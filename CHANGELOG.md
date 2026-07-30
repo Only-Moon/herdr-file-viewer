@@ -5,6 +5,11 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries are short on purpose; follow the
 `→` links for the full detail.
 
+## [Unreleased]
+
+### Fixed
+- **Windows only:** AltGr characters now trigger their bound actions; only `Ctrl+Alt` plus optional `Shift` on character keys is inferred as AltGr. → [keys](docs/keys.md)
+
 ## [1.14.0] - 2026-07-20
 
 ### Added
