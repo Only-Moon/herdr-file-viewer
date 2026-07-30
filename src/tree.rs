@@ -6,8 +6,9 @@
 
 use crate::git::Status;
 use crate::index::walk_builder;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,11 @@ pub struct Node {
     /// For a directory: whether any file under it has a git status (so the Presenter can
     /// color a folder that contains changes). Always `false` for files.
     pub dir_dirty: bool,
+    /// The row's display name when it is not simply the path's final component: a **compacted
+    /// chain** of single-child directories drawn as one row (`src/main/java`), whose `path` is the
+    /// deepest directory of the chain (`…/java`). `None` on every ordinary row, so the Presenter
+    /// falls back to the file name and an uncompacted tree renders exactly as before.
+    pub label: Option<String>,
 }
 
 /// The tree's sibling order, and the **single source of truth** for it: directories before
@@ -102,6 +108,11 @@ fn file_row(rows: &[Node], path: &Path) -> Option<usize> {
         .position(|n| n.path == path && n.kind == NodeKind::File)
 }
 
+/// A directory's **foldability**: its sole visible child directory, when that single subdirectory
+/// is the only entry it has. `None` when it holds a file, a second entry, or nothing — each of
+/// which ends a chain. This, not the directory's contents, is all compaction needs to know.
+type Fold = Option<PathBuf>;
+
 /// Order tree entries: directories first, then files; alphabetical within each group.
 fn sort_entries(entries: &mut [(PathBuf, NodeKind)]) {
     entries.sort_by(|a, b| {
@@ -112,6 +123,22 @@ fn sort_entries(entries: &mut [(PathBuf, NodeKind)]) {
     });
 }
 
+/// A path's final component as a display string; the whole path when it has none (a root).
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The members of `set` whose parent is exactly `parent` — the synthesized changed-only tree's
+/// "immediate children of", shared by the emitter and the chain fold.
+fn children_of<'a>(set: &'a BTreeSet<PathBuf>, parent: &Path) -> Vec<&'a PathBuf> {
+    set.iter()
+        .filter(|p| p.parent().unwrap_or(Path::new("")) == parent)
+        .collect()
+}
+
 /// The browsable file tree rooted at `root`.
 pub struct TreeModel {
     root: PathBuf,
@@ -120,6 +147,26 @@ pub struct TreeModel {
     show_ignored: bool,
     hide_hidden: bool,
     changed_only: bool,
+    /// Draw a chain of single-child directories as one row (`src/main/java`) instead of one row
+    /// per segment. Off by default; seeded once at startup from the `compact_dirs` config key.
+    compact_dirs: bool,
+    /// Memoized [`probe_fold`](Self::probe_fold) results, one per directory probed — **the whole
+    /// price of compaction**, and deliberately the fold SHAPE rather than any directory's contents.
+    ///
+    /// Compaction has to look inside a directory to know whether its row folds, including a
+    /// **collapsed** one the uncompacted tree never opens. Re-probing per frame would be more
+    /// filesystem work than the uncompacted tree does, so the answers are kept until something
+    /// re-reads the world ([`invalidate_compaction`](Self::invalidate_compaction)). The listings
+    /// themselves are NOT cached: the tree still walks the root and each expanded directory live on
+    /// every frame, exactly as it always has, so a compacted tree's contents are never stale and
+    /// only its fold shape can lag a change on disk.
+    folds: RefCell<HashMap<PathBuf, Fold>>,
+    /// Walk meters — every filesystem read this tree has made, split by kind: full child listings
+    /// ([`entries`](Self::entries)) and two-entry foldability probes
+    /// ([`probe_fold`](Self::probe_fold)). Read together via
+    /// [`walk_counts`](Self::walk_counts); the walk-discipline tests assert the deltas.
+    full_reads: Cell<usize>,
+    probe_reads: Cell<usize>,
     /// Per-file status for tree markers (AC-7), keyed by root-relative path. Set
     /// independently of the filter (`set_status`) so the two can never overwrite each
     /// other.
@@ -137,14 +184,52 @@ impl TreeModel {
             show_ignored: false,
             hide_hidden: false,
             changed_only: false,
+            compact_dirs: false,
+            folds: RefCell::new(HashMap::new()),
+            full_reads: Cell::new(0),
+            probe_reads: Cell::new(0),
             markers: BTreeMap::new(),
             changed_filter: BTreeMap::new(),
         }
     }
 
+    /// Draw a chain of single-child directories as one row (the `compact_dirs` config key).
+    /// A startup setting, not a runtime toggle: it changes the tree's shape, not what it shows.
+    pub fn set_compact_dirs(&mut self, on: bool) {
+        self.compact_dirs = on;
+        self.invalidate_compaction();
+        self.clamp_cursor();
+    }
+
+    /// Drop the memoized fold shapes so the next build re-probes the filesystem — the tree's "the
+    /// world may have moved" hook, and a no-op with `compact_dirs` off (nothing is cached).
+    ///
+    /// Called from every point that changes what a probe would see: the display filters below,
+    /// [`reveal`](Self::reveal) (which relaxes them directly, and re-probes so it never decides
+    /// against a stale shape), and the controller's `refresh_git_state` — launch, the `r` key,
+    /// editor return, baseline toggle, and focus-gain, **repo or not**.
+    ///
+    /// Re-probing is cheap enough to do on all of those: a probe stops after two entries, so an
+    /// invalidation costs a two-entry read per visible collapsed directory plus the full listings
+    /// the tree was going to take anyway. There is no walk storm to schedule around.
+    pub fn invalidate_compaction(&mut self) {
+        self.folds.get_mut().clear();
+    }
+
+    /// Every filesystem read this tree has made, as `(full listings, foldability probes)`.
+    ///
+    /// The walk-discipline seam: a test takes the pair before and after an action and asserts the
+    /// delta — that a build lists only the directories it descends into, that a collapsed row costs
+    /// a two-entry probe rather than a listing, and that a rebuild re-probes nothing. Monotonic
+    /// across invalidations, so a test can measure re-reads too.
+    pub fn walk_counts(&self) -> (usize, usize) {
+        (self.full_reads.get(), self.probe_reads.get())
+    }
+
     /// Reveal gitignored/all files (AC-5).
     pub fn set_show_ignored(&mut self, on: bool) {
         self.show_ignored = on;
+        self.invalidate_compaction();
         self.clamp_cursor();
     }
 
@@ -153,6 +238,7 @@ impl TreeModel {
     /// them (e.g. when opening a `$HOME` flooded with dotfiles).
     pub fn set_hide_hidden(&mut self, on: bool) {
         self.hide_hidden = on;
+        self.invalidate_compaction();
         self.clamp_cursor();
     }
 
@@ -206,6 +292,15 @@ impl TreeModel {
 
     fn collect(&self, dir: &Path, depth: usize, out: &mut Vec<Node>) {
         for (path, kind) in self.entries(dir) {
+            // Under `compact_dirs`, a directory that only ever contains one subdirectory is folded
+            // into that chain: one row, `path` the DEEPEST directory, so expand/collapse, status,
+            // and the child walk below all act on the directory the row actually leads into. The
+            // row keeps the position its own name sorted into, so the fold never reorders siblings.
+            let (path, label) = if kind == NodeKind::Dir && self.compact_dirs {
+                self.compact_chain(&path)
+            } else {
+                (path, None)
+            };
             let expanded = kind == NodeKind::Dir && self.expanded.contains(&path);
             let dir_dirty = kind == NodeKind::Dir && self.dir_contains_change(&path);
             out.push(Node {
@@ -215,11 +310,40 @@ impl TreeModel {
                 expanded,
                 status: self.status_for(&path),
                 dir_dirty,
+                label,
             });
             if expanded {
                 self.collect(&path, depth + 1, out);
             }
         }
+    }
+
+    /// Follow a chain of single-child directories down from `dir`, returning the deepest directory
+    /// of the chain and its display label (`src/main/java`), or `(dir, None)` when there is nothing
+    /// to fold.
+    ///
+    /// The chain extends only while a directory's **sole visible entry** is one subdirectory: a
+    /// directory holding a file, more than one entry, or nothing ends it. "Visible" is the point —
+    /// [`probe_fold`](Self::probe_fold) reads under the same gitignore / hidden filters the tree is
+    /// drawing with, so a row never merges past something the user can see. Separators in the label
+    /// are always `/`, so a compacted row reads the same on every platform.
+    ///
+    /// Per link this is one memoized probe, not a listing — the fold shape is the only thing read.
+    fn compact_chain(&self, dir: &Path) -> (PathBuf, Option<String>) {
+        let mut deepest = dir.to_path_buf();
+        let mut segments: Vec<String> = Vec::new();
+        while let Some(only) = self.probe_fold(&deepest) {
+            segments.push(file_name_of(&only));
+            deepest = only;
+        }
+        if segments.is_empty() {
+            return (deepest, None);
+        }
+        let label = std::iter::once(file_name_of(dir))
+            .chain(segments)
+            .collect::<Vec<_>>()
+            .join("/");
+        (deepest, Some(label))
     }
 
     /// Build the changed-only tree from the changed-set's paths (not the filesystem), so
@@ -250,18 +374,17 @@ impl TreeModel {
         files: &BTreeSet<PathBuf>,
         out: &mut Vec<Node>,
     ) {
-        let is_child = |rel: &Path| rel.parent().unwrap_or(Path::new("")) == parent_rel;
-        let mut children: Vec<(&PathBuf, NodeKind)> = dirs
-            .iter()
-            .filter(|d| is_child(d))
+        let mut children: Vec<(&PathBuf, NodeKind)> = children_of(dirs, parent_rel)
+            .into_iter()
             .map(|d| (d, NodeKind::Dir))
             .chain(
-                files
-                    .iter()
-                    .filter(|f| is_child(f))
+                children_of(files, parent_rel)
+                    .into_iter()
                     .map(|f| (f, NodeKind::File)),
             )
             .collect();
+        // Sorted BEFORE the fold below, on each child's own name — so compaction can only ever
+        // change a row's label and where it leads, never where it sits among its siblings.
         children.sort_by(|a, b| {
             cmp_sibling(
                 (a.0.file_name().unwrap_or_default(), a.1),
@@ -270,7 +393,16 @@ impl TreeModel {
         });
 
         for (rel, kind) in children {
-            let abs = self.root.join(rel);
+            // Same fold as the full tree, over the synthesized set instead of the filesystem: while
+            // a directory's only child is one directory and it holds no changed file of its own,
+            // the chain becomes a single row. This is where it pays most — a changed-set tree is
+            // all path, so `src/main/java/br/com/…` is otherwise one row per segment.
+            let (rel, label) = if kind == NodeKind::Dir && self.compact_dirs {
+                self.compact_synthetic_chain(rel, dirs, files)
+            } else {
+                (rel.clone(), None)
+            };
+            let abs = self.root.join(&rel);
             out.push(Node {
                 path: abs.clone(),
                 kind,
@@ -278,11 +410,41 @@ impl TreeModel {
                 expanded: kind == NodeKind::Dir,
                 status: self.status_for(&abs),
                 dir_dirty: kind == NodeKind::Dir && self.dir_contains_change(&abs),
+                label,
             });
             if kind == NodeKind::Dir {
-                self.emit_synthetic(rel, depth + 1, dirs, files, out);
+                self.emit_synthetic(&rel, depth + 1, dirs, files, out);
             }
         }
+    }
+
+    /// [`compact_chain`](Self::compact_chain) for the synthesized changed-only tree: fold `start`
+    /// down while its only child is a single directory and it holds no changed file directly, and
+    /// return the deepest directory plus its `a/b/c` label (`None` when nothing folded).
+    fn compact_synthetic_chain(
+        &self,
+        start: &Path,
+        dirs: &BTreeSet<PathBuf>,
+        files: &BTreeSet<PathBuf>,
+    ) -> (PathBuf, Option<String>) {
+        let mut deepest = start.to_path_buf();
+        let mut segments: Vec<String> = Vec::new();
+        loop {
+            let sub_dirs = children_of(dirs, &deepest);
+            if sub_dirs.len() != 1 || !children_of(files, &deepest).is_empty() {
+                break;
+            }
+            deepest = sub_dirs[0].clone();
+            segments.push(file_name_of(&deepest));
+        }
+        if segments.is_empty() {
+            return (deepest, None);
+        }
+        let label = std::iter::once(file_name_of(start))
+            .chain(segments)
+            .collect::<Vec<_>>()
+            .join("/");
+        (deepest, Some(label))
     }
 
     /// The node's git status (AC-7): the dedicated marker map, falling back to the
@@ -309,10 +471,10 @@ impl TreeModel {
             .any(|k| k != rel && k.starts_with(rel))
     }
 
-    /// Immediate children of `dir`: gitignore-filtered (unless `show_ignored`), dot-prefixed
-    /// entries dropped when `hide_hidden` (#46), `.git` always hidden, directories before files,
-    /// each group alphabetical. Read-only.
-    fn entries(&self, dir: &Path) -> Vec<(PathBuf, NodeKind)> {
+    /// The `ignore` walk both readers below share: `dir`'s immediate children, gitignore-filtered
+    /// (unless `show_ignored`), dot-prefixed entries dropped when `hide_hidden` (#46), `.git` always
+    /// hidden. Lazy — the caller decides how much of it to consume. Read-only.
+    fn walk_children(&self, dir: &Path) -> impl Iterator<Item = ignore::DirEntry> {
         let mut builder = walk_builder(dir);
         builder
             .max_depth(Some(1))
@@ -321,12 +483,23 @@ impl TreeModel {
             .hidden(self.hide_hidden)
             .git_ignore(!self.show_ignored)
             .git_exclude(!self.show_ignored);
-
-        let mut entries: Vec<(PathBuf, NodeKind)> = builder
+        builder
             .build()
             .filter_map(Result::ok)
             .filter(|e| e.depth() == 1) // children only, not `dir` itself
             .filter(|e| e.file_name().to_str() != Some(".git")) // never browse into .git
+    }
+
+    /// Immediate children of `dir` in row order: directories before files, each group alphabetical.
+    ///
+    /// The **full** read — walk, classify, collect, sort — and so taken only for a directory the
+    /// tree actually descends into: the root and each expanded directory, which is exactly the set
+    /// the uncompacted tree lists on every frame. Never memoized, so the contents a compacted tree
+    /// draws are as live as they have always been.
+    fn entries(&self, dir: &Path) -> Vec<(PathBuf, NodeKind)> {
+        self.full_reads.set(self.full_reads.get() + 1);
+        let mut entries: Vec<(PathBuf, NodeKind)> = self
+            .walk_children(dir)
             .map(|e| {
                 let kind = if e.file_type().is_some_and(|t| t.is_dir()) {
                     NodeKind::Dir
@@ -339,6 +512,36 @@ impl TreeModel {
 
         sort_entries(&mut entries);
         entries
+    }
+
+    /// Whether `dir` folds into a single subdirectory, memoized in [`folds`](Self::folds).
+    ///
+    /// Deliberately **not** [`entries`](Self::entries). Compaction asks this of every visible
+    /// directory row, including collapsed ones the tree never opens, and the answer needs at most
+    /// **two** entries: one is a fold candidate, a second is a branch point that ends the chain. So
+    /// this stops the walk at two and skips the classify / collect / sort entirely — which is what
+    /// keeps a collapsed row from costing a full listing, and what makes re-probing on every
+    /// refresh cheap rather than a walk storm.
+    fn probe_fold(&self, dir: &Path) -> Fold {
+        if let Some(hit) = self.folds.borrow().get(dir) {
+            return hit.clone();
+        }
+        self.probe_reads.set(self.probe_reads.get() + 1);
+        // Walk OUTSIDE the borrow: holding a `RefCell` borrow across a filesystem read is how a
+        // future caller earns a panic.
+        let mut first_two = self.walk_children(dir).take(2);
+        let fold = match (first_two.next(), first_two.next()) {
+            // A lone subdirectory is the only thing a chain continues through; a file, a second
+            // entry, or an empty directory ends it.
+            (Some(only), None) if only.file_type().is_some_and(|t| t.is_dir()) => {
+                Some(only.into_path())
+            }
+            _ => None,
+        };
+        self.folds
+            .borrow_mut()
+            .insert(dir.to_path_buf(), fold.clone());
+        fold
     }
 
     /// Expand a directory (no-op for a path outside the root — AC-N5).
@@ -425,6 +628,13 @@ impl TreeModel {
         if !path.is_file() {
             return false; // missing or not a regular file — AC-20
         }
+        // Every decision below turns on whether the target has a row, and each relaxation it can
+        // reach is PERMANENT. A cached fold shape that predates the target's creation can hide a
+        // perfectly visible file — the chain it was folded into no longer ends where it did — and
+        // that would silently and irreversibly flip a filter the user never touched. So re-probe
+        // first: `reveal` is a rare, explicitly-requested path (a finder confirm, `--open`), and
+        // correctness of a one-way switch is worth a two-entry read per collapsed row.
+        self.invalidate_compaction();
         self.expand_ancestors(path);
         // Relax a filter only if it still hides the target after expansion.
         if self.changed_only && !self.visible_nodes().iter().any(|n| n.path == path) {
@@ -432,10 +642,14 @@ impl TreeModel {
         }
         if self.hide_hidden && !self.visible_nodes().iter().any(|n| n.path == path) {
             self.hide_hidden = false;
+            // Set directly rather than through `set_hide_hidden`, so the fold shapes probed under
+            // the flag just dropped have to be dropped here too.
+            self.invalidate_compaction();
         }
         // Explicit path intent beats the default gitignore hide (launch open target / known path).
         if !self.show_ignored && !self.visible_nodes().iter().any(|n| n.path == path) {
             self.show_ignored = true;
+            self.invalidate_compaction();
         }
         // Move the cursor to the target's visible row.
         match self.visible_nodes().iter().position(|n| n.path == path) {

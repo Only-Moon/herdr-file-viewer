@@ -3174,13 +3174,64 @@ fn focus_gained_re_queries_git_but_preserves_content_scroll() {
 }
 
 #[test]
-fn focus_gained_without_a_repo_is_inert() {
-    // No repo → nothing to refresh (AC-26); focus-gain must not force a redraw or a git query.
+fn focus_gained_without_a_repo_queries_no_git_but_still_re_reads_the_tree() {
+    // No repo → no git query (AC-26). It is NOT inert beyond that, though: a directory outside a
+    // repo gains and loses files like any other, and focus-gain is the moment the viewer re-reads
+    // the world. It used to return before `refresh_git_state` altogether, which left a compacted
+    // tree's cached fold shapes stale until the user hit `r`.
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.txt"), "x").unwrap();
-    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    let git = StubGit::default();
+    let changed_calls = git.changed_calls.clone();
+    let (mut ctrl, _, _) = controller(dir.path(), false, git, false);
+
     let fx = ctrl.handle_focus_gained();
-    assert!(!fx.redraw && !fx.quit, "no repo → focus-gain is a no-op");
+    assert!(!fx.quit);
+    assert!(
+        changed_calls.lock().unwrap().is_empty(),
+        "AC-26: no repo, so no git is queried"
+    );
+}
+
+#[test]
+fn focus_gained_without_a_repo_un_stales_a_compacted_tree() {
+    // The regression the early return caused. With `compact_dirs` on, the tree caches which
+    // directories fold; in a non-git directory nothing ever dropped that cache, so a chain that
+    // stopped folding on disk kept rendering its old shape — and the file that ended it stayed
+    // invisible — until a manual `r`.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("src/main/java")).unwrap();
+    std::fs::write(dir.path().join("src/main/java/App.java"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.apply_compact_dirs(true);
+
+    let labels = |c: &Controller| -> Vec<String> {
+        c.tree()
+            .visible_nodes()
+            .iter()
+            .filter_map(|n| n.label.clone())
+            .collect()
+    };
+    assert_eq!(
+        labels(&ctrl),
+        vec!["src/main/java".to_string()],
+        "precondition: the whole chain folds into one row"
+    );
+
+    // A file added outside the viewer ends the chain two segments early.
+    std::fs::write(dir.path().join("src/main/Extra.java"), "x").unwrap();
+    assert_eq!(
+        labels(&ctrl),
+        vec!["src/main/java".to_string()],
+        "the cached shape has not noticed yet"
+    );
+
+    ctrl.handle_focus_gained();
+    assert_eq!(
+        labels(&ctrl),
+        vec!["src/main".to_string()],
+        "focus-gain re-probes even without a repo, so the new file's directory gets its row back"
+    );
 }
 
 /// A Git stub whose changed-set flips from `first` to `rest` after the first query — so a
@@ -10025,6 +10076,7 @@ fn open_help_appends_settings_section_when_display_is_set() {
         open: None,
         reveal: None,
         hide_dotfiles: false,
+        compact_dirs: false,
         update_check: true,
         confirm_discard: true,
         scroll_lines: 3,
@@ -10474,6 +10526,54 @@ fn reveal_non_zero_exit_sets_a_non_fatal_notice() {
         "AC-8: reveal non-zero exit sets the reveal-specific notice, got: {notice:?}"
     );
     assert!(!fx.quit, "AC-8: a non-zero exit does not end the session");
+}
+
+#[test]
+fn apply_compact_dirs_folds_the_tree_and_survives_a_reroot() {
+    // The config path: `app::run` resolves `compact_dirs` and calls this. Tested here because the
+    // TreeModel tests set the flag directly and would not catch a broken wiring.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("src/main/java")).unwrap();
+    std::fs::write(dir.path().join("src/main/java/App.java"), "x\n").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    assert!(
+        ctrl.tree()
+            .visible_nodes()
+            .iter()
+            .all(|n| n.label.is_none()),
+        "off by default"
+    );
+
+    ctrl.apply_compact_dirs(true);
+    let labels: Vec<String> = ctrl
+        .tree()
+        .visible_nodes()
+        .iter()
+        .filter_map(|n| n.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["src/main/java".to_string()],
+        "the chain is folded into one labelled row"
+    );
+
+    // A re-root builds a fresh TreeModel; the preference must be carried onto it (AC-12).
+    let other = TempDir::new();
+    std::fs::create_dir_all(other.path().join("a/b/c")).unwrap();
+    std::fs::write(other.path().join("a/b/c/f.txt"), "x\n").unwrap();
+    ctrl.re_root(other.path());
+    let labels: Vec<String> = ctrl
+        .tree()
+        .visible_nodes()
+        .iter()
+        .filter_map(|n| n.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["a/b/c".to_string()],
+        "compaction survives a worktree switch"
+    );
 }
 
 // ---- next / previous changed file (`]` / `[`) --------------------------------------------
