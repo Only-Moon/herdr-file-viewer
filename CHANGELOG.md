@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- `]` / `[` jump the tree cursor to the next / previous changed file, wrapping at the ends with a notice — `n`/`N` for the tree instead of arrowing past directory rows. Walks the set the tree is filtered by (working-tree status under `d`, else the baseline-aware set behind `c` / `b`) and expands a collapsed directory to reach a changed file inside it. → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
 - Page-wise scrolling: `Space` / `PageDown` move down one screenful and `PageUp` moves up one, paging the content pane when it is focused and the tree cursor otherwise. The step is the focused pane's live height, so it follows a resize and stays a screenful in the narrow single-column layout. `Space` follows the pager convention (`less`, `more`, `man`, and so `bat`); both are remappable as `page_down` / `page_up`. → [keys](docs/keys.md) · [configuration](docs/configuration.md#keybindings)
 
 ### Fixed
@@ -16,7 +17,6 @@ All notable changes to this project are documented here. The format is based on
 - Tree rows now indent by depth alone. A file row reserved no space for the expand arrow, so a file sat two columns left of a directory at the same depth — putting every file in the exact column of its parent directory's name, and every top-level file two columns left of the directory beside it. Files now reserve the arrow's width, so siblings line up and a child always reads one level in from its parent. → [usage](docs/usage.md#the-tree)
 
 - **Windows only:** AltGr characters now trigger their bound actions; only `Ctrl+Alt` plus optional `Shift` on character keys is inferred as AltGr. → [keys](docs/keys.md)
-
 
 ## [1.14.0] - 2026-07-20
 
