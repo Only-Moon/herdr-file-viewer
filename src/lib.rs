@@ -25,6 +25,7 @@ pub mod open_target;
 pub mod opener;
 pub mod picker;
 pub mod presenter;
+pub mod preview;
 pub mod proc;
 pub mod prompt;
 pub mod render;
