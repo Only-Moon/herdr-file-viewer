@@ -4,6 +4,73 @@
 
 use super::*;
 
+/// Extract the plain text of displayed lines for an in-file search.
+fn plain_lines(lines: &[Line<'_>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+        .collect()
+}
+
+/// Replace one interaction's search with matches over its displayed lines, returning the first line.
+fn refresh_search(
+    interaction: &mut PreviewInteractionState,
+    lines: &[Line<'_>],
+    query: String,
+) -> Option<usize> {
+    let matches = crate::search::find_matches(&query, &plain_lines(lines));
+    let first_line = matches.first().map(|matched| matched.line);
+    interaction.search = Some(SearchState {
+        query,
+        matches,
+        current: 0,
+    });
+    first_line
+}
+
+/// Recompute one interaction's committed search against replacement displayed lines.
+fn recompute_search(interaction: &mut PreviewInteractionState, lines: &[Line<'_>]) {
+    let Some(previous) = interaction.search.take() else {
+        return;
+    };
+    if previous.query.is_empty() {
+        return;
+    }
+    let matches = crate::search::find_matches(&previous.query, &plain_lines(lines));
+    interaction.search = Some(SearchState {
+        query: previous.query,
+        current: previous.current.min(matches.len().saturating_sub(1)),
+        matches,
+    });
+}
+
+/// Advance or retreat one interaction's committed search, returning its new line and wrap flag.
+fn navigate_search(
+    interaction: &mut PreviewInteractionState,
+    forward: bool,
+) -> Option<(usize, bool)> {
+    let search = interaction.search.as_mut()?;
+    if search.matches.is_empty() {
+        return None;
+    }
+    let wrapped = if forward {
+        search.current + 1 >= search.matches.len()
+    } else {
+        search.current == 0
+    };
+    search.current = if forward {
+        (search.current + 1) % search.matches.len()
+    } else {
+        (search.current + search.matches.len() - 1) % search.matches.len()
+    };
+    Some((search.matches[search.current].line, wrapped))
+}
+
 impl Controller {
     /// Scroll the content pane so 1-based source line `line_1based` is visible, landing the line near
     /// the top of the viewport. The source line is clamped to `[1, source_line_count]` (below 1 →
@@ -21,7 +88,8 @@ impl Controller {
         } else {
             line - 1
         };
-        self.content_scroll = (offset.min(u16::MAX as usize) as u16).min(self.max_content_scroll());
+        self.active_interaction.vertical_scroll =
+            (offset.min(u16::MAX as usize) as u16).min(self.max_content_scroll());
     }
 
     /// Open the go-to-line prompt (AC-1). Opens whenever a **file** is selected, in any view: in a
@@ -35,7 +103,7 @@ impl Controller {
             self.modal = Modal::Prompt(PromptState {
                 mode: PromptMode::GoToLine,
                 input: crate::prompt::PromptInput::new(),
-                saved_scroll: self.content_scroll,
+                saved_scroll: self.active_interaction.vertical_scroll,
             });
         } else {
             self.action_notice = Some("Go to line: select a file first".into());
@@ -63,17 +131,17 @@ impl Controller {
         }
         // Zoom-on-open (7b): if the content pane isn't visible (narrow tree-only layout), zoom the
         // file so the user sees the content they're about to search. Mirrors the go-to-file finder.
-        if self.content_width == 0 {
+        if self.active_interaction.viewport_width == 0 {
             self.zoomed = true;
             self.focus = Focus::Content;
         }
         // AC-20: opening a new search clears any prior committed SearchState so highlights from
         // the old query are gone before the new prompt opens. Clear first, then snapshot scroll.
-        self.search = None;
+        self.active_interaction.search = None;
         self.modal = Modal::Prompt(PromptState {
             mode: PromptMode::Search,
             input: crate::prompt::PromptInput::new(),
-            saved_scroll: self.content_scroll,
+            saved_scroll: self.active_interaction.vertical_scroll,
         });
         Effects::redraw()
     }
@@ -193,7 +261,7 @@ impl Controller {
                     .map(|p| p.input.query().is_empty())
                     .unwrap_or(true);
                 if empty {
-                    self.search = None;
+                    self.active_interaction.search = None;
                 }
                 self.modal = Modal::None;
                 Effects::redraw()
@@ -202,8 +270,8 @@ impl Controller {
             // the in-progress SearchState (no highlights remain after cancel).
             KeyCode::Esc => {
                 let saved_scroll = self.modal.prompt().map(|p| p.saved_scroll).unwrap_or(0);
-                self.content_scroll = saved_scroll;
-                self.search = None;
+                self.active_interaction.vertical_scroll = saved_scroll;
+                self.active_interaction.search = None;
                 self.modal = Modal::None;
                 Effects::redraw()
             }
@@ -216,19 +284,12 @@ impl Controller {
     /// with ≥1 match: no search, a committed search with zero matches, or the prompt still open
     /// (AC-19). Scrolls the new current match into view.
     pub(super) fn next_match(&mut self) -> Effects {
-        // A committed search exists iff self.search is Some, non-empty, AND the prompt is closed.
-        let (len, current) = match self.search.as_ref() {
-            Some(s) if !s.matches.is_empty() && !self.prompt_open() => (s.matches.len(), s.current),
-            _ => return Effects::noop(),
-        };
-        // Copy the fields we need before taking &mut self — borrow checker.
-        let wrapped = current + 1 >= len;
-        let next_current = (current + 1) % len;
-        // Compute the next match's line before mutating self.search.
-        let next_line = self.search.as_ref().unwrap().matches[next_current].line;
-        if let Some(s) = self.search.as_mut() {
-            s.current = next_current;
+        if self.prompt_open() {
+            return Effects::noop();
         }
+        let Some((next_line, wrapped)) = navigate_search(&mut self.active_interaction, true) else {
+            return Effects::noop();
+        };
         if wrapped {
             self.action_notice = Some("Search: wrapped to first match".into());
         }
@@ -240,19 +301,13 @@ impl Controller {
     /// first match back to the last with a notice (AC-16). Inert when there is no committed
     /// search with ≥1 match (AC-19). Scrolls the new current match into view.
     pub(super) fn prev_match(&mut self) -> Effects {
-        // A committed search exists iff self.search is Some, non-empty, AND the prompt is closed.
-        let (len, current) = match self.search.as_ref() {
-            Some(s) if !s.matches.is_empty() && !self.prompt_open() => (s.matches.len(), s.current),
-            _ => return Effects::noop(),
-        };
-        // Copy the fields we need before taking &mut self — borrow checker.
-        let wrapped = current == 0;
-        let prev_current = (current + len - 1) % len;
-        // Compute the previous match's line before mutating self.search.
-        let prev_line = self.search.as_ref().unwrap().matches[prev_current].line;
-        if let Some(s) = self.search.as_mut() {
-            s.current = prev_current;
+        if self.prompt_open() {
+            return Effects::noop();
         }
+        let Some((prev_line, wrapped)) = navigate_search(&mut self.active_interaction, false)
+        else {
+            return Effects::noop();
+        };
         if wrapped {
             self.action_notice = Some("Search: wrapped to last match".into());
         }
@@ -269,25 +324,12 @@ impl Controller {
             .prompt()
             .map(|p| p.input.query().to_string())
             .unwrap_or_default();
-        let plain = self.content_plain_lines();
-        let matches = crate::search::find_matches(&q, &plain);
-
-        // Selection policy: always choose match index 0 (first in document order).
-        // Incremental "stay near cursor" policies are deferred to a later task.
-        let current = 0;
-
-        // AC-10: scroll so the current match is within the viewport.
-        // AC-18: do NOT touch content_scroll when there are no matches.
-        if !matches.is_empty() {
-            // matches[0].line is 0-based; scroll_to_line takes 1-based.
-            self.scroll_to_line(matches[0].line + 1);
+        if let Some(first_line) =
+            refresh_search(&mut self.active_interaction, &self.content.lines, q)
+        {
+            // `first_line` is 0-based; scroll_to_line takes 1-based.
+            self.scroll_to_line(first_line + 1);
         }
-
-        self.search = Some(SearchState {
-            query: q,
-            matches,
-            current,
-        });
     }
 
     /// Re-run a COMMITTED search (the prompt is closed, so [`refresh_search`] — which reads the live
@@ -301,21 +343,6 @@ impl Controller {
     ///
     /// [`refresh_search`]: Self::refresh_search
     pub(super) fn recompute_committed_search(&mut self) {
-        let Some(prev) = self.search.take() else {
-            return;
-        };
-        if prev.query.is_empty() {
-            return;
-        }
-        let plain = self.content_plain_lines();
-        let matches = crate::search::find_matches(&prev.query, &plain);
-        // Keep the same ordinal where possible; clamp if the reflow reduced the match count (an
-        // empty result leaves `current` at 0 with no matches — the status line reads "no matches").
-        let current = prev.current.min(matches.len().saturating_sub(1));
-        self.search = Some(SearchState {
-            query: prev.query,
-            matches,
-            current,
-        });
+        recompute_search(&mut self.active_interaction, &self.content.lines);
     }
 }

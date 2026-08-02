@@ -44,6 +44,7 @@ use crate::presenter::{
     FinderView, Focus, HelpView, LineSelectView, PaneGeometry, PickerRowView, PickerView,
     ViewState,
 };
+use crate::preview::{PreviewInteractionState, PreviewSelection};
 use crate::render::Renderers;
 use crate::root::Resolved;
 use crate::tree::{Node, NodeKind, TreeModel};
@@ -51,15 +52,101 @@ use crate::update::{self, NoticeSnapshot, UpdateState};
 use crate::view_policy::{FileDescriptor, ViewMode, applicable_modes, default_mode};
 use annotation::{AnnotationEditorState, AnnotationListState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use lineselect::LineSelectState;
 use ratatui::layout::Position;
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+
+// The line-select modal and the ambient active-preview selection share one interaction value.
+// Keep the established controller-local name while the modal is migrated in-place.
+type LineSelectState = PreviewSelection;
+
+/// Count the rows a preview's displayed lines occupy at its measured viewport width.
+///
+/// Layout remains controller behavior: a later pinned preview can pass its own lines and
+/// interaction value without teaching [`PreviewInteractionState`] about ratatui text layout.
+fn rendered_rows(
+    interaction: &PreviewInteractionState,
+    lines: &[Line<'_>],
+    wrap: bool,
+    overlay_columns: usize,
+) -> u16 {
+    let count = if wrap {
+        wrapped_rows_before(interaction, lines, lines.len(), overlay_columns)
+    } else {
+        lines.len()
+    };
+    count.min(u16::MAX as usize) as u16
+}
+
+/// Count wrapped display rows before source line `n` at an interaction's measured width.
+fn wrapped_rows_before(
+    interaction: &PreviewInteractionState,
+    lines: &[Line<'_>],
+    n: usize,
+    overlay_columns: usize,
+) -> usize {
+    let width = interaction.viewport_width as usize;
+    lines
+        .iter()
+        .take(n)
+        .map(|line| crate::text_layout::line_wrapped_rows_prefixed(line, width, overlay_columns))
+        .sum()
+}
+
+/// Find the one-based source line shown at a zero-based display row.
+fn line_at_row(
+    interaction: &PreviewInteractionState,
+    lines: &[Line<'_>],
+    row: usize,
+    wrap: bool,
+    overlay_columns: usize,
+) -> usize {
+    if !wrap {
+        return row + 1;
+    }
+    let mut rows = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        rows += crate::text_layout::line_wrapped_rows_prefixed(
+            line,
+            interaction.viewport_width as usize,
+            overlay_columns,
+        );
+        if row < rows {
+            return index + 1;
+        }
+    }
+    lines.len().max(1)
+}
+
+/// Clamp an interaction's viewport offsets to the supplied displayed lines.
+fn clamp_offsets(
+    interaction: &mut PreviewInteractionState,
+    lines: &[Line<'_>],
+    wrap: bool,
+    overlay_columns: usize,
+) {
+    interaction.vertical_scroll = interaction.vertical_scroll.min(
+        rendered_rows(interaction, lines, wrap, overlay_columns)
+            .saturating_sub(interaction.viewport_height),
+    );
+    let horizontal_max = if wrap {
+        0
+    } else {
+        (lines
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16)
+            .saturating_sub(interaction.viewport_width)
+    };
+    interaction.horizontal_scroll = interaction.horizontal_scroll.min(horizontal_max);
+}
 
 /// Tree-column width as a percentage of the pane: its default and the bounds the resize keys
 /// clamp to, so neither column can be squeezed to nothing.
@@ -396,7 +483,7 @@ enum Modal {
     Finder(FinderState),
     Prompt(PromptState),
     Help(HelpState),
-    LineSelect(LineSelectState),
+    LineSelect(PreviewSelection),
     Annotations(AnnotationListState),
     AnnotationEditor(AnnotationEditorState),
     /// The confirm raised when an action would discard unexported annotations. Carries what to do
@@ -485,7 +572,7 @@ impl Modal {
             _ => None,
         }
     }
-    fn line_select(&self) -> Option<&LineSelectState> {
+    fn line_select(&self) -> Option<&PreviewSelection> {
         match self {
             Modal::LineSelect(s) => Some(s),
             _ => None,
@@ -493,7 +580,7 @@ impl Modal {
     }
     // Used by the line-select key handler (`handle_line_select_key`); the state exists here from
     // T-3 so the accessor pair mirrors picker/finder/prompt/help.
-    fn line_select_mut(&mut self) -> Option<&mut LineSelectState> {
+    fn line_select_mut(&mut self) -> Option<&mut PreviewSelection> {
         match self {
             Modal::LineSelect(s) => Some(s),
             _ => None,
@@ -561,16 +648,9 @@ pub struct Controller {
     /// The pane width the run loop last observed (session state for the narrow-split flag,
     /// AC-21); the Presenter still lays out from the live frame, never this.
     width: u16,
-    /// Vertical scroll offset of the content pane, in lines. Reset to the top whenever a new
-    /// render is dispatched (a new file / mode / baseline).
-    content_scroll: u16,
-    /// Horizontal scroll offset of the content pane, in columns (only used when not wrapping).
-    /// Reset to the left edge on a new render.
-    content_hscroll: u16,
-    /// The content viewport `(width, height)` the Presenter last drew into. Used to clamp
-    /// `content_scroll` so the user cannot scroll past the last screenful.
-    content_width: u16,
-    content_height: u16,
+    /// Mutable viewport, search, and displayed-text selection state for the active preview.
+    /// A later pinned snapshot owns a distinct clone of this value.
+    active_interaction: PreviewInteractionState,
     /// How many lines (or finder list items, or help-overlay lines) one mouse-wheel event advances
     /// — the effective **scroll step** (config `scroll_lines`, else [`crate::config::DEFAULT_SCROLL_LINES`]).
     /// Set once at startup via [`apply_scroll_lines`](Self::apply_scroll_lines). Held as `isize`
@@ -688,13 +768,6 @@ pub struct Controller {
     /// What the held left button is dragging (divider resize or a scrollbar), so the release is
     /// treated as the end of the drag, not a click. `None` ⇒ no drag in progress.
     drag: Option<Drag>,
-    /// An ambient character selection dragged out in the content pane during normal navigation, held
-    /// OUTSIDE [`Modal`] so `Modal::None` stays in force and every keyboard binding keeps its normal
-    /// meaning — that is what makes it ambient, not a mode. Reuses the [`LineSelectState`] char
-    /// primitives (always char-mode; `char_at_content_col` maps wrapped views too). Mutually
-    /// exclusive with L line-select mode by construction: created only in `handle_column_mouse`,
-    /// which runs only for `Modal::None`. Auto-copied on release.
-    content_selection: Option<LineSelectState>,
     /// The last complete remote-notice state. Background results replace this value atomically,
     /// so release and spotlight state never land on different redraws.
     notice_snapshot: NoticeSnapshot,
@@ -770,15 +843,6 @@ pub struct Controller {
     /// current" from "a render is still coming" — so `:N` only jumps in-place when the source-mapped
     /// content is actually applied, and otherwise queues against the in-flight render (AC-3/AC-7).
     applied_seq: u64,
-    /// Live incremental-search state: the most-recently-typed query, the matches it produced,
-    /// and which match is current. `None` until the first keystroke in a Search prompt; `Some`
-    /// (even with empty matches) once typing begins. Enter-commit retains it so `n`/`N` can
-    /// navigate the committed matches (AC-14). Cleared to `None` on Esc-cancel (AC-17), on
-    /// opening a new search (AC-20), and at the top of `dispatch_render` so any displayed-content
-    /// change (file-select, view-cycle, baseline-toggle, refresh, re-root, etc.) wipes a committed
-    /// search + its highlighting (AC-20). The incremental-typing path (`refresh_search`) does NOT
-    /// call `dispatch_render`, so live typing is never wiped by that clear.
-    search: Option<SearchState>,
     /// The OS opener seam used by the `O` / `R` hand-offs (open-with-default-app / reveal-in-file-
     /// manager). Injected post-construction via [`set_opener`](Self::set_opener) (like
     /// [`herdr`](Self::herdr)) so the controller stays hermetic in tests. `None` until then.
@@ -855,10 +919,7 @@ impl Controller {
             git_status: BTreeMap::new(),
             focus: Focus::Tree,
             width: 0,
-            content_scroll: 0,
-            content_hscroll: 0,
-            content_width: 0,
-            content_height: 0,
+            active_interaction: PreviewInteractionState::default(),
             wheel_step: crate::config::DEFAULT_SCROLL_LINES as isize,
             split_pct: SPLIT_DEFAULT,
             tree_position: crate::config::TreePosition::Left,
@@ -889,7 +950,6 @@ impl Controller {
             geom: PaneGeometry::default(),
             last_click: None,
             drag: None,
-            content_selection: None,
             notice_snapshot: NoticeSnapshot::default(),
             settings_display: None,
             keybindings_display: None,
@@ -902,7 +962,6 @@ impl Controller {
             open_range_flash: None,
             pending_line_select: None,
             applied_seq: 0,
-            search: None,
             herdr: None,
             our_workspace_id: None,
             base_branch,
@@ -1075,8 +1134,8 @@ impl Controller {
         // too (no-op if `Z` was never used); otherwise the pane would stay full-screen while the
         // plugin resets to the split (`herdr` is session-level and survives the re-root).
         self.leave_host_zoom();
-        self.content_scroll = 0;
-        self.content_hscroll = 0;
+        self.active_interaction.vertical_scroll = 0;
+        self.active_interaction.horizontal_scroll = 0;
         self.tree_hscroll = 0;
         self.overrides.clear();
         // The old root's rendered content is invalid under the new root — drop the displayed-file
@@ -1559,16 +1618,17 @@ impl Controller {
                 need_redraw = true;
             }
         }
-        if width == self.content_width && height == self.content_height {
+        if width == self.active_interaction.viewport_width
+            && height == self.active_interaction.viewport_height
+        {
             return need_redraw; // unchanged — avoid recomputing the clamp on every idle draw
         }
-        let width_changed = width != self.content_width;
-        self.content_width = width;
-        self.content_height = height;
+        let width_changed = width != self.active_interaction.viewport_width;
+        self.active_interaction.viewport_width = width;
+        self.active_interaction.viewport_height = height;
         // A smaller viewport shrinks the max offset, so an existing scroll could now point past
         // the end, leaving blank space; re-clamp both axes to the new geometry.
-        self.content_scroll = self.content_scroll.min(self.max_content_scroll());
-        self.content_hscroll = self.content_hscroll.min(self.max_content_hscroll());
+        self.clamp_active_interaction();
         // A width-sensitive delegate (glow fit-to-pane markdown, or a non-`Raw` delta diff mode)
         // must reflow to the new width, preserving scroll and search (unlike a selection-change
         // render); `rerender_after_resize` gates per-mode whether that applies. A height-only
@@ -1615,7 +1675,20 @@ impl Controller {
 
     /// The content scroll offset (lines). Exposed for the Presenter wiring and tests.
     pub fn content_scroll(&self) -> u16 {
-        self.content_scroll
+        self.active_interaction.vertical_scroll
+    }
+
+    /// The active preview's complete mutable interaction state.
+    pub fn active_interaction(&self) -> &PreviewInteractionState {
+        &self.active_interaction
+    }
+
+    /// Mutably access the active preview's interaction state.
+    ///
+    /// The controller continues to clamp and project this state through its regular input and
+    /// presentation paths; this accessor is the copy seam used by the later pinned snapshot.
+    pub fn active_interaction_mut(&mut self) -> &mut PreviewInteractionState {
+        &mut self.active_interaction
     }
 
     /// Assemble the [`ViewState`] the Presenter draws from: the visible tree rows + cursor,
@@ -1658,8 +1731,8 @@ impl Controller {
             }),
             focus: self.focus,
             width: self.width,
-            content_scroll: self.content_scroll,
-            content_hscroll: self.content_hscroll,
+            content_scroll: self.active_interaction.vertical_scroll,
+            content_hscroll: self.active_interaction.horizontal_scroll,
             // Last frame's tree offset, so the Presenter scrolls minimally from it (#45): selecting
             // a row already in view — e.g. a mouse click — never jumps the viewport.
             tree_scroll: self.geom.tree_scroll,
@@ -1707,10 +1780,14 @@ impl Controller {
             // Populate the highlight overlay from the committed/live search state so the Presenter
             // overlays matches via highlight::apply. `None` when no search is active → draw_content
             // falls through to `state.content.clone()`, byte-identical to the prior path.
-            search: self.search.as_ref().map(|s| ContentSearch {
-                matches: s.matches.clone(),
-                current: s.current,
-            }),
+            search: self
+                .active_interaction
+                .search
+                .as_ref()
+                .map(|s| ContentSearch {
+                    matches: s.matches.clone(),
+                    current: s.current,
+                }),
             // Populate the line-select overlay from the active modal so the Presenter draws the
             // marker + selection highlight (AC-1, AC-7). When the modal is closed, a launch
             // open-range flash (if any) reuses the same view slot as a *passive* highlight only.
@@ -1753,7 +1830,8 @@ impl Controller {
             // Snapshot the ambient selection only when non-collapsed, so a bare click never paints a
             // zero-width highlight (`draw_content` gives `line_select` precedence if both were set).
             content_selection: self
-                .content_selection
+                .active_interaction
+                .selection
                 .as_ref()
                 .filter(|s| {
                     let (a, b) = s.char_span();
@@ -1807,7 +1885,7 @@ impl Controller {
         if query.is_empty() {
             return String::new();
         }
-        match &self.search {
+        match &self.active_interaction.search {
             None => String::new(),
             Some(s) if s.matches.is_empty() => " (no matches)".to_owned(),
             Some(s) => format!(" ({}/{})", s.current + 1, s.matches.len()),
@@ -1821,7 +1899,7 @@ impl Controller {
     /// - ≥1 match: `Search: {query} ({current+1}/{total}) · n next · N prev · Esc clear`
     /// - 0 matches: `Search: {query} (no matches) · Esc clear`
     fn search_status_line(&self) -> Option<String> {
-        let s = self.search.as_ref()?;
+        let s = self.active_interaction.search.as_ref()?;
         let q = &s.query;
         let line = if s.matches.is_empty() {
             format!("Search: {q} (no matches) · Esc clear")
@@ -1963,7 +2041,7 @@ impl Controller {
     /// pane has no measured geometry (before the first layout pass), so a page key is never a no-op.
     fn page_step(&self) -> isize {
         let rows = match self.focus {
-            Focus::Content => self.content_height,
+            Focus::Content => self.active_interaction.viewport_height,
             Focus::Tree => self.geom.tree_inner.map_or(0, |inner| inner.height),
         };
         (rows as isize).max(1)
@@ -2050,14 +2128,28 @@ impl Controller {
     /// above the first line or past the last screenful.
     fn scroll_content(&mut self, delta: isize) {
         let max = self.max_content_scroll() as isize;
-        let next = (self.content_scroll as isize + delta).clamp(0, max);
-        self.content_scroll = next as u16;
+        let next = (self.active_interaction.vertical_scroll as isize + delta).clamp(0, max);
+        self.active_interaction.vertical_scroll = next as u16;
     }
 
     /// The largest valid scroll offset: total rendered lines minus the viewport height.
     fn max_content_scroll(&self) -> u16 {
         self.rendered_line_count()
-            .saturating_sub(self.content_height)
+            .saturating_sub(self.active_interaction.viewport_height)
+    }
+
+    /// Clamp the active interaction's two viewport offsets against the currently displayed lines.
+    /// The active-only shell supplies the current render's wrap and modal-overlay facts until a
+    /// later task supplies a Preview Document.
+    fn clamp_active_interaction(&mut self) {
+        let wrap = self.effective_wrap();
+        let overlay_columns = self.content_overlay_glyph_cols();
+        clamp_offsets(
+            &mut self.active_interaction,
+            &self.content.lines,
+            wrap,
+            overlay_columns,
+        );
     }
 
     /// How many rows the content occupies once laid out, so the vertical scroll clamps to the
@@ -2078,12 +2170,12 @@ impl Controller {
     /// extra tree walk `effective_wrap` would do. This is the wrapped-aware row total the content
     /// vertical scrollbar must size/position against — raw `lines.len()` undercounts under wrap.
     fn rendered_line_count_for(&self, wrap: bool) -> u16 {
-        let count = if wrap {
-            self.wrapped_rows_before(self.content.lines.len())
-        } else {
-            self.content.lines.len()
-        };
-        count.min(u16::MAX as usize) as u16
+        rendered_rows(
+            &self.active_interaction,
+            &self.content.lines,
+            wrap,
+            self.content_overlay_glyph_cols(),
+        )
     }
 
     /// Cumulative display rows the first `n` content (source) lines occupy at the current content
@@ -2092,14 +2184,12 @@ impl Controller {
     /// the display-row offset of a source line), so the scroll clamp and the go-to-line target are
     /// computed by the SAME wrapping logic and therefore always agree (AC-3/AC-4).
     fn wrapped_rows_before(&self, n: usize) -> usize {
-        let w = self.content_width as usize;
-        let overlay = self.content_overlay_glyph_cols();
-        self.content
-            .lines
-            .iter()
-            .take(n)
-            .map(|l| crate::text_layout::line_wrapped_rows_prefixed(l, w, overlay))
-            .sum::<usize>()
+        wrapped_rows_before(
+            &self.active_interaction,
+            &self.content.lines,
+            n,
+            self.content_overlay_glyph_cols(),
+        )
     }
 
     /// The 0-based display-row offset at which 1-based source `line` begins. Without wrap a source
@@ -2124,55 +2214,35 @@ impl Controller {
     /// override (the copy-line-reference wrap fix). Returns at least 1; the last source line for a
     /// `row` past the end. `content.lines` empty ⇒ 1 (callers guard the empty case separately).
     fn line_at_content_row(&self, row: usize) -> usize {
-        if !self.effective_wrap() {
-            return row + 1;
-        }
-        let w = self.content_width as usize;
-        let overlay = self.content_overlay_glyph_cols();
-        let mut acc = 0usize;
-        for (i, line) in self.content.lines.iter().enumerate() {
-            acc += crate::text_layout::line_wrapped_rows_prefixed(line, w, overlay);
-            if row < acc {
-                return i + 1;
-            }
-        }
-        self.content.lines.len().max(1)
-    }
-
-    /// Extract the plain-text content of every displayed line (ANSI spans joined, no styling).
-    /// Used by the incremental search to feed `search::find_matches`; search always
-    /// operates on the DISPLAYED content, not the source file, so it works identically across
-    /// every view mode (SyntaxContent, Diff, RenderedMarkdown — AC-13).
-    fn content_plain_lines(&self) -> Vec<String> {
-        self.content
-            .lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect()
+        line_at_row(
+            &self.active_interaction,
+            &self.content.lines,
+            row,
+            self.effective_wrap(),
+            self.content_overlay_glyph_cols(),
+        )
     }
 
     /// Scroll the content pane horizontally by `delta` columns, clamped to `[0, max]`.
     fn scroll_content_h(&mut self, delta: i32) -> Effects {
         let max = self.max_content_hscroll() as i32;
-        let next = (self.content_hscroll as i32 + delta).clamp(0, max);
-        self.content_hscroll = next as u16;
+        let next = (self.active_interaction.horizontal_scroll as i32 + delta).clamp(0, max);
+        self.active_interaction.horizontal_scroll = next as u16;
         Effects::redraw()
     }
 
     /// The largest valid horizontal offset: the widest content line minus the viewport width.
     /// Zero while wrapping (no line overflows the pane, so there is nothing to scroll past).
     fn max_content_hscroll(&self) -> u16 {
-        if self.effective_wrap() {
-            return 0;
-        }
-        let widest = self
-            .content
-            .lines
-            .iter()
-            .map(|l| l.width())
-            .max()
-            .unwrap_or(0);
-        (widest.min(u16::MAX as usize) as u16).saturating_sub(self.content_width)
+        let mut clamped = self.active_interaction.clone();
+        clamped.horizontal_scroll = u16::MAX;
+        clamp_offsets(
+            &mut clamped,
+            &self.content.lines,
+            self.effective_wrap(),
+            self.content_overlay_glyph_cols(),
+        );
+        clamped.horizontal_scroll
     }
 
     /// Right (→/l): expand the selected directory when the tree is focused, or scroll the
@@ -2573,7 +2643,7 @@ impl Controller {
     fn close_or_unzoom(&mut self) -> Effects {
         // Esc drops an ambient selection first — the outermost layer of the Esc stack, ahead of
         // search / unzoom / quit. (A collapsed selection held mid-press is swallowed too; harmless.)
-        if self.content_selection.take().is_some() {
+        if self.active_interaction.selection.take().is_some() {
             return Effects::redraw();
         }
         // Same layer: dismiss a launch open-range flash without quitting.
@@ -2582,8 +2652,8 @@ impl Controller {
         }
         // A committed search (prompt closed, highlights persisting) is dismissed first — Esc/q
         // "come out of the search" before they unzoom or close (layered like unzoom). (owner UX)
-        if self.search.is_some() && !self.prompt_open() {
-            self.search = None;
+        if self.active_interaction.search.is_some() && !self.prompt_open() {
+            self.active_interaction.search = None;
             return Effects::redraw();
         }
         if self.zoomed {
@@ -2755,8 +2825,7 @@ impl Controller {
     /// scroll and search, like a resize reflow. The scroll clamp recomputes from the new layout.
     fn toggle_wrap(&mut self) -> Effects {
         self.wrap_override = Some(!self.effective_wrap());
-        self.content_scroll = self.content_scroll.min(self.max_content_scroll());
-        self.content_hscroll = self.content_hscroll.min(self.max_content_hscroll());
+        self.clamp_active_interaction();
         // Markdown must re-render at the new wrap width (fit vs. natural); a no-op for other modes,
         // which only need the re-clamp above.
         self.rerender_after_wrap_toggle();
@@ -2861,7 +2930,7 @@ impl Controller {
     /// has been typed into yet, or the prompt was closed and state cleared). Exposed for tests;
     /// the Presenter reads it for the highlight overlay.
     pub fn search(&self) -> Option<&SearchState> {
-        self.search.as_ref()
+        self.active_interaction.search.as_ref()
     }
 
     /// The full candidate list loaded when the finder was opened, or an empty slice when
@@ -2902,7 +2971,8 @@ impl Controller {
     /// natural-width layout and the pane scrolls to reveal the whole table, and `None` before the
     /// first draw has measured the pane (`content_width == 0`). Only the markdown delegate uses it.
     fn md_wrap_width(&self) -> Option<u16> {
-        (self.content_width > 0 && self.effective_wrap()).then_some(self.content_width)
+        (self.active_interaction.viewport_width > 0 && self.effective_wrap())
+            .then_some(self.active_interaction.viewport_width)
     }
 
     /// The content pane's drawable text width, unconditional (unlike
@@ -2910,7 +2980,8 @@ impl Controller {
     /// preference) — feeds `delta`'s own `--width` for the diff modes. `None` before the
     /// first draw has measured the pane.
     fn pane_width(&self) -> Option<u16> {
-        (self.content_width > 0).then_some(self.content_width)
+        (self.active_interaction.viewport_width > 0)
+            .then_some(self.active_interaction.viewport_width)
     }
 
     /// `w` wrap toggle: re-render if the selection is rendered markdown, since wrap changes
@@ -3003,8 +3074,8 @@ impl Controller {
         let seq = self.latest_seq;
         // A fresh render means new content — start it at the top-left, never inheriting the
         // previous file's scroll offsets.
-        self.content_scroll = 0;
-        self.content_hscroll = 0;
+        self.active_interaction.vertical_scroll = 0;
+        self.active_interaction.horizontal_scroll = 0;
         // A new render supersedes any queued go-to-line jump from an OLDER render (e.g. the user
         // navigated away before an auto-switch render landed). The auto-switch path sets its own
         // `pending_goto` AFTER calling this, so its jump survives; only stale ones are cleared.
@@ -3019,11 +3090,11 @@ impl Controller {
         // `refresh_search` (the incremental-typing path) only calls `scroll_to_line` and sets
         // `self.search` directly — it does NOT call `dispatch_render` — so live typing is NOT
         // wiped by this clear.
-        self.search = None;
+        self.active_interaction.search = None;
         // Drop an ambient selection on any content change: its line/char coordinates only mean
         // something against the body it was dragged over, so a stale highlight (and copy) must not
         // carry onto new content. Scrolling keeps it — it doesn't dispatch, and the coords stay valid.
-        self.content_selection = None;
+        self.active_interaction.selection = None;
         // Launch open-range flash is also content-bound: a new file/view must not keep the old
         // range painted. (apply_open_target re-arms it after its own dispatch.)
         self.open_range_flash = None;
@@ -3119,7 +3190,7 @@ impl Controller {
                 // dispatch_render's clear must not carry its stale coordinates onto the new body.
                 // (Also dropped on a reflow: an ambient selection's line/col coords are against the
                 // pre-reflow rendered lines, so they no longer point at the same text.)
-                self.content_selection = None;
+                self.active_interaction.selection = None;
                 self.content_notices = result.notices;
                 self.content_source = result.source; // in lockstep with `content` (copy fidelity)
                 self.applied_seq = seq; // the displayed content is now this render (go-to-line guard)
@@ -3128,7 +3199,7 @@ impl Controller {
                 // the offset to the new content. A selection-change render already reset scroll to 0
                 // in dispatch_render, so this is gated to the reflow path.
                 if is_reflow {
-                    self.content_scroll = self.content_scroll.min(self.max_content_scroll());
+                    self.clamp_active_interaction();
                 }
                 // the body has landed — now switch the title to match it. The latest
                 // dispatched render always corresponds to the current tree selection (every
@@ -3161,9 +3232,9 @@ impl Controller {
                     if !self.content.lines.is_empty() {
                         let last = self.content.lines.len();
                         let top = self
-                            .line_at_content_row(self.content_scroll as usize)
+                            .line_at_content_row(self.active_interaction.vertical_scroll as usize)
                             .clamp(1, last);
-                        self.modal = Modal::LineSelect(LineSelectState::new(top));
+                        self.modal = Modal::LineSelect(PreviewSelection::new(top));
                     }
                     self.pending_line_select = None;
                 }
@@ -3178,7 +3249,7 @@ impl Controller {
                 } else if is_reflow {
                     self.recompute_committed_search();
                 } else {
-                    self.search = None;
+                    self.active_interaction.search = None;
                 }
             }
             // else: a superseded selection's render — drop it.

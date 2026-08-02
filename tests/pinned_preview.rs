@@ -1,0 +1,200 @@
+//! Pinned-preview interaction-state seams that are useful before pin lifecycle wiring lands.
+
+mod common;
+
+use common::TempDir;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use herdr_file_viewer::controller::{
+    Components, ContentProvider, Controller, EditorHandoff, EditorOutcome, GitService,
+    RenderResult, RootProviders,
+};
+use herdr_file_viewer::git::{Baseline, Status};
+use herdr_file_viewer::infile::SearchState;
+use herdr_file_viewer::intent::Intent;
+use herdr_file_viewer::presenter::{Focus, PaneGeometry};
+use herdr_file_viewer::search::Match;
+use herdr_file_viewer::view_policy::ViewMode;
+use ratatui::layout::Rect;
+use ratatui::text::Text;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct StubGit;
+
+impl GitService for StubGit {
+    fn status(&self) -> BTreeMap<std::path::PathBuf, Status> {
+        BTreeMap::new()
+    }
+
+    fn changed_set(&self, _baseline: Baseline) -> BTreeMap<std::path::PathBuf, Status> {
+        BTreeMap::new()
+    }
+
+    fn diff(&self, _path: &Path, _baseline: Baseline, _full_context: bool) -> String {
+        String::new()
+    }
+
+    fn diff_directory(&self, _path: &Path, _baseline: Baseline) -> String {
+        String::new()
+    }
+}
+
+#[derive(Clone)]
+struct Lines;
+
+impl ContentProvider for Lines {
+    fn render(&self, _path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        RenderResult {
+            content: Text::raw(
+                (1..=20)
+                    .map(|n| format!("line {n} needle"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            notices: Vec::new(),
+            source: None,
+        }
+    }
+}
+
+struct NoopEditor;
+
+impl EditorHandoff for NoopEditor {
+    fn open(&mut self, _file: &Path) -> EditorOutcome {
+        EditorOutcome::NoTakeover
+    }
+}
+
+fn controller(root: &Path) -> Controller {
+    let components = Components {
+        providers: Box::new(|_resolved| RootProviders {
+            git: Arc::new(StubGit),
+            content: Box::new(Lines),
+        }),
+        editor: Box::new(NoopEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    Controller::new(
+        common::resolved(root.to_path_buf(), false),
+        Baseline::Head,
+        components,
+    )
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn await_content(ctrl: &mut Controller) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ctrl.content().lines.len() != 20 {
+        ctrl.poll();
+        assert!(Instant::now() < deadline, "preview content never rendered");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn active_interaction_can_be_copied_and_mutated_independently() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut ctrl = controller(dir.path());
+
+    let interaction = ctrl.active_interaction_mut();
+    interaction.vertical_scroll = 7;
+    interaction.horizontal_scroll = 3;
+    interaction.search = Some(SearchState {
+        query: "needle".into(),
+        matches: vec![
+            Match {
+                line: 2,
+                start: 7,
+                end: 13,
+            },
+            Match {
+                line: 4,
+                start: 7,
+                end: 13,
+            },
+        ],
+        current: 1,
+    });
+
+    let mut copied = ctrl.active_interaction().clone();
+    copied.vertical_scroll = 11;
+    copied.horizontal_scroll = 9;
+    copied.search.as_mut().unwrap().query = "changed".into();
+
+    assert_eq!(ctrl.active_interaction().vertical_scroll, 7);
+    assert_eq!(ctrl.active_interaction().horizontal_scroll, 3);
+    assert_eq!(
+        ctrl.active_interaction().search.as_ref().unwrap().query,
+        "needle"
+    );
+    assert_eq!(
+        ctrl.active_interaction().search.as_ref().unwrap().current,
+        1
+    );
+    assert_ne!(copied, *ctrl.active_interaction());
+}
+
+#[test]
+fn unpinned_navigation_projects_the_existing_active_interaction() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut ctrl = controller(dir.path());
+    await_content(&mut ctrl);
+    ctrl.set_content_viewport(40, 5);
+    ctrl.set_pane_geometry(PaneGeometry {
+        content_inner: Some(Rect::new(0, 0, 40, 5)),
+        ..Default::default()
+    });
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::NavDown);
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 6,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 6,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_eq!(ctrl.active_interaction().vertical_scroll, 0);
+    assert_eq!(ctrl.view_state().content_scroll, 0);
+    assert_eq!(ctrl.active_interaction().horizontal_scroll, 0);
+    assert_eq!(
+        ctrl.search().map(|search| search.query.as_str()),
+        Some("needle")
+    );
+    assert_eq!(
+        ctrl.view_state()
+            .search
+            .as_ref()
+            .map(|search| search.matches.len()),
+        Some(20)
+    );
+    assert!(ctrl.active_interaction().selection.is_some());
+    assert!(ctrl.view_state().content_selection.is_some());
+}

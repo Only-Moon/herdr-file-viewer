@@ -204,6 +204,97 @@ impl PreviewDocument {
     }
 }
 
+/// A displayed-text selection local to one preview.
+///
+/// The active preview uses this value for its ambient mouse-drag selection and for the line-select
+/// modal. A pinned preview never accepts selection input, but keeping the value with the other
+/// interaction data makes a copied interaction state self-contained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewSelection {
+    anchor: usize,
+    marker: usize,
+    anchor_col: usize,
+    marker_col: usize,
+    char_mode: bool,
+}
+
+impl PreviewSelection {
+    /// Start a collapsed whole-line selection on `line`.
+    pub fn new(line: usize) -> Self {
+        Self {
+            anchor: line,
+            marker: line,
+            anchor_col: 0,
+            marker_col: 0,
+            char_mode: false,
+        }
+    }
+
+    /// Begin a character-granular selection, clamped to the displayed line extent.
+    pub fn begin_char(&mut self, line: usize, col: usize, last: usize) {
+        let line = Self::clamp(line, last);
+        self.anchor = line;
+        self.marker = line;
+        self.anchor_col = col;
+        self.marker_col = col;
+        self.char_mode = true;
+    }
+
+    /// Extend a character-granular selection, retaining its original anchor.
+    pub fn drag_char(&mut self, line: usize, col: usize, last: usize) {
+        self.marker = Self::clamp(line, last);
+        self.marker_col = col;
+        self.char_mode = true;
+    }
+
+    /// Return whether this is a character-granular selection.
+    pub fn is_char_mode(&self) -> bool {
+        self.char_mode
+    }
+
+    /// Return the ordered character span as `(line, column)` carets.
+    pub fn char_span(&self) -> ((usize, usize), (usize, usize)) {
+        let anchor = (self.anchor, self.anchor_col);
+        let marker = (self.marker, self.marker_col);
+        if anchor <= marker {
+            (anchor, marker)
+        } else {
+            (marker, anchor)
+        }
+    }
+
+    /// Move and collapse the marker onto a whole-line selection.
+    pub fn move_to(&mut self, line: usize, last: usize) {
+        self.marker = Self::clamp(line, last);
+        self.anchor = self.marker;
+        self.char_mode = false;
+    }
+
+    /// Move the marker while retaining the whole-line selection anchor.
+    pub fn extend_to(&mut self, line: usize, last: usize) {
+        self.marker = Self::clamp(line, last);
+        self.char_mode = false;
+    }
+
+    /// Return the marker line, using the preview's one-based line convention.
+    pub fn marker(&self) -> usize {
+        self.marker
+    }
+
+    /// Return the selected whole-line range in ascending order.
+    pub fn selection(&self) -> (usize, usize) {
+        if self.anchor <= self.marker {
+            (self.anchor, self.marker)
+        } else {
+            (self.marker, self.anchor)
+        }
+    }
+
+    fn clamp(line: usize, last: usize) -> usize {
+        line.max(1).min(last.max(1))
+    }
+}
+
 /// Mutable, session-only interactions for one preview document.
 ///
 /// Active and pinned previews receive separate instances so their viewport and search state never
@@ -220,6 +311,8 @@ pub struct PreviewInteractionState {
     pub viewport_height: u16,
     /// The preview-local in-file search state, when a search has begun.
     pub search: Option<SearchState>,
+    /// A transient displayed-text selection. Only the active preview projects or mutates it.
+    pub selection: Option<PreviewSelection>,
 }
 
 #[cfg(test)]
@@ -403,6 +496,7 @@ mod tests {
                 }],
                 current: 0,
             }),
+            selection: None,
         };
         let mut copied = interaction.clone();
 

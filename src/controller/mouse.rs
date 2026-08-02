@@ -146,14 +146,14 @@ impl Controller {
                     }
                     let (line, caret) = self.char_at_content_col(col, row);
                     let last = self.content.lines.len().max(1);
-                    let mut sel = LineSelectState::new(line);
+                    let mut sel = PreviewSelection::new(line);
                     sel.begin_char(line, caret, last);
-                    self.content_selection = Some(sel);
+                    self.active_interaction.selection = Some(sel);
                     self.drag = Some(Drag::ContentSelect);
                     return Effects::redraw();
                 }
                 // A press anywhere outside the content region drops a standing ambient selection.
-                let had_selection = self.content_selection.take().is_some();
+                let had_selection = self.active_interaction.selection.take().is_some();
                 self.drag = match region {
                     MouseRegion::Divider => Some(Drag::Divider),
                     MouseRegion::ContentVBar => Some(Drag::ContentV),
@@ -186,7 +186,7 @@ impl Controller {
                 Some(Drag::ContentSelect) => {
                     let (line, caret) = self.char_at_content_col(col, row);
                     let last = self.content.lines.len().max(1);
-                    if let Some(sel) = self.content_selection.as_mut() {
+                    if let Some(sel) = self.active_interaction.selection.as_mut() {
                         sel.drag_char(line, caret, last);
                     }
                     self.autoscroll_selection(row);
@@ -200,7 +200,8 @@ impl Controller {
                 // keeping the highlight.
                 Some(Drag::ContentSelect) => {
                     let collapsed = self
-                        .content_selection
+                        .active_interaction
+                        .selection
                         .as_ref()
                         .map(|s| {
                             let (a, b) = s.char_span();
@@ -209,7 +210,7 @@ impl Controller {
                         .unwrap_or(true);
                     self.last_click = None;
                     if collapsed {
-                        self.content_selection = None;
+                        self.active_interaction.selection = None;
                         self.focus = Focus::Content;
                         Effects::redraw()
                     } else {
@@ -378,7 +379,7 @@ impl Controller {
         else {
             return Effects::noop();
         };
-        self.content_scroll = off as u16;
+        self.active_interaction.vertical_scroll = off as u16;
         Effects::redraw()
     }
 
@@ -392,7 +393,7 @@ impl Controller {
         else {
             return Effects::noop();
         };
-        self.content_hscroll = off as u16;
+        self.active_interaction.horizontal_scroll = off as u16;
         Effects::redraw()
     }
 
