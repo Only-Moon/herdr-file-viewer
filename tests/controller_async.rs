@@ -228,6 +228,55 @@ fn an_applied_render_exposes_one_complete_active_preview_document() {
 }
 
 #[test]
+fn pinning_while_the_new_selection_is_rendering_rejects_without_capturing_it() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "1\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "2\n").unwrap();
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(NoGit),
+            content: Box::new(SlowContent {
+                delay: Duration::from_millis(80),
+            }),
+        }),
+        editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_contains(&mut ctrl, "rendered:a.rs");
+    ctrl.pin_active_preview();
+    let original = ctrl
+        .view_state()
+        .pinned
+        .expect("settled initial selection was pinned")
+        .origin
+        .expect("pin retains initial identity");
+
+    ctrl.handle(Intent::NavDown);
+    assert!(
+        ctrl.view_state().active.rendering,
+        "b.rs render is in flight"
+    );
+    assert!(ctrl.pin_active_preview().redraw);
+    assert_eq!(
+        ctrl.action_notice(),
+        Some("Cannot pin while preview is rendering")
+    );
+    assert_eq!(
+        ctrl.view_state()
+            .pinned
+            .expect("rejection keeps existing pin")
+            .origin,
+        Some(original)
+    );
+}
+
+#[test]
 fn a_select_intent_does_not_block_on_a_slow_render_and_content_arrives_later() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.rs"), "1\n").unwrap();

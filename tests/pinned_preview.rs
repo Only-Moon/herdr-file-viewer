@@ -75,6 +75,18 @@ impl ContentProvider for CountingLines {
     }
 }
 
+struct DiskContent;
+
+impl ContentProvider for DiskContent {
+    fn render(&self, path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        RenderResult {
+            content: Text::raw(std::fs::read_to_string(path).unwrap()),
+            notices: Vec::new(),
+            source: None,
+        }
+    }
+}
+
 struct NoopEditor;
 
 impl EditorHandoff for NoopEditor {
@@ -109,6 +121,32 @@ fn await_content(ctrl: &mut Controller) {
     while ctrl.content().lines.len() != 20 {
         ctrl.poll();
         assert!(Instant::now() < deadline, "preview content never rendered");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn content_text(ctrl: &Controller) -> String {
+    ctrl.content()
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn await_content_containing(ctrl: &mut Controller, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !content_text(ctrl).contains(expected) {
+        ctrl.poll();
+        assert!(
+            Instant::now() < deadline,
+            "preview content never rendered {expected:?}"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -318,4 +356,148 @@ fn loading_directory_and_empty_tree_are_not_active_documents() {
         empty.active_document().is_none(),
         "empty-tree guidance is not pinnable"
     );
+}
+
+#[test]
+fn pin_lifecycle_clones_the_settled_preview_and_toggles_the_same_identity() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut ctrl = controller(dir.path());
+    await_content(&mut ctrl);
+    ctrl.set_content_viewport(40, 5);
+    let interaction = ctrl.active_interaction_mut();
+    interaction.vertical_scroll = 7;
+    interaction.horizontal_scroll = 3;
+    interaction.search = Some(SearchState {
+        query: "needle".into(),
+        matches: vec![Match {
+            line: 4,
+            start: 7,
+            end: 13,
+        }],
+        current: 0,
+    });
+
+    assert!(ctrl.pin_active_preview().redraw);
+    let pin = ctrl.view_state().pinned.expect("settled file is pinned");
+    assert_eq!(pin.content, *ctrl.content());
+    assert_eq!(pin.scroll, 7);
+    assert_eq!(pin.hscroll, 3);
+    assert_eq!(pin.search.expect("copied search").matches.len(), 1);
+    assert_eq!(ctrl.view_state().preview_split_pct, 50);
+
+    assert!(ctrl.pin_active_preview().redraw);
+    assert!(
+        ctrl.view_state().pinned.is_none(),
+        "same identity removes the pin"
+    );
+
+    assert!(ctrl.pin_active_preview().redraw);
+    assert!(ctrl.view_state().pinned.is_some());
+    assert_eq!(ctrl.view_state().preview_split_pct, 50);
+}
+
+#[test]
+fn pinning_a_different_file_replaces_one_frozen_snapshot_without_rendering() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = Arc::clone(&calls);
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(StubGit),
+            content: Box::new(CountingLines {
+                calls: Arc::clone(&provider_calls),
+            }),
+        }),
+        editor: Box::new(NoopEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_content(&mut ctrl);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    ctrl.pin_active_preview();
+    let first = ctrl
+        .view_state()
+        .pinned
+        .expect("first file was captured")
+        .origin
+        .expect("pins retain origins");
+
+    ctrl.handle(Intent::NavDown);
+    await_content(&mut ctrl);
+    let frozen = ctrl.view_state().pinned.expect("navigation keeps the pin");
+    assert_eq!(frozen.origin.as_ref(), Some(&first));
+
+    let calls_before_pin = calls.load(Ordering::SeqCst);
+    ctrl.pin_active_preview();
+    assert_provider_call_count_stays(&calls, calls_before_pin);
+    let replacement = ctrl.view_state().pinned.expect("different file replaces");
+    assert_ne!(replacement.origin.as_ref(), Some(&first));
+    assert_eq!(replacement.content.lines.len(), 20);
+}
+
+#[test]
+fn rejected_pin_attempts_leave_no_file_and_directory_targets_explained() {
+    let empty_root = TempDir::new();
+    let mut empty = controller(empty_root.path());
+    assert!(empty.pin_active_preview().redraw);
+    assert!(empty.view_state().pinned.is_none());
+    assert_eq!(
+        empty.action_notice(),
+        Some("Cannot pin: no file is selected")
+    );
+
+    let directory_root = TempDir::new();
+    std::fs::create_dir(directory_root.path().join("child")).unwrap();
+    let mut directory = controller(directory_root.path());
+    assert!(directory.pin_active_preview().redraw);
+    assert!(directory.view_state().pinned.is_none());
+    assert_eq!(directory.action_notice(), Some("Cannot pin a directory"));
+}
+
+#[test]
+fn active_refresh_and_width_reflow_do_not_change_a_pinned_snapshot() {
+    let dir = TempDir::new();
+    let path = dir.path().join("preview.md");
+    std::fs::write(&path, "before reflow\n").unwrap();
+    let components = Components {
+        providers: Box::new(|_resolved| RootProviders {
+            git: Arc::new(StubGit),
+            content: Box::new(DiskContent),
+        }),
+        editor: Box::new(NoopEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_content_containing(&mut ctrl, "before reflow");
+    ctrl.pin_active_preview();
+    let before = ctrl.view_state().pinned.expect("pin before active changes");
+
+    std::fs::write(&path, "after reflow\n").unwrap();
+    ctrl.set_content_viewport(40, 5);
+    await_content_containing(&mut ctrl, "after reflow");
+    std::fs::write(&path, "after refresh\n").unwrap();
+    ctrl.handle(Intent::Refresh);
+    await_content_containing(&mut ctrl, "after refresh");
+    let after = ctrl
+        .view_state()
+        .pinned
+        .expect("pin survives active refresh");
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.notices, before.notices);
+    assert_eq!(after.origin, before.origin);
+    assert_eq!(after.scroll, before.scroll);
+    assert_eq!(after.hscroll, before.hscroll);
 }

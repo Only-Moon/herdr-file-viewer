@@ -29,6 +29,7 @@ mod infile;
 mod lineselect;
 mod mouse;
 mod picker;
+mod pinned;
 
 use crate::annotation::AnnotationStore;
 use crate::finder::FinderState;
@@ -55,6 +56,7 @@ use crate::update::{self, NoticeSnapshot, UpdateState};
 use crate::view_policy::{FileDescriptor, ViewMode, applicable_modes, default_mode};
 use annotation::{AnnotationEditorState, AnnotationListState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use pinned::PinnedSnapshot;
 use ratatui::layout::Position;
 use ratatui::text::{Line, Text};
 use std::collections::{BTreeMap, HashMap};
@@ -772,6 +774,10 @@ pub struct Controller {
     /// Mutable viewport, search, and displayed-text selection state for the active preview.
     /// A later pinned snapshot owns a distinct clone of this value.
     active_interaction: PreviewInteractionState,
+    /// The one optional frozen document and independently evolving interaction state.
+    pinned_snapshot: Option<PinnedSnapshot>,
+    /// The pinned preview's share of the preview area, preserved across removal/recreation.
+    preview_split_pct: u16,
     /// How many lines (or finder list items, or help-overlay lines) one mouse-wheel event advances
     /// — the effective **scroll step** (config `scroll_lines`, else [`crate::config::DEFAULT_SCROLL_LINES`]).
     /// Set once at startup via [`apply_scroll_lines`](Self::apply_scroll_lines). Held as `isize`
@@ -1022,6 +1028,8 @@ impl Controller {
             focus: Focus::Tree,
             width: 0,
             active_interaction: PreviewInteractionState::default(),
+            pinned_snapshot: None,
+            preview_split_pct: 50,
             wheel_step: crate::config::DEFAULT_SCROLL_LINES as isize,
             split_pct: SPLIT_DEFAULT,
             tree_position: crate::config::TreePosition::Left,
@@ -1754,7 +1762,9 @@ impl Controller {
     /// seam remains the owner of launch-open zoom and width-sensitive rerendering; a pinned
     /// interaction state is added by the lifecycle task.
     pub fn set_preview_viewports(&mut self, viewports: PreviewViewports) -> bool {
-        self.set_content_viewport(viewports.active.0, viewports.active.1)
+        let redraw = self.set_content_viewport(viewports.active.0, viewports.active.1);
+        self.set_pinned_viewport(viewports.pinned);
+        redraw
     }
 
     /// Receive the hit-test geometry the Presenter drew this frame (fed back from the draw
@@ -1918,7 +1928,7 @@ impl Controller {
                 selection: selection.clone(),
                 origin: None,
             },
-            pinned: None,
+            pinned: self.pinned_projection(),
             content: self.content().clone(),
             notices: self.notices(),
             flash: self.flash.as_ref().map(|f| crate::presenter::FlashLine {
@@ -1933,7 +1943,7 @@ impl Controller {
             // a row already in view — e.g. a mouse click — never jumps the viewport.
             tree_scroll: self.geom.tree_scroll,
             tree_hscroll: self.tree_hscroll,
-            preview_split_pct: 50,
+            preview_split_pct: self.preview_split_pct,
             content_rows,
             wrap,
             content_pad_left,
