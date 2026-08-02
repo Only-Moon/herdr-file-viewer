@@ -81,7 +81,7 @@ impl Controller {
     /// rows, so the offset is the cumulative wrapped-row count of the lines BEFORE the target — the
     /// same mapping the wrapped-row total uses, so `:N` lands on source line N either way. (AC-3, AC-4)
     pub fn scroll_to_line(&mut self, line_1based: usize) {
-        let source_lines = self.content.lines.len();
+        let source_lines = self.active_lines().len();
         let line = line_1based.max(1).min(source_lines.max(1));
         let offset = if self.effective_wrap() {
             self.wrapped_rows_before(line - 1)
@@ -324,9 +324,8 @@ impl Controller {
             .prompt()
             .map(|p| p.input.query().to_string())
             .unwrap_or_default();
-        if let Some(first_line) =
-            refresh_search(&mut self.active_interaction, &self.content.lines, q)
-        {
+        let lines = &self.active_display.content().lines;
+        if let Some(first_line) = refresh_search(&mut self.active_interaction, lines, q) {
             // `first_line` is 0-based; scroll_to_line takes 1-based.
             self.scroll_to_line(first_line + 1);
         }
@@ -343,6 +342,7 @@ impl Controller {
     ///
     /// [`refresh_search`]: Self::refresh_search
     pub(super) fn recompute_committed_search(&mut self) {
-        recompute_search(&mut self.active_interaction, &self.content.lines);
+        let lines = &self.active_display.content().lines;
+        recompute_search(&mut self.active_interaction, lines);
     }
 }

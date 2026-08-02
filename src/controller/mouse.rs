@@ -54,7 +54,7 @@ impl Controller {
             return Effects::noop();
         }
         let (col, row) = (ev.column, ev.row);
-        let last = self.content.lines.len().max(1);
+        let last = self.active_lines().len().max(1);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A press outside the content region is inert and drops any in-flight drag.
@@ -141,11 +141,11 @@ impl Controller {
                     // But not over the "Rendering…" placeholder: a file *is* selected mid-render, so
                     // the is-file guard in `copy_content_selection` wouldn't stop a drag from copying
                     // the placeholder text. (The press still focuses the pane.)
-                    if self.content_rendering {
+                    if self.active_display.is_loading() {
                         return Effects::redraw();
                     }
                     let (line, caret) = self.char_at_content_col(col, row);
-                    let last = self.content.lines.len().max(1);
+                    let last = self.active_lines().len().max(1);
                     let mut sel = PreviewSelection::new(line);
                     sel.begin_char(line, caret, last);
                     self.active_interaction.selection = Some(sel);
@@ -185,7 +185,7 @@ impl Controller {
                 // — the L-mode drag, but on the Modal-independent `content_selection`.
                 Some(Drag::ContentSelect) => {
                     let (line, caret) = self.char_at_content_col(col, row);
-                    let last = self.content.lines.len().max(1);
+                    let last = self.active_lines().len().max(1);
                     if let Some(sel) = self.active_interaction.selection.as_mut() {
                         sel.drag_char(line, caret, last);
                     }

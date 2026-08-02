@@ -12,13 +12,17 @@ use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::infile::SearchState;
 use herdr_file_viewer::intent::Intent;
 use herdr_file_viewer::presenter::{Focus, PaneGeometry};
+use herdr_file_viewer::preview::PreviewPresentation;
 use herdr_file_viewer::search::Match;
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::layout::Rect;
 use ratatui::text::Text;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -60,6 +64,17 @@ impl ContentProvider for Lines {
     }
 }
 
+struct CountingLines {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ContentProvider for CountingLines {
+    fn render(&self, _path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Lines.render(_path, _mode, _raw_diff)
+    }
+}
+
 struct NoopEditor;
 
 impl EditorHandoff for NoopEditor {
@@ -96,6 +111,19 @@ fn await_content(ctrl: &mut Controller) {
         assert!(Instant::now() < deadline, "preview content never rendered");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn assert_provider_call_count_stays(calls: &AtomicUsize, expected: usize) {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            expected,
+            "content provider call count changed during the bounded quiet period"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), expected);
 }
 
 #[test]
@@ -197,4 +225,97 @@ fn unpinned_navigation_projects_the_existing_active_interaction() {
     );
     assert!(ctrl.active_interaction().selection.is_some());
     assert!(ctrl.view_state().content_selection.is_some());
+}
+
+#[test]
+fn layout_only_wrap_toggle_keeps_the_active_document_presentation_in_sync() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut ctrl = controller(dir.path());
+    await_content(&mut ctrl);
+
+    ctrl.handle(Intent::ToggleWrap);
+
+    let projected = ctrl.view_state();
+    let settled = *ctrl
+        .active_document()
+        .expect("the syntax preview remains a settled active document")
+        .presentation();
+    assert_eq!(
+        settled,
+        PreviewPresentation::new(
+            settled.view_mode(),
+            projected.wrap,
+            projected.content_pad_left,
+        )
+    );
+}
+
+#[test]
+fn no_pin_navigation_does_not_add_content_provider_work() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = Arc::clone(&calls);
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(StubGit),
+            content: Box::new(CountingLines {
+                calls: Arc::clone(&provider_calls),
+            }),
+        }),
+        editor: Box::new(NoopEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_content(&mut ctrl);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one initial file render");
+
+    ctrl.set_content_viewport(40, 5);
+    ctrl.set_pane_geometry(PaneGeometry {
+        content_inner: Some(Rect::new(0, 0, 40, 5)),
+        ..Default::default()
+    });
+    ctrl.handle(Intent::ToggleFocus);
+    ctrl.handle(Intent::NavDown);
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    ctrl.handle(Intent::NextMatch);
+    ctrl.handle(Intent::PrevMatch);
+
+    assert_provider_call_count_stays(&calls, 1);
+}
+
+#[test]
+fn loading_directory_and_empty_tree_are_not_active_documents() {
+    let loading_root = TempDir::new();
+    std::fs::write(loading_root.path().join("preview.rs"), "placeholder\n").unwrap();
+    let loading = controller(loading_root.path());
+    assert!(
+        loading.active_document().is_none(),
+        "loading is not pinnable"
+    );
+
+    let directory_root = TempDir::new();
+    std::fs::create_dir(directory_root.path().join("child")).unwrap();
+    let directory = controller(directory_root.path());
+    assert!(
+        directory.active_document().is_none(),
+        "directory guidance is not pinnable"
+    );
+
+    let empty_root = TempDir::new();
+    let empty = controller(empty_root.path());
+    assert!(
+        empty.active_document().is_none(),
+        "empty-tree guidance is not pinnable"
+    );
 }

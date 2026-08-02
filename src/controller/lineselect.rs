@@ -111,7 +111,7 @@ impl Controller {
             // valid now, so open synchronously. The top visible source line is mapped from the scroll
             // offset through `line_at_content_row`, so it is correct even when the `w` wrap override is
             // on (under wrap `content_scroll` is a wrapped display-row offset, NOT a source-line index).
-            let last = self.content.lines.len().max(1);
+            let last = self.active_lines().len().max(1);
             let top = self
                 .line_at_content_row(self.active_interaction.vertical_scroll as usize)
                 .clamp(1, last);
@@ -147,7 +147,7 @@ impl Controller {
     /// newlines/tabs — hence the per-line approach). Bounds are clamped into `[1, line_count]`; an
     /// empty body yields an empty string.
     fn selected_lines_text(&self, start: usize, end: usize) -> String {
-        let total = self.content.lines.len();
+        let total = self.active_lines().len();
         if total == 0 {
             return String::new();
         }
@@ -174,8 +174,7 @@ impl Controller {
     /// source-mapped (see [`RenderResult::source`]); `None` otherwise. `content_source` is applied
     /// in lockstep with `content`, so `Some` guarantees index `n-1` IS displayed line `n`'s source.
     fn source_line(&self, n: usize) -> Option<&str> {
-        self.content_source
-            .as_ref()
+        self.active_source()
             .and_then(|src| src.get(n - 1))
             .map(String::as_str)
     }
@@ -214,7 +213,7 @@ impl Controller {
     /// [`gutter_len_of`](Self::gutter_len_of). Caller guarantees `n` is in
     /// `[1, content.lines.len()]`.
     fn filtered_display_line(&self, n: usize) -> String {
-        let joined: String = self.content.lines[n - 1]
+        let joined: String = self.active_lines()[n - 1]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -236,10 +235,10 @@ impl Controller {
     /// [`crate::text_layout::wrap_row_starts`] — the same break-position port the wrapped scroll
     /// math counts rows with — so the caret lands on the character actually under the cursor.
     pub(crate) fn char_at_content_col(&self, col: u16, row: u16) -> (usize, usize) {
-        if self.content.lines.is_empty() {
+        if self.active_lines().is_empty() {
             return (1, 0); // no content to index (line-select can't open on an empty pane anyway)
         }
-        let last = self.content.lines.len();
+        let last = self.active_lines().len();
         let top = self.geom.content_inner.map_or(row, |c| c.y);
         let x = self.geom.content_inner.map_or(0, |c| c.x);
         let display_row =
@@ -334,7 +333,7 @@ impl Controller {
     /// plain-text fallback / test stubs — or empty content). Both char-selection overlays subtract it
     /// so a highlight never paints the gutter. `line` is clamped into `[1, line_count]`.
     pub(crate) fn content_gutter_len(&self, line: usize) -> usize {
-        let total = self.content.lines.len();
+        let total = self.active_lines().len();
         if total == 0 {
             return 0;
         }
@@ -369,7 +368,7 @@ impl Controller {
         (lo_line, lo_col): (usize, usize),
         (hi_line, hi_col): (usize, usize),
     ) -> String {
-        let total = self.content.lines.len();
+        let total = self.active_lines().len();
         if total == 0 {
             return String::new();
         }
@@ -589,7 +588,7 @@ impl Controller {
         let Some(marker) = self.modal.line_select().map(|s| s.marker()) else {
             return Effects::noop();
         };
-        let last = self.content.lines.len();
+        let last = self.active_lines().len();
 
         // Classify the key into a marker target + whether it extends the selection. Shift+letter
         // arrives as the uppercase char (`J`/`K`); Shift+arrow as the arrow + the SHIFT bit.
