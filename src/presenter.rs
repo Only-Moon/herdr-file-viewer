@@ -9,6 +9,7 @@
 
 use crate::annotation::LineRange;
 use crate::git::Status;
+use crate::preview::PreviewOrigin;
 use crate::preview_layout::{LayoutInput, PreviewFocus, PreviewLayout, layout};
 use crate::text_layout::{line_wrapped_rows_prefixed, sanitize_control};
 use crate::tree::{Node, NodeKind};
@@ -37,6 +38,56 @@ pub struct FlashLine {
     pub dim: bool,
 }
 
+/// Everything one preview region needs to project already-rendered content. Active and pinned
+/// previews deliberately use the same value so their notices, scroll offsets, wrapping, search,
+/// and scrollbars cannot drift into separate drawing implementations.
+pub struct PreviewProjection {
+    pub content: Text<'static>,
+    pub notices: Vec<String>,
+    pub flash: Option<FlashLine>,
+    pub title: Option<String>,
+    pub rendering: bool,
+    pub scroll: u16,
+    pub hscroll: u16,
+    pub rows: u16,
+    pub wrap: bool,
+    pub pad_left: bool,
+    pub search: Option<ContentSearch>,
+    pub line_select: Option<LineSelectView>,
+    pub selection: Option<CharSelView>,
+    /// `Some` only for a pinned snapshot. It is rendered as its own sanitized identity title.
+    pub origin: Option<PreviewOrigin>,
+}
+
+impl PreviewProjection {
+    pub fn new(title: impl Into<String>, content: Text<'static>) -> Self {
+        let rows = content.lines.len().min(u16::MAX as usize) as u16;
+        Self {
+            content,
+            notices: Vec::new(),
+            flash: None,
+            title: Some(title.into()),
+            rendering: false,
+            scroll: 0,
+            hscroll: 0,
+            rows,
+            wrap: false,
+            pad_left: false,
+            search: None,
+            line_select: None,
+            selection: None,
+            origin: None,
+        }
+    }
+}
+
+/// The measured drawable text interiors from one Presenter frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreviewViewports {
+    pub active: (u16, u16),
+    pub pinned: Option<(u16, u16)>,
+}
+
 /// Everything the Presenter needs to draw one frame. Built by the Session Controller from
 /// the Tree Model (nodes + selection), Content Renderer (content + notices), and session
 /// focus/width. `width` is the pane width the controller observed (the narrow-split input
@@ -46,12 +97,15 @@ pub struct ViewState {
     pub nodes: Vec<Node>,
     /// Index into `nodes` of the selected row.
     pub selected: usize,
-    /// The content-pane text (already sanitized/ingested by the Content Renderer).
+    /// The tree-selected preview. It remains the sole target for active-only interaction.
+    pub active: PreviewProjection,
+    /// A frozen preview when a pin exists. `None` keeps the no-pin layout byte-for-byte unchanged.
+    pub pinned: Option<PreviewProjection>,
+    /// Compatibility aliases for active-preview consumers outside this task. The Presenter draws
+    /// only [`active`](Self::active); controller construction keeps these synchronized until those
+    /// callers migrate to the projection.
     pub content: Text<'static>,
-    /// Non-fatal notices to surface (truncation AC-13, renderer fallback AC-25).
     pub notices: Vec<String>,
-    /// A self-expiring status hint (e.g. `D`'s diff-presentation label), drawn as one line atop
-    /// the notices strip and styled distinctly from a warning. `None` when nothing is flashing.
     pub flash: Option<FlashLine>,
     /// Which column has focus.
     pub focus: Focus,
@@ -59,11 +113,7 @@ pub struct ViewState {
     /// narrow-split flag). The Presenter lays out from the live frame width, not this, so
     /// the two can never disagree; it is carried for the controller's own use.
     pub width: u16,
-    /// Vertical scroll offset of the content pane, in lines (wrapped lines when `wrap`,
-    /// raw lines otherwise — matching ratatui's `Paragraph::scroll` semantics).
     pub content_scroll: u16,
-    /// Horizontal scroll offset of the content pane, in columns. Only meaningful when not
-    /// wrapping (ratatui ignores it under wrap); lets long code/diff lines be read sideways.
     pub content_hscroll: u16,
     /// The tree's vertical scroll offset from the LAST drawn frame (first visible node index),
     /// carried back via [`PaneGeometry::tree_scroll`]. The Presenter scrolls *minimally* from it
@@ -76,18 +126,10 @@ pub struct ViewState {
     /// expand/collapse in the tree). The Presenter clamps it to the widest row at draw, so it can
     /// never over-scroll.
     pub tree_hscroll: u16,
-    /// The content's total RENDERED row count — wrapped rows under `wrap`, raw lines otherwise (the
-    /// controller's wrapped-aware count). The content vertical scrollbar sizes/positions against
-    /// this so the thumb is correct under wrap, where raw `content.lines.len()` undercounts.
+    /// The pinned preview's share of the preview area (20–80). Ignored while no pin exists.
+    pub preview_split_pct: u16,
     pub content_rows: u16,
-    /// Wrap long content lines (prose: markdown / plain text) instead of truncating them.
-    /// Off for diffs and code, whose column alignment must be preserved.
     pub wrap: bool,
-    /// Inset the content text one column from the left border. Set for the transformed views
-    /// (rendered markdown, diff) whose delegate output starts at column 0 and otherwise hugs the
-    /// border; syntax/plain files get the same visual gap for free from bat's line-number gutter,
-    /// so it stays off for them (no double gap). Applied identically by [`draw_content`] and
-    /// [`geometry`] so the drawn text rect and the hit-test geometry inset the border in lockstep.
     pub content_pad_left: bool,
     /// The tree column's share of the width, as a percentage (the content pane takes the
     /// rest). Adjustable from the keyboard; used only in the wide two-column layout.
@@ -140,29 +182,10 @@ pub struct ViewState {
     /// border. `None` outside a git repo or on a detached HEAD — in which case the bottom title is
     /// omitted entirely rather than showing a blank/placeholder branch (degrade gracefully).
     pub branch: Option<String>,
-    /// The content pane's border title, derived from the displayed content's file path (not the
-    /// live tree cursor), so the title switches in lockstep with the body — it never shows a
-    /// freshly-selected file's name before that file's content arrives. `None` while no
-    /// file's content has landed yet (launch, a re-root, or a directory/empty selection); the
-    /// Presenter then falls back to the selected node's name (a directory) or "Content" — unless
-    /// [`content_rendering`](Self::content_rendering) is set, in which case it uses a neutral
-    /// "Content" label so the title doesn't jump to the still-loading selection.
     pub content_title: Option<String>,
-    /// True while an off-thread render for a file is in flight. The Presenter uses this to pick a
-    /// neutral title while the body shows the loading placeholder.
     pub content_rendering: bool,
-    /// When `Some`, the content pane is drawn through [`crate::highlight::apply`] to overlay
-    /// match highlights on top of the rendered text (AC-9, AC-11). `None` ⇒ draw the content
-    /// as-is (byte-identical to today — the `None` arm is just `state.content.clone()`).
     pub search: Option<ContentSearch>,
-    /// When `Some`, the copy-line-reference modal is active: the Presenter overlays a marker +
-    /// selection highlight on the content pane (AC-1, AC-7), mirroring the [`search`](Self::search)
-    /// overlay. `None` ⇒ draw the content as-is (byte-identical to today — the `None` arm leaves the
-    /// content path untouched, so no other snapshot moves).
     pub line_select: Option<LineSelectView>,
-    /// When `Some`, an ambient character selection (a content-pane drag, no modal). Drawn as a
-    /// gutter-less highlight — no ▶/│ glyph, no content shift — so it reads as a plain text selection,
-    /// not a mode. `draw_content` gives [`line_select`](Self::line_select) precedence if both are set.
     pub content_selection: Option<CharSelView>,
     /// When `Some`, the in-app help overlay is drawn on top of everything else (AC-1, AC-5).
     /// `None` ⇒ no overlay. Drawn last in [`draw`] so it sits above the picker and finder.
@@ -205,6 +228,7 @@ pub struct PickerRowView {
 ///
 /// The Presenter uses this purely for rendering — it overlays the highlight onto `content` lines
 /// at draw time and never mutates any state (AC-N1, constitution read-only).
+#[derive(Clone)]
 pub struct ContentSearch {
     /// The matches to highlight, in document order.
     pub matches: Vec<crate::search::Match>,
@@ -222,6 +246,7 @@ pub struct ContentSearch {
 /// [`crate::highlight::CURRENT_HIGHLIGHT`] on the `marker` line and a selection bar +
 /// [`crate::highlight::HIGHLIGHT`] across `[start, end]`; lines scrolled off-screen are simply not
 /// drawn (the `Paragraph` scroll offset clips them — the state stays whole).
+#[derive(Clone)]
 pub struct LineSelectView {
     /// The marker (cursor) line — where `Enter` will anchor the reference. Rendered with a distinct
     /// caret + the stronger current-match emphasis so the user sees exactly which line is active.
@@ -245,6 +270,7 @@ pub struct LineSelectView {
 /// A character-granular selection for the line-select overlay. `*_col` are char carets into the
 /// displayed line (gutter included), ordered ascending by `(line, col)`; `gutter` is the leading
 /// gutter width so continuation lines start their highlight at the code, not the line number.
+#[derive(Clone)]
 pub struct CharSelView {
     pub start_line: usize,
     pub start_col: usize,
@@ -624,8 +650,8 @@ fn tree_bars(
 /// Total rows the notice strip occupies: the persistent notices plus the optional flash line.
 /// Used by both [`draw_content`] and [`geometry`] so the drawn strip and the hit-test geometry
 /// reserve the same rows.
-fn notice_strip_len(state: &ViewState) -> usize {
-    state.notices.len() + usize::from(state.flash.is_some())
+fn notice_strip_len(preview: &PreviewProjection) -> usize {
+    preview.notices.len() + usize::from(preview.flash.is_some())
 }
 
 /// Split the content block interior into the notices strip (top) and the content area (below it,
@@ -888,15 +914,15 @@ fn styled_run(text: &str, base: Style, selected: bool, style: Style) -> Span<'st
     Span::styled(text.to_string(), s)
 }
 
-fn blank_annotation_style(source_line: usize, state: &ViewState) -> Style {
-    if let Some(line_select) = &state.line_select {
+fn blank_annotation_style(source_line: usize, preview: &PreviewProjection) -> Style {
+    if let Some(line_select) = &preview.line_select {
         if source_line == line_select.marker {
             return ANNOTATION_STYLE.patch(crate::highlight::CURRENT_HIGHLIGHT);
         }
         if source_line >= line_select.start && source_line <= line_select.end {
             return ANNOTATION_STYLE.patch(crate::highlight::HIGHLIGHT);
         }
-    } else if state.content_selection.as_ref().is_some_and(|selection| {
+    } else if preview.selection.as_ref().is_some_and(|selection| {
         source_line >= selection.start_line && source_line <= selection.end_line
     }) {
         return ANNOTATION_STYLE.patch(crate::highlight::HIGHLIGHT);
@@ -907,7 +933,12 @@ fn blank_annotation_style(source_line: usize, state: &ViewState) -> Style {
 /// Patch one bounded visible cell for each annotated source line whose rendered width is zero.
 /// Paragraph deliberately leaves those rows textually empty; this post-render pass supplies the
 /// persistent background without padding content or changing wrap/search/mouse geometry.
-fn draw_blank_annotation_cells(frame: &mut Frame, text: Rect, state: &ViewState) -> Vec<Position> {
+fn draw_blank_annotation_cells(
+    frame: &mut Frame,
+    text: Rect,
+    state: &ViewState,
+    preview: &PreviewProjection,
+) -> Vec<Position> {
     if text.width == 0 || text.height == 0 {
         return Vec::new();
     }
@@ -919,15 +950,15 @@ fn draw_blank_annotation_cells(frame: &mut Frame, text: Rect, state: &ViewState)
         return Vec::new();
     }
 
-    let scroll = state.content_scroll as usize;
+    let scroll = preview.scroll as usize;
     let visible_end = scroll.saturating_add(text.height as usize);
     // Active line-select adds a ▶/│ gutter column; passive range flash does not.
-    let prefix = usize::from(state.line_select.as_ref().is_some_and(|ls| !ls.passive));
+    let prefix = usize::from(preview.line_select.as_ref().is_some_and(|ls| !ls.passive));
     let mut display_row = 0usize;
     let mut range_index = 0usize;
     let mut painted = Vec::with_capacity(text.height as usize);
 
-    for (index, line) in state.content.lines.iter().enumerate() {
+    for (index, line) in preview.content.lines.iter().enumerate() {
         let source_line = index + 1;
         let annotated = range_covers(
             &state.annotation_indicators.displayed_line_ranges,
@@ -935,7 +966,7 @@ fn draw_blank_annotation_cells(frame: &mut Frame, text: Rect, state: &ViewState)
             source_line,
         );
         let line_start = display_row;
-        let rows = if state.wrap {
+        let rows = if preview.wrap {
             line_wrapped_rows_prefixed(line, text.width as usize, prefix)
         } else {
             1
@@ -955,7 +986,7 @@ fn draw_blank_annotation_cells(frame: &mut Frame, text: Rect, state: &ViewState)
         }
         let position = Position::new(text.x, text.y + y_offset as u16);
         if let Some(cell) = frame.buffer_mut().cell_mut(position) {
-            cell.set_style(blank_annotation_style(source_line, state));
+            cell.set_style(blank_annotation_style(source_line, preview));
             painted.push(position);
         }
     }
@@ -1055,9 +1086,9 @@ fn draw_tree(frame: &mut Frame, area: Rect, state: &ViewState) {
 /// Shared by [`draw_content`] and [`geometry`] so the drawn text rect and the hit-test geometry
 /// inset the border identically — a mismatch would map a content-pane click one column off under
 /// the [`ViewState::content_pad_left`] gap.
-fn content_block(state: &ViewState) -> Block<'static> {
+fn content_block(preview: &PreviewProjection) -> Block<'static> {
     let block = Block::bordered();
-    if state.content_pad_left {
+    if preview.pad_left {
         block.padding(Padding::left(1))
     } else {
         block
@@ -1066,7 +1097,13 @@ fn content_block(state: &ViewState) -> Block<'static> {
 
 /// Draw the right column: a notices strip (if any) above the content pane. Returns the
 /// content viewport `(width, height)` so the controller can clamp scrolling to it.
-fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) {
+fn draw_content(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ViewState,
+    preview: &PreviewProjection,
+    active: bool,
+) -> (u16, u16) {
     // the title is derived from the DISPLAYED content's file (`content_title`), not the
     // live tree cursor, so it switches in lockstep with the body — the pane never shows a newly-
     // selected file's name over the previous file's body while the new render is in flight.
@@ -1074,10 +1111,12 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     // directory/empty selection); in that case fall back to the selected node's name (a directory)
     // or "Content" — but only when NO render is in flight, otherwise the fallback would pick up
     // the still-loading selection's name and re-introduce the title-ahead-of-body bug.
-    let applied_title = state.content_title.is_some();
-    let mut title = if let Some(name) = &state.content_title {
+    let applied_title = preview.title.is_some();
+    let mut title = if let Some(origin) = &preview.origin {
+        pinned_origin_title(origin)
+    } else if let Some(name) = &preview.title {
         sanitize_control(name)
-    } else if !state.content_rendering {
+    } else if active && !preview.rendering {
         state
             .nodes
             .get(state.selected)
@@ -1086,7 +1125,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     } else {
         "Content".to_string()
     };
-    if applied_title && state.annotation_indicators.displayed_file_annotated {
+    if active && applied_title && state.annotation_indicators.displayed_file_annotated {
         title.insert(0, '@');
     }
     // Persistent bottom-border chips: annotation count on the left (only when nonzero and it
@@ -1094,20 +1133,23 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     // annotation chip deliberately names no key because ShowAnnotations is configurable.
     let hint_text = sanitize_control(HELP_HINT);
     let hint = Line::styled(hint_text.clone(), Style::new().fg(Color::Reset)).right_aligned();
-    let annotation_chip = (state.annotation_count > 0)
+    let annotation_chip = (active && state.annotation_count > 0)
         .then(|| sanitize_control(&format!("annotations: {}", state.annotation_count)));
     let chip_fits = annotation_chip.as_ref().is_some_and(|chip| {
         Line::from(chip.as_str()).width() + 1 + Line::from(hint_text.as_str()).width()
             <= area.width.saturating_sub(2) as usize
     });
-    let mut block = content_block(state).title(title).title_bottom(hint);
+    let mut block = content_block(preview).title(title);
+    if active {
+        block = block.title_bottom(hint);
+    }
     if chip_fits {
         block = block.title_bottom(Line::styled(
             annotation_chip.expect("checked as present"),
             Style::new().fg(Color::Reset),
         ));
     }
-    let block = block.border_style(border_style(state.focus == Focus::Content));
+    let block = block.border_style(border_style(active && state.focus == Focus::Content));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1115,10 +1157,10 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     // it can never crowd out the file itself; the file + its scrollbars fill the area below it.
     // The self-expiring flash (if any) leads the strip, styled distinctly from a yellow warning
     // (cyan, dimming to gray as it fades) so a status hint never reads as an error.
-    let (notices_rect, content_area) = content_notice_split(inner, notice_strip_len(state));
+    let (notices_rect, content_area) = content_notice_split(inner, notice_strip_len(preview));
     if notices_rect.height > 0 {
         let mut notice_lines: Vec<Line> = Vec::new();
-        if let Some(flash) = &state.flash {
+        if let Some(flash) = &preview.flash {
             let color = if flash.dim {
                 Color::DarkGray
             } else {
@@ -1130,7 +1172,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
             ));
         }
         notice_lines.extend(
-            state
+            preview
                 .notices
                 .iter()
                 .map(|n| Line::styled(sanitize_control(n), Style::new().fg(Color::Yellow))),
@@ -1143,9 +1185,9 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     // (`content_rows`) — wrapped rows under wrap, raw lines otherwise — so the bar is correct even
     // for a few long lines that wrap past the viewport. The horizontal bar uses the widest raw line
     // and is suppressed under wrap, where there is nothing to scroll sideways.
-    let total_rows = state.content_rows as usize;
-    let max_width = content_max_line_width(&state.content);
-    let (text, vbar, hbar) = content_bars(content_area, total_rows, max_width, state.wrap);
+    let total_rows = preview.rows as usize;
+    let max_width = content_max_line_width(&preview.content);
+    let (text, vbar, hbar) = content_bars(content_area, total_rows, max_width, preview.wrap);
 
     // Persistent annotation styling is the base. The existing mutually-exclusive active overlay
     // then patches over it: line-select first, ambient selection second, committed search third.
@@ -1156,36 +1198,41 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     // it and an active overlay (line-select / selection / search) deep-clones the content a SECOND
     // time per keystroke, on a file up to `preview_max_lines` long, for users with no annotations at
     // all. Same waste guarded in `draw_blank_annotation_cells` below.
-    let ranges = &state.annotation_indicators.displayed_line_ranges;
+    let ranges: &[LineRange] = if active {
+        &state.annotation_indicators.displayed_line_ranges
+    } else {
+        &[]
+    };
     let annotated =
-        (!ranges.is_empty()).then(|| apply_annotation_lines(&state.content.lines, ranges));
-    let base: &[Line<'static>] = annotated.as_deref().unwrap_or(&state.content.lines);
-    let content_text = if let Some(ls) = &state.line_select {
+        (!ranges.is_empty()).then(|| apply_annotation_lines(&preview.content.lines, ranges));
+    let base: &[Line<'static>] = annotated.as_deref().unwrap_or(&preview.content.lines);
+    let content_text = if active && let Some(ls) = &preview.line_select {
         ratatui::text::Text::from(apply_line_select(base, ls))
-    } else if let Some(cs) = &state.content_selection {
+    } else if active && let Some(cs) = &preview.selection {
         ratatui::text::Text::from(apply_char_selection(base, cs))
-    } else if let Some(cs) = &state.search {
+    } else if let Some(cs) = &preview.search {
         ratatui::text::Text::from(crate::highlight::apply(base, &cs.matches, cs.current))
     } else if let Some(annotated) = annotated {
         ratatui::text::Text::from(annotated)
     } else {
         // No ranges and no overlay: exactly main's pre-annotation path.
-        state.content.clone()
+        preview.content.clone()
     };
-    let mut content =
-        Paragraph::new(content_text).scroll((state.content_scroll, state.content_hscroll));
-    if state.wrap {
+    let mut content = Paragraph::new(content_text).scroll((preview.scroll, preview.hscroll));
+    if preview.wrap {
         content = content.wrap(Wrap { trim: false });
     }
     frame.render_widget(content, text);
-    draw_blank_annotation_cells(frame, text, state);
+    if active {
+        draw_blank_annotation_cells(frame, text, state, preview);
+    }
 
     if let Some(track) = vbar {
         draw_vscrollbar(
             frame,
             track,
             total_rows,
-            state.content_scroll as usize,
+            preview.scroll as usize,
             text.height as usize,
         );
     }
@@ -1194,11 +1241,27 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
             frame,
             track,
             max_width,
-            state.content_hscroll as usize,
+            preview.hscroll as usize,
             text.width as usize,
         );
     }
     (text.width, text.height)
+}
+
+/// The frozen pin's complete origin identity, kept on its own title so a worktree switch cannot
+/// make the reference surface look like it belongs to the active tree. Each component is
+/// neutralized independently because all three are captured from paths/branch metadata.
+fn pinned_origin_title(origin: &PreviewOrigin) -> String {
+    let branch = match origin.branch() {
+        crate::preview::BranchState::Named(branch) => sanitize_control(branch),
+        crate::preview::BranchState::Detached => "detached".to_string(),
+    };
+    format!(
+        "Pinned: {} [{} @ {}]",
+        sanitize_control(&origin.root_relative_path().to_string_lossy()),
+        branch,
+        sanitize_control(&origin.root().to_string_lossy()),
+    )
 }
 
 /// Draw the supplied one-row remote-notice status. Reversed (theme-relative) so it reads as a
@@ -1233,13 +1296,13 @@ fn structural_layout(area: Rect, state: &ViewState) -> PreviewLayout {
         area,
         has_prompt: state.prompt.is_some(),
         has_remote_status: state.remote_notice_status.is_some(),
-        has_pin: false,
+        has_pin: state.pinned.is_some(),
         focus: match state.focus {
             Focus::Tree => PreviewFocus::Tree,
             Focus::Content => PreviewFocus::Active,
         },
         tree_hidden: state.zoomed,
-        preview_split_pct: 50,
+        preview_split_pct: state.preview_split_pct,
         tree_split_pct: state.split_pct,
         tree_position: state.tree_position,
         tree_max_cols: state.tree_max_cols,
@@ -1332,6 +1395,7 @@ pub struct PaneGeometry {
 /// block is its area inset by one cell on each side (the title does not change it).
 pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
     let layout = structural_layout(area, state);
+    let active = &state.active;
     let body = layout.body;
     let tree = layout.tree;
     let content = layout.active;
@@ -1375,14 +1439,14 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         height: 1,
     });
     let (content_inner, content_vbar, content_hbar) =
-        match content.map(|r| content_block(state).inner(r)) {
+        match content.map(|r| content_block(active).inner(r)) {
             Some(ci) => {
-                let (_notices, content_area) = content_notice_split(ci, notice_strip_len(state));
+                let (_notices, content_area) = content_notice_split(ci, notice_strip_len(active));
                 let (text, v, h) = content_bars(
                     content_area,
-                    state.content_rows as usize,
-                    content_max_line_width(&state.content),
-                    state.wrap,
+                    active.rows as usize,
+                    content_max_line_width(&active.content),
+                    active.wrap,
                 );
                 (Some(text), v, h)
             }
@@ -1451,16 +1515,18 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
     }
 }
 
-/// Draw the viewer for the given state, returning the content viewport `(width, height)`
-/// the content pane was drawn into — `(0, 0)` when the content pane is not visible (narrow
-/// layout with the tree focused). The controller uses it to clamp content scrolling.
+/// Draw the viewer for the given state, returning named active/pinned content viewports. The
+/// active viewport is `(0, 0)` when the active region is hidden; the optional pinned viewport is
+/// present only when that frozen region was drawn. The controller uses only the active feedback
+/// for live reflow, while the aggregate keeps the two regions unambiguous.
 ///
 /// At ≥ 80 columns both columns are shown side by side. Narrower than that, only the focused
 /// column is drawn — full width — so the active content stays readable (AC-21). The split is
 /// taken from the **live frame width** (via [`columns`]), so it can never disagree with the
 /// geometry it is drawn into (a stale `state.width` cannot desync the layout).
-pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
+pub fn draw(frame: &mut Frame, state: &ViewState) -> PreviewViewports {
     let layout = structural_layout(frame.area(), state);
+    let active = &state.active;
     let remote_notice_area = layout.remote_status;
     let prompt_area = layout.prompt;
     if let (Some(area), Some(status)) = (remote_notice_area, state.remote_notice_status.as_deref())
@@ -1473,8 +1539,12 @@ pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
     if let Some(area) = layout.tree {
         draw_tree(frame, area, state);
     }
-    let dims = match layout.active {
-        Some(area) => draw_content(frame, area, state),
+    let pinned = match (layout.pinned, state.pinned.as_ref()) {
+        (Some(area), Some(preview)) => Some(draw_content(frame, area, state, preview, false)),
+        _ => None,
+    };
+    let active = match layout.active {
+        Some(area) => draw_content(frame, area, state, active, true),
         None => (0, 0),
     };
     // The worktree picker is a modal overlay: drawn last, on TOP of whatever columns are
@@ -1502,7 +1572,7 @@ pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
     if let Some(help) = &state.help {
         draw_help_overlay(frame, frame.area(), help);
     }
-    dims
+    PreviewViewports { active, pinned }
 }
 
 /// A `Rect` of outer size `w` × `h`, centered in `area` and clamped so it never exceeds `area`.

@@ -6,7 +6,7 @@ use herdr_file_viewer::annotation::LineRange;
 use herdr_file_viewer::git::Status;
 use herdr_file_viewer::presenter::{
     AnnotationEditorKind, AnnotationEditorView, AnnotationIndicatorsView, AnnotationOverviewView,
-    AnnotationRowView, AnnotationTargetView, Focus, ViewState, draw,
+    AnnotationRowView, AnnotationTargetView, Focus, PreviewProjection, ViewState, draw,
 };
 use herdr_file_viewer::preview_layout::{LayoutInput, PreviewFocus, layout};
 use herdr_file_viewer::render::to_text;
@@ -28,6 +28,8 @@ fn node(path: &str, kind: NodeKind, depth: usize, status: Option<Status>) -> Nod
 }
 
 fn state(width: u16, focus: Focus) -> ViewState {
+    let mut active = PreviewProjection::new("main.rs", to_text("fn main() {}\n"));
+    active.notices = vec!["delta not found — showing plain diff".to_string()];
     ViewState {
         nodes: vec![
             node("/r/src", NodeKind::Dir, 0, None),
@@ -35,8 +37,10 @@ fn state(width: u16, focus: Focus) -> ViewState {
             node("/r/scratch.log", NodeKind::File, 0, Some(Status::Untracked)),
         ],
         selected: 1,
-        content: to_text("fn main() {}\n"),
-        notices: vec!["delta not found — showing plain diff".to_string()],
+        active,
+        pinned: None,
+        content: to_text(""),
+        notices: Vec::new(),
         flash: None,
         focus,
         width,
@@ -44,7 +48,8 @@ fn state(width: u16, focus: Focus) -> ViewState {
         content_hscroll: 0,
         tree_scroll: 0,
         tree_hscroll: 0,
-        content_rows: 1, // the fixture content is one line
+        preview_split_pct: 50,
+        content_rows: 0,
         wrap: false,
         content_pad_left: false,
         split_pct: 40,
@@ -63,7 +68,7 @@ fn state(width: u16, focus: Focus) -> ViewState {
         root_name: "r".to_string(), // the fixture tree is rooted at /r
         branch: None,
         prompt: None,
-        content_title: Some("main.rs".to_string()),
+        content_title: None,
         content_rendering: false,
         search: None,
         line_select: None,
@@ -212,7 +217,7 @@ fn narrow_content_snapshot() {
 fn annotation_title_marker_remains_visible_with_tree_hidden_in_narrow_and_zoom_layouts() {
     let mut narrow = state(60, Focus::Content);
     narrow.annotation_indicators.displayed_file_annotated = true;
-    narrow.content_pad_left = true;
+    narrow.active.pad_left = true;
     let narrow_out = render(&narrow, 60, 10);
     assert!(
         narrow_out.contains("@main.rs"),

@@ -42,7 +42,7 @@ use crate::presenter::{
     AnnotationEditorKind, AnnotationEditorView, AnnotationIndicatorsView, AnnotationOverviewView,
     AnnotationRowView, AnnotationTargetView, CharSelView, ContentSearch, DiscardConfirmView,
     FinderView, Focus, HelpView, LineSelectView, PaneGeometry, PickerRowView, PickerView,
-    ViewState,
+    PreviewProjection, PreviewViewports, ViewState,
 };
 use crate::preview::{
     BranchState, PreviewDocument, PreviewInteractionState, PreviewOrigin, PreviewPresentation,
@@ -1709,7 +1709,7 @@ impl Controller {
         self.tree_max_cols = cols.max(crate::config::MIN_TREE_MAX_COLS);
     }
 
-    /// Record the content viewport `(width, height)` the Presenter last drew into, so content
+    /// Record the active content viewport `(width, height)` the Presenter last drew into, so content
     /// scrolling can be clamped to it. Called by the run loop after each draw.
     ///
     /// Returns `true` when the run loop should redraw immediately: a deferred launch-open zoom
@@ -1748,6 +1748,13 @@ impl Controller {
             self.rerender_after_resize();
         }
         need_redraw
+    }
+
+    /// Receive all preview viewport feedback from the Presenter. The active-only compatibility
+    /// seam remains the owner of launch-open zoom and width-sensitive rerendering; a pinned
+    /// interaction state is added by the lifecycle task.
+    pub fn set_preview_viewports(&mut self, viewports: PreviewViewports) -> bool {
+        self.set_content_viewport(viewports.active.0, viewports.active.1)
     }
 
     /// Receive the hit-test geometry the Presenter drew this frame (fed back from the draw
@@ -1830,9 +1837,88 @@ impl Controller {
         // Gutter width for a character selection's highlight (0 when not applicable); computed once
         // here so the line-select snapshot below stays a pure read.
         let sel_gutter = self.selection_gutter_len();
+        let line_select = self
+            .modal
+            .line_select()
+            .map(|s| {
+                let (start, end) = s.selection();
+                let char_sel = if s.is_char_mode() {
+                    let ((sl, sc), (el, ec)) = s.char_span();
+                    Some(CharSelView {
+                        start_line: sl,
+                        start_col: sc,
+                        end_line: el,
+                        end_col: ec,
+                        gutter: sel_gutter,
+                    })
+                } else {
+                    None
+                };
+                LineSelectView {
+                    marker: s.marker(),
+                    start,
+                    end,
+                    char_sel,
+                    passive: false,
+                }
+            })
+            .or_else(|| {
+                self.open_range_flash.as_ref().map(|f| LineSelectView {
+                    marker: f.start,
+                    start: f.start,
+                    end: f.end,
+                    char_sel: None,
+                    passive: true,
+                })
+            });
+        let selection = self
+            .active_interaction
+            .selection
+            .as_ref()
+            .filter(|s| {
+                let (a, b) = s.char_span();
+                a != b
+            })
+            .map(|s| {
+                let ((sl, sc), (el, ec)) = s.char_span();
+                CharSelView {
+                    start_line: sl,
+                    start_col: sc,
+                    end_line: el,
+                    end_col: ec,
+                    gutter: self.content_gutter_len(sl),
+                }
+            });
         ViewState {
             nodes,
             selected,
+            active: PreviewProjection {
+                content: self.content().clone(),
+                notices: self.notices(),
+                flash: self.flash.as_ref().map(|f| crate::presenter::FlashLine {
+                    text: f.text.clone(),
+                    dim: f.dim,
+                }),
+                title: self.active_display.title(),
+                rendering: self.active_display.is_loading(),
+                scroll: self.active_interaction.vertical_scroll,
+                hscroll: self.active_interaction.horizontal_scroll,
+                rows: content_rows,
+                wrap,
+                pad_left: content_pad_left,
+                search: self
+                    .active_interaction
+                    .search
+                    .as_ref()
+                    .map(|s| ContentSearch {
+                        matches: s.matches.clone(),
+                        current: s.current,
+                    }),
+                line_select: line_select.clone(),
+                selection: selection.clone(),
+                origin: None,
+            },
+            pinned: None,
             content: self.content().clone(),
             notices: self.notices(),
             flash: self.flash.as_ref().map(|f| crate::presenter::FlashLine {
@@ -1847,6 +1933,7 @@ impl Controller {
             // a row already in view — e.g. a mouse click — never jumps the viewport.
             tree_scroll: self.geom.tree_scroll,
             tree_hscroll: self.tree_hscroll,
+            preview_split_pct: 50,
             content_rows,
             wrap,
             content_pad_left,
@@ -1873,19 +1960,8 @@ impl Controller {
                 .unwrap_or_default(),
             branch: self.current_branch.clone(),
             prompt: self.bottom_line(),
-            // the content pane's border title. `content_path` is the displayed content's
-            // file (set by `poll` when a render lands, cleared by `clear_content`/re-root), so the
-            // title switches in lockstep with the body — it never jumps to a freshly-selected file
-            // before that file's content arrives. `None` while no file's content has landed (launch,
-            // re-root, or a directory/empty selection); the Presenter then falls back to the selected
-            // node's name (a directory) or "Content". `content_rendering` tells the Presenter a
-            // render is in flight so the `None` fallback doesn't pick up the new (still-loading)
-            // selection's name and re-introduce the title-ahead-of-body bug.
             content_title: self.active_display.title(),
             content_rendering: self.active_display.is_loading(),
-            // Populate the highlight overlay from the committed/live search state so the Presenter
-            // overlays matches via highlight::apply. `None` when no search is active → draw_content
-            // falls through to `state.content.clone()`, byte-identical to the prior path.
             search: self
                 .active_interaction
                 .search
@@ -1894,65 +1970,8 @@ impl Controller {
                     matches: s.matches.clone(),
                     current: s.current,
                 }),
-            // Populate the line-select overlay from the active modal so the Presenter draws the
-            // marker + selection highlight (AC-1, AC-7). When the modal is closed, a launch
-            // open-range flash (if any) reuses the same view slot as a *passive* highlight only.
-            line_select: self
-                .modal
-                .line_select()
-                .map(|s| {
-                    let (start, end) = s.selection();
-                    // A mouse drag carries character carets → the overlay highlights just those chars;
-                    // a keyboard selection has none → the whole-line highlight.
-                    let char_sel = if s.is_char_mode() {
-                        let ((sl, sc), (el, ec)) = s.char_span();
-                        Some(CharSelView {
-                            start_line: sl,
-                            start_col: sc,
-                            end_line: el,
-                            end_col: ec,
-                            gutter: sel_gutter,
-                        })
-                    } else {
-                        None
-                    };
-                    LineSelectView {
-                        marker: s.marker(),
-                        start,
-                        end,
-                        char_sel,
-                        passive: false,
-                    }
-                })
-                .or_else(|| {
-                    self.open_range_flash.as_ref().map(|f| LineSelectView {
-                        marker: f.start,
-                        start: f.start,
-                        end: f.end,
-                        char_sel: None,
-                        passive: true,
-                    })
-                }),
-            // Snapshot the ambient selection only when non-collapsed, so a bare click never paints a
-            // zero-width highlight (`draw_content` gives `line_select` precedence if both were set).
-            content_selection: self
-                .active_interaction
-                .selection
-                .as_ref()
-                .filter(|s| {
-                    let (a, b) = s.char_span();
-                    a != b
-                })
-                .map(|s| {
-                    let ((sl, sc), (el, ec)) = s.char_span();
-                    CharSelView {
-                        start_line: sl,
-                        start_col: sc,
-                        end_line: el,
-                        end_col: ec,
-                        gutter: self.content_gutter_len(sl),
-                    }
-                }),
+            line_select,
+            content_selection: selection,
             help: self.help_view(),
         }
     }
@@ -3836,7 +3855,7 @@ mod tests {
         assert_eq!(ctrl.open_range_flash_lines(), Some((1, 3)));
         // Passive highlight appears in view_state (not a modal).
         let vs = ctrl.view_state();
-        let ls = vs.line_select.expect("passive range flash in view");
+        let ls = vs.active.line_select.expect("passive range flash in view");
         assert!(ls.passive);
         assert_eq!((ls.start, ls.end), (1, 3));
         assert!(
