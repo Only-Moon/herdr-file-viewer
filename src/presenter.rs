@@ -9,6 +9,7 @@
 
 use crate::annotation::LineRange;
 use crate::git::Status;
+use crate::preview_layout::{LayoutInput, PreviewFocus, PreviewLayout, layout};
 use crate::text_layout::{line_wrapped_rows_prefixed, sanitize_control};
 use crate::tree::{Node, NodeKind};
 use ratatui::Frame;
@@ -25,6 +26,9 @@ pub enum Focus {
     Tree,
     Content,
 }
+
+/// Re-export the structural policy's tree-floor helper for existing controller callers.
+pub use crate::preview_layout::min_tree_split_pct;
 
 /// A self-expiring status hint. `dim` is set once the flash enters its fade-out phase, so the
 /// Presenter can render it dimmed just before it disappears.
@@ -1197,18 +1201,6 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
     (text.width, text.height)
 }
 
-/// Split the frame into the body (the two columns) and an optional one-row remote-notice status.
-/// The status is present exactly when supplied (and the frame is tall enough to spare a row).
-/// Shared by [`draw`] and [`geometry`] so the drawn layout and the hit-test geometry carve the
-/// same body rect, a mouse click is never mapped against stale geometry.
-fn body_and_remote_notice_status(area: Rect, state: &ViewState) -> (Rect, Option<Rect>) {
-    if state.remote_notice_status.is_none() || area.height < 2 {
-        return (area, None);
-    }
-    let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    (parts[0], Some(parts[1]))
-}
-
 /// Draw the supplied one-row remote-notice status. Reversed (theme-relative) so it reads as a
 /// status bar on any terminal palette, sanitized (defense-in-depth, AC-27) and clipped to its row
 /// by ratatui.
@@ -1222,24 +1214,6 @@ fn draw_remote_notice_status(frame: &mut Frame, area: Rect, status: &str) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Carve the optional one-row bottom prompt off the very bottom, then the optional remote-notice
-/// status off what remains (so the prompt sits below the status). Reuses
-/// [`body_and_remote_notice_status`] so a frame with no prompt lays out exactly as before. Shared
-/// by [`draw`] and [`geometry`] so the body rect they use can never disagree.
-fn body_remote_notice_status_prompt(
-    area: Rect,
-    state: &ViewState,
-) -> (Rect, Option<Rect>, Option<Rect>) {
-    let (above_prompt, prompt) = if state.prompt.is_some() && area.height >= 2 {
-        let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-        (parts[0], Some(parts[1]))
-    } else {
-        (area, None)
-    };
-    let (body, remote_notice_status) = body_and_remote_notice_status(above_prompt, state);
-    (body, remote_notice_status, prompt)
-}
-
 /// Draw the one-row bottom prompt (`Go to line: 42` / later search). Reversed (theme-relative)
 /// so it reads as a prompt bar on any palette — previously `Black`-on-`Gray`, which
 /// ignored the terminal theme. Sanitized (AC-27), clipped to its row.
@@ -1251,75 +1225,26 @@ fn draw_prompt_line(frame: &mut Frame, area: Rect, prompt: &str) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Below this pane width the viewer drops to a single, focused column (AC-21).
-const NARROW_SPLIT: u16 = 80;
-
-/// The smallest tree column the split may render, as a percentage of `pane_width` — the percentage
-/// that yields at least [`crate::config::MIN_TREE_MAX_COLS`] columns. Pane-aware on purpose: a fixed
-/// percentage floor is wrong in absolute terms on a very wide pane (10% of a 1000-column pane is 100
-/// columns), so a manually-narrowed or `tree_max_cols`-capped tree could not be represented and would
-/// jump up to that floor. Expressing the floor as "≥ N columns" lets the tree stay narrow on any pane
-/// width while never collapsing on a small one. Shared by [`columns`] (render) and the controller's
-/// interactive resize so the two agree on how narrow the tree can get.
-pub fn min_tree_split_pct(pane_width: u16) -> u16 {
-    if pane_width == 0 {
-        return crate::config::MIN_TREE_MAX_COLS;
-    }
-    let pct = (crate::config::MIN_TREE_MAX_COLS as u32 * 100).div_ceil(pane_width as u32) as u16;
-    // Never 0 (a tree needs some width); capped well below the 90% upper bound so a small pane can't
-    // force a floor that would crowd out the content pane.
-    pct.clamp(1, 40)
-}
-
-/// The column split for the current frame: `(tree_area, content_area, divider_x)`. A column
-/// is `None` when not drawn (narrow layout shows only the focused one). Shared by [`draw`] and
-/// [`geometry`] so the drawn layout and the hit-test geometry can never disagree.
-fn columns(area: Rect, state: &ViewState) -> (Option<Rect>, Option<Rect>, Option<u16>) {
-    // Zoom hides the tree entirely: the content pane fills the frame regardless of width or
-    // focus, so there is no tree interior and no divider to hit-test.
-    if state.zoomed {
-        return (None, Some(area), None);
-    }
-    if area.width < NARROW_SPLIT {
-        return match state.focus {
-            Focus::Tree => (Some(area), None, None),
-            Focus::Content => (None, Some(area), None),
-        };
-    }
-    let tree_pct = state.split_pct.clamp(min_tree_split_pct(area.width), 90);
-    // The tree is `min(tree_pct% of the pane, tree_max_cols)`: the percentage governs normal panes,
-    // and the column cap reins the tree in on a very wide pane (a full tab, a big monitor) so it
-    // doesn't over-allocate blank space past the filenames. The cap is a *default* ceiling only:
-    // once the user has resized the split by hand (`split_manual` — a divider drag or the grow/shrink
-    // keys), it is lifted so the tree honours exactly what they dragged to, otherwise the resize
-    // would look frozen. Only when the cap actually bites do we switch to a fixed `Length(cap)`
-    // column; otherwise keep the exact `Percentage` layout (so nothing shifts when it doesn't). The
-    // tree keeps this width whichever side it sits on; only the column ORDER flips. `cols[1]` is
-    // always the right-hand column, so the divider — the boundary where the two bordered blocks abut
-    // — is `cols[1].x` in either layout (the hit-test and drag geometry both derive from this, so
-    // neither needs to know the side).
-    let pct_cols = (area.width as u32 * tree_pct as u32 / 100) as u16;
-    let cap_bites = !state.split_manual && pct_cols > state.tree_max_cols;
-    let (tree_c, content_c) = if cap_bites {
-        // Cap bites: fix the tree at the cap and give the content pane the rest.
-        (Constraint::Length(state.tree_max_cols), Constraint::Min(0))
-    } else {
-        (
-            Constraint::Percentage(tree_pct),
-            Constraint::Percentage(100 - tree_pct),
-        )
-    };
-    match state.tree_position {
-        crate::config::TreePosition::Left => {
-            let cols = Layout::horizontal([tree_c, content_c]).split(area);
-            (Some(cols[0]), Some(cols[1]), Some(cols[1].x))
-        }
-        crate::config::TreePosition::Right => {
-            let cols = Layout::horizontal([content_c, tree_c]).split(area);
-            // content = cols[0] (left), tree = cols[1] (right); divider at their boundary.
-            (Some(cols[1]), Some(cols[0]), Some(cols[1].x))
-        }
-    }
+/// Translate the presenter's legacy no-pin view state into the structural policy. Later tasks pass
+/// the policy's pinned state directly; keeping the conversion here preserves every current drawing
+/// and hit-test caller while ensuring they already share one frame-carving path.
+fn structural_layout(area: Rect, state: &ViewState) -> PreviewLayout {
+    layout(LayoutInput {
+        area,
+        has_prompt: state.prompt.is_some(),
+        has_remote_status: state.remote_notice_status.is_some(),
+        has_pin: false,
+        focus: match state.focus {
+            Focus::Tree => PreviewFocus::Tree,
+            Focus::Content => PreviewFocus::Active,
+        },
+        tree_hidden: state.zoomed,
+        preview_split_pct: 50,
+        tree_split_pct: state.split_pct,
+        tree_position: state.tree_position,
+        tree_max_cols: state.tree_max_cols,
+        tree_split_manual: state.split_manual,
+    })
 }
 
 /// Hit-test geometry for mouse input, derived from the same split [`draw`] renders.
@@ -1406,8 +1331,11 @@ pub struct PaneGeometry {
 /// renders, so a click is never mapped against stale geometry. The interior of a bordered
 /// block is its area inset by one cell on each side (the title does not change it).
 pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
-    let (body, _remote_notice_status, _prompt) = body_remote_notice_status_prompt(area, state);
-    let (tree, content, divider_x) = columns(body, state);
+    let layout = structural_layout(area, state);
+    let body = layout.body;
+    let tree = layout.tree;
+    let content = layout.active;
+    let divider_x = layout.tree_divider.map(|divider| divider.x);
     let inner = |r: Rect| Block::bordered().inner(r);
 
     // Tree: the SAME layout `draw_tree` computes (text rect + in-pane bar tracks), so a click maps
@@ -1532,8 +1460,9 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
 /// taken from the **live frame width** (via [`columns`]), so it can never disagree with the
 /// geometry it is drawn into (a stale `state.width` cannot desync the layout).
 pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
-    let (body, remote_notice_area, prompt_area) =
-        body_remote_notice_status_prompt(frame.area(), state);
+    let layout = structural_layout(frame.area(), state);
+    let remote_notice_area = layout.remote_status;
+    let prompt_area = layout.prompt;
     if let (Some(area), Some(status)) = (remote_notice_area, state.remote_notice_status.as_deref())
     {
         draw_remote_notice_status(frame, area, status);
@@ -1541,11 +1470,10 @@ pub fn draw(frame: &mut Frame, state: &ViewState) -> (u16, u16) {
     if let (Some(area), Some(prompt)) = (prompt_area, state.prompt.as_deref()) {
         draw_prompt_line(frame, area, prompt);
     }
-    let (tree, content, _divider) = columns(body, state);
-    if let Some(area) = tree {
+    if let Some(area) = layout.tree {
         draw_tree(frame, area, state);
     }
-    let dims = match content {
+    let dims = match layout.active {
         Some(area) => draw_content(frame, area, state),
         None => (0, 0),
     };

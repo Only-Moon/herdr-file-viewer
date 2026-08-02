@@ -8,6 +8,7 @@ use herdr_file_viewer::presenter::{
     AnnotationEditorKind, AnnotationEditorView, AnnotationIndicatorsView, AnnotationOverviewView,
     AnnotationRowView, AnnotationTargetView, Focus, ViewState, draw,
 };
+use herdr_file_viewer::preview_layout::{LayoutInput, PreviewFocus, layout};
 use herdr_file_viewer::render::to_text;
 use herdr_file_viewer::tree::{Node, NodeKind};
 use ratatui::Terminal;
@@ -137,6 +138,36 @@ fn wide_shows_both_columns_regardless_of_focus() {
         out.contains("fn main()"),
         "content column present at >= 80 cols\n{out}"
     );
+}
+
+#[test]
+fn structural_policy_keeps_no_pin_boundary_and_pin_floor_distinct() {
+    use ratatui::layout::Rect;
+
+    for (width, tree, active) in [(79, true, false), (80, true, true)] {
+        let result = layout(LayoutInput::new(Rect::new(0, 0, width, 10)));
+        assert_eq!(result.tree.is_some(), tree, "no pin at {width} columns");
+        assert_eq!(result.active.is_some(), active, "no pin at {width} columns");
+    }
+
+    for (width, adjacent) in [(83, false), (84, true)] {
+        let result = layout(LayoutInput {
+            area: Rect::new(0, 0, width, 10),
+            has_pin: true,
+            tree_hidden: true,
+            focus: PreviewFocus::Pinned,
+            ..LayoutInput::new(Rect::default())
+        });
+        assert_eq!(
+            result.pinned.is_some() && result.active.is_some(),
+            adjacent,
+            "each 50/50 preview needs 40 interior columns at {width} columns"
+        );
+        if !adjacent {
+            assert_eq!(result.pinned, Some(Rect::new(0, 0, width, 10)));
+            assert_eq!(result.active, None);
+        }
+    }
 }
 
 #[test]

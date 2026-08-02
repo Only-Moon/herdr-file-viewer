@@ -1424,6 +1424,34 @@ fn min_tree_split_pct_yields_at_least_the_min_columns() {
 }
 
 #[test]
+fn split_preview_policy_keeps_prompt_below_remote_status_outside_body() {
+    use herdr_file_viewer::preview_layout::{LayoutInput, PreviewFocus, layout};
+
+    let layout = layout(
+        LayoutInput::new(ratatui::layout::Rect::new(4, 8, 100, 12))
+            .with_prompt(true)
+            .with_remote_status(true)
+            .with_pin(true)
+            .with_focus(PreviewFocus::Active),
+    );
+
+    assert_eq!(
+        layout.prompt,
+        Some(ratatui::layout::Rect::new(4, 19, 100, 1))
+    );
+    assert_eq!(
+        layout.remote_status,
+        Some(ratatui::layout::Rect::new(4, 18, 100, 1))
+    );
+    assert_eq!(layout.body, ratatui::layout::Rect::new(4, 8, 100, 10));
+    assert!(
+        layout
+            .active
+            .is_some_and(|active| active.bottom() <= layout.remote_status.unwrap().y)
+    );
+}
+
+#[test]
 fn geometry_allows_a_narrow_manual_tree_on_a_very_wide_pane() {
     // Medium-fix: on an ultrawide pane the tree floor is pane-aware, so a manually-narrowed (or
     // capped) tree is representable instead of jumping up to a fixed 10% of the pane (100 cols here).
