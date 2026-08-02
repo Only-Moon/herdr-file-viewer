@@ -1,7 +1,8 @@
 //! Content Renderer: escape-sequence neutralization (AC-27).
 
-use herdr_file_viewer::render::to_text;
+use herdr_file_viewer::render::{neutralize_plain_text, render_markdown_section, to_text};
 use ratatui::text::Text;
+use std::time::Duration;
 
 fn flatten(text: &Text) -> String {
     text.lines
@@ -9,6 +10,96 @@ fn flatten(text: &Text) -> String {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.content.as_ref())
         .collect()
+}
+
+#[test]
+fn markdown_section_neutralizes_hostile_delegate_output_and_preserves_safe_sgr() {
+    // This is the actual section path, not a direct neutralizer test: the injected command returns
+    // untrusted stdin verbatim, then the shared T-2 boundary must make its output safe for ratatui.
+    let command = vec!["sh".into(), "-c".into(), "cat".into()];
+    let cases = [
+        ("cursor", "before\x1b[10;10Hafter", "beforeafter", false),
+        ("screen", "before\x1b[2Jafter", "beforeafter", false),
+        (
+            "OSC hyperlink",
+            "before\x1b]8;;https://evil.invalid/\x1b\\after",
+            "beforeafter",
+            false,
+        ),
+        (
+            "OSC clipboard",
+            "before\x1b]52;c;c3RvbGVu\x07after",
+            "beforeafter",
+            false,
+        ),
+        ("C0", "be\x07fore\rafter", "beforeafter", false),
+        ("C1", "be\u{9b}fore\u{85}after", "beforeafter", false),
+        ("malformed CSI", "before\x1b[31", "before", false),
+        ("safe SGR", "\x1b[34mBlue\x1b[0m", "Blue", true),
+    ];
+
+    for (name, hostile, expected, expect_color) in cases {
+        let (text, notice) = render_markdown_section(
+            &command,
+            hostile,
+            to_text(hostile),
+            72,
+            std::time::Instant::now() + Duration::from_secs(1),
+        );
+        let rendered = flatten(&text);
+        assert!(notice.is_none(), "{name}: cat succeeds");
+        assert_eq!(rendered, expected, "{name}: hostile bytes are neutralized");
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "{name}: no terminal control survives: {rendered:?}"
+        );
+        let has_color = text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.style.fg.is_some());
+        assert_eq!(
+            has_color, expect_color,
+            "{name}: safe SGR styling is retained"
+        );
+    }
+}
+
+#[test]
+fn plain_text_neutralizer_makes_hostile_titles_one_safe_visible_line() {
+    // Spotlight titles are remote input. The same plain-text boundary as `to_text` must remove
+    // all terminal control behavior while preserving ordinary Unicode text on one visible line.
+    let cases = [
+        ("newlines", "first\nsecond", "firstsecond"),
+        ("C0", "be\x07fore\rafter\tend", "beforeafterend"),
+        ("C1", "be\u{9b}fore\u{85}after", "beforeafter"),
+        ("CSI", "before\x1b[2Jafter", "beforeafter"),
+        (
+            "OSC hyperlink",
+            "before\x1b]8;;https://evil.invalid/\x1b\\after",
+            "beforeafter",
+        ),
+        (
+            "OSC clipboard",
+            "before\x1b]52;c;c3RvbGVu\x07after",
+            "beforeafter",
+        ),
+        ("malformed CSI", "before\x1b[31", "before"),
+        ("Unicode", "Café 東京", "Café 東京"),
+    ];
+
+    for (name, hostile, expected) in cases {
+        let title = neutralize_plain_text(hostile);
+        assert_eq!(
+            title, expected,
+            "{name}: expected hostile bytes to be neutralized"
+        );
+        assert_eq!(title.lines().count(), 1, "{name}: exactly one visible line");
+        assert!(
+            !title.chars().any(char::is_control),
+            "{name}: no control characters survive: {title:?}"
+        );
+    }
 }
 
 #[test]

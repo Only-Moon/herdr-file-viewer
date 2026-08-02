@@ -57,6 +57,20 @@ impl EffectiveBindings {
         codes.sort_by_key(|&c| key_label(c));
         codes
     }
+
+    /// The already-joined effective key label for `intent` in a remote-notice status hint. The
+    /// label reflects the resolved map, including custom bindings and keys displaced by another
+    /// custom binding. `None` means the intent has no effective keys; the status formatter owns
+    /// its display normalization.
+    pub(crate) fn status_hint_label(&self, intent: Intent) -> Option<String> {
+        let label = self
+            .keys_for(intent)
+            .into_iter()
+            .map(key_label)
+            .collect::<Vec<_>>()
+            .join(" / ");
+        (!label.is_empty()).then_some(label)
+    }
 }
 
 /// Fold the [`REGISTRY`] into the default [`EffectiveBindings`]: every default key of every row
@@ -402,7 +416,7 @@ pub(crate) const REGISTRY: &[Binding] = &[
         intent: Intent::DismissUpdate,
         name: "dismiss_update",
         default_keys: &[KeyCode::Char('u')],
-        description: "Dismiss the update-available banner for this session.",
+        description: "Dismiss the advisory status row for this session.",
         category: "Session",
     },
     Binding {
@@ -859,6 +873,25 @@ mod tests {
             registry().len(),
             "no two REGISTRY rows may share a name"
         );
+    }
+
+    #[test]
+    fn dismiss_update_help_copy_describes_session_status_row() {
+        let binding = registry()
+            .iter()
+            .find(|binding| binding.intent == Intent::DismissUpdate)
+            .expect("dismiss_update must be registered");
+        let help = crate::help::keybindings_text(
+            registry(),
+            &default_bindings(),
+            &KeyLoadOutcome::default(),
+        );
+
+        for copy in [binding.description, help.as_str()] {
+            assert!(copy.contains("advisory status row"));
+            assert!(copy.contains("this session"));
+            assert!(!copy.contains("all remote notices"));
+        }
     }
 
     #[test]
@@ -1663,6 +1696,24 @@ mod tests {
         assert_eq!(dec(&b, KeyCode::Char('j')), Some(Intent::Refresh));
         assert_ne!(dec(&b, KeyCode::Char('j')), Some(Intent::NavDown));
         assert_eq!(dec(&b, KeyCode::Down), Some(Intent::NavDown));
+    }
+
+    #[test]
+    fn status_hint_collision_decodes_the_claimant() {
+        // A status hint reporting Help as unbound must mean its key actually moved to the custom
+        // claimant, not that collision handling dropped it from the effective decode map.
+        let (bindings, outcome) = resolve_with(&[("refresh", one("?"))]);
+        assert!(outcome.is_empty(), "an explicit/default collision is valid");
+        assert_eq!(
+            bindings.status_hint_label(Intent::ShowHelp),
+            None,
+            "the default Help key is displaced"
+        );
+        assert_eq!(
+            dec(&bindings, KeyCode::Char('?')),
+            Some(Intent::Refresh),
+            "the displaced key decodes to its explicit claimant"
+        );
     }
 
     #[test]

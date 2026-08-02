@@ -44,10 +44,10 @@ use crate::presenter::{
     FinderView, Focus, HelpView, LineSelectView, PaneGeometry, PickerRowView, PickerView,
     ViewState,
 };
-use crate::render::{Prepared, Renderers};
+use crate::render::Renderers;
 use crate::root::Resolved;
 use crate::tree::{Node, NodeKind, TreeModel};
-use crate::update::{self, UpdateState, Version};
+use crate::update::{self, NoticeSnapshot, UpdateState};
 use crate::view_policy::{FileDescriptor, ViewMode, applicable_modes, default_mode};
 use annotation::{AnnotationEditorState, AnnotationListState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -80,12 +80,6 @@ const SPLIT_STEP: u16 = 5;
 const SPLIT_DRAG_MIN: u16 = 10;
 /// How many columns one horizontal-scroll keypress moves the content pane.
 const HSCROLL_STEP: u16 = 8;
-/// Wall-clock bound for the synchronous What's New markdown render in `open_help`. The render runs
-/// on the input thread (the design settled on prerender-at-open), so it must be bounded well within
-/// the AC-22 responsiveness budget — far tighter than the shared 5s content `RENDER_TIMEOUT`, which
-/// would let a wedged `glow` freeze input for up to 5s. On timeout the existing render path falls
-/// back to plain text + a notice (AC-15). This reconciles prerender-at-open with AC-22.
-const HELP_RENDER_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long a [`Flash`] stays at full brightness before it starts to dim.
 const FLASH_FULL: Duration = Duration::from_millis(1600);
 /// How long a [`Flash`] lingers dimmed after [`FLASH_FULL`] before it disappears entirely. The
@@ -311,8 +305,8 @@ pub struct Components {
     pub providers: Box<dyn Fn(&Resolved) -> RootProviders>,
     pub editor: Box<dyn EditorHandoff>,
     pub clipboard: Box<dyn Clipboard>,
-    /// The external renderer commands used for the in-app help overlay's What's New section
-    /// (render CHANGELOG_MD as markdown via the same renderer the content pane uses).
+    /// The external renderer commands used for independently rendering the in-app Help What's New
+    /// documents through the injected markdown command.
     /// `None` ⇒ the markdown renderer is absent; `render::render` falls back to plain text
     /// and a notice (AC-15) — the same fallback it applies for any missing renderer.
     pub renderers: Option<Renderers>,
@@ -668,7 +662,7 @@ pub struct Controller {
     /// The provider factory (ADR-0004), kept so a re-root can rebuild the root-bound providers
     /// (Git Service + Content Renderer) against the new root.
     providers: Box<dyn Fn(&Resolved) -> RootProviders>,
-    /// The external renderer commands for the help overlay's What's New section.
+    /// The external renderer commands for independently rendering Help's What's New documents.
     /// Built from `Components::renderers` at construction; `None` ⇒ fallback.
     renderers: Renderers,
     /// Render dispatch to the worker thread (AC-23). `latest_seq` is the most recently
@@ -701,9 +695,9 @@ pub struct Controller {
     /// exclusive with L line-select mode by construction: created only in `handle_column_mouse`,
     /// which runs only for `Modal::None`. Auto-copied on release.
     content_selection: Option<LineSelectState>,
-    /// The newer version to advertise, if any (set from the cached value at startup and
-    /// refreshed by the background check). `None` ⇒ up-to-date / unknown.
-    update_available: Option<Version>,
+    /// The last complete remote-notice state. Background results replace this value atomically,
+    /// so release and spotlight state never land on different redraws.
+    notice_snapshot: NoticeSnapshot,
     /// The pre-formatted Settings section body (AC-15, AC-18), or `None` before
     /// [`set_settings_display`](Self::set_settings_display) is called. Injected post-construction
     /// (mirrors [`set_update`](Self::set_update)) so the controller stays hermetic in tests — a
@@ -714,11 +708,12 @@ pub struct Controller {
     /// post-construction (mirrors [`settings_display`](Self::settings_display)) so the controller
     /// stays hermetic in tests — a test that never calls the setter keeps its overlay unchanged.
     keybindings_display: Option<String>,
-    /// Hides the banner for the rest of this session (the `u` key). Not persisted — it returns
-    /// next launch while still behind.
+    /// Hides the status line for the rest of this session after a remote-notice dismissal (the
+    /// `u` key). It is never reset by a later background replacement, so the current process
+    /// cannot revive a dismissed line.
     update_dismissed: bool,
-    /// One-shot receiver for the background update check's result (`None` when no check ran).
-    update_rx: Option<mpsc::Receiver<Option<Version>>>,
+    /// One-shot receiver for a background notice replacement (`None` when no check ran).
+    notice_rx: Option<mpsc::Receiver<NoticeSnapshot>>,
     /// One-shot receiver for a re-root's off-thread status/changed-set computation (AC-17).
     /// `Some` between a re-root and the tick that applies the result; `None` otherwise.
     status_rx: Option<mpsc::Receiver<StatusResult>>,
@@ -895,11 +890,11 @@ impl Controller {
             last_click: None,
             drag: None,
             content_selection: None,
-            update_available: None,
+            notice_snapshot: NoticeSnapshot::default(),
             settings_display: None,
             keybindings_display: None,
             update_dismissed: false,
-            update_rx: None,
+            notice_rx: None,
             status_rx: None,
             modal: Modal::None,
             pending_goto: None,
@@ -1300,12 +1295,18 @@ impl Controller {
         self.width = width;
     }
 
-    /// Install the update-check result: the initial (cached) banner value plus the receiver the
-    /// background probe will deliver a refreshed result on. Called once by the run loop after
-    /// construction; absent ⇒ no banner (so existing call sites/tests are unaffected).
+    /// Install the initial remote-notice snapshot plus the receiver a background probe uses to
+    /// deliver one complete replacement. Called once by the run loop after construction; the
+    /// default snapshot keeps every existing no-update call site inert.
     pub fn set_update(&mut self, state: UpdateState) {
-        self.update_available = state.initial;
-        self.update_rx = state.rx;
+        self.notice_snapshot = state.initial;
+        self.notice_rx = state.rx;
+    }
+
+    /// The last complete remote-notice state applied by the controller. Exposed for integration
+    /// tests and the later notice presenters; callers receive the same atomic unit `poll` applies.
+    pub fn notice_snapshot(&self) -> &NoticeSnapshot {
+        &self.notice_snapshot
     }
 
     /// Install the formatted Settings section body (AC-15, AC-18), so [`open_help`](Self::open_help)
@@ -1671,7 +1672,7 @@ impl Controller {
             tree_max_cols: self.tree_max_cols,
             split_manual: self.split_manual,
             zoomed: self.zoomed,
-            update_banner: self.update_banner(),
+            remote_notice_status: self.remote_notice_status(),
             picker: self.picker_view(),
             finder: self.finder_view(),
             annotation_count: self.annotations.len(),
@@ -2778,22 +2779,29 @@ impl Controller {
         Effects::redraw()
     }
 
-    /// Hide the update banner for this session (the `u` key). Inert when no banner is showing,
-    /// so the key does nothing (no wasted repaint) until an update is actually available.
+    /// Hide the visible remote-notice line for this session (`u`). This never changes the
+    /// snapshot or cache, so What's New stays available and a fresh session can show the same row.
     fn dismiss_update(&mut self) -> Effects {
-        if self.update_available.is_some() && !self.update_dismissed {
-            self.update_dismissed = true;
-            return Effects::redraw();
+        if self.remote_notice_status().is_none() {
+            return Effects::noop();
         }
-        Effects::noop()
+
+        self.update_dismissed = true;
+        Effects::redraw()
     }
 
-    /// The update-banner text to display, or `None` when up-to-date, dismissed, or unknown.
-    fn update_banner(&self) -> Option<String> {
-        if self.update_dismissed {
-            return None;
-        }
-        self.update_available.as_ref().map(update::banner_text)
+    /// The remote-notice status text to display, or `None` when there is no visible notice or the
+    /// session dismissed it. Labels come from the controller's already-resolved bindings, never
+    /// from raw config or a per-frame resolver.
+    fn remote_notice_status(&self) -> Option<String> {
+        let details_key = self.bindings.status_hint_label(Intent::ShowHelp);
+        let dismiss_key = self.bindings.status_hint_label(Intent::DismissUpdate);
+        update::status::format_status(
+            &self.notice_snapshot,
+            self.update_dismissed,
+            details_key.as_deref(),
+            dismiss_key.as_deref(),
+        )
     }
 
     /// Whether the go-to-file finder overlay is currently open.
@@ -3195,18 +3203,17 @@ impl Controller {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        // A finished background update check (one-shot): adopt its verdict and drop the receiver.
-        // `Some(v)` shows/refreshes the banner; `None` (a successful check that found nothing
-        // newer) clears a now-stale cached banner. A *disconnected* channel means the probe failed
-        // and sent nothing — drop the receiver too, so we stop polling a dead channel every tick.
-        if let Some(rx) = &self.update_rx {
+        // A finished background probe replaces the whole notice state and drops the receiver.
+        // A disconnected channel sent no replacement, so retain the last applied snapshot and stop
+        // polling the dead receiver.
+        if let Some(rx) = &self.notice_rx {
             match rx.try_recv() {
-                Ok(version) => {
-                    self.update_available = version;
-                    self.update_rx = None;
+                Ok(snapshot) => {
+                    self.notice_snapshot = snapshot;
+                    self.notice_rx = None;
                     applied = true;
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.update_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => self.notice_rx = None,
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -3322,22 +3329,14 @@ fn is_markdown(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::HELP_RENDER_TIMEOUT;
-
     #[test]
-    fn help_render_timeout_within_ac22_budget() {
-        // FIX-B / AC-22: open_help renders What's New synchronously on the input thread, so the
-        // worst-case input-thread block is HELP_RENDER_TIMEOUT. Since R3 item 1, `run_renderer`
-        // enforces a SINGLE combined wall-clock deadline (the stdout-wait and the exit-wait share
-        // one `timeout`, not two), so the real worst-case is now exactly `HELP_RENDER_TIMEOUT`, not
-        // ~2× it — making this `≤ 300ms` assertion a TRUE single wall-clock bound rather than a
-        // best-case one. A slow/wedged renderer is killed at it and the plain-text fallback applies.
-        // This pins that bound deterministically within the 300 ms responsiveness budget: bumping
-        // the timeout past it fails HERE, covering the slow real-renderer path that a wall-clock
-        // timing assertion could only check flakily.
-        assert!(
-            HELP_RENDER_TIMEOUT <= std::time::Duration::from_millis(300),
-            "HELP_RENDER_TIMEOUT ({HELP_RENDER_TIMEOUT:?}) must stay within the 300ms AC-22 budget"
+    fn help_composition_timeout_is_the_single_200ms_budget() {
+        // T-19: the controller must not retain or stack its former help-render timeout. T-17 owns
+        // the one absolute deadline shared across every independently rendered What's New document.
+        assert_eq!(
+            crate::update::compose::WHATS_NEW_COMPOSE_TIMEOUT,
+            std::time::Duration::from_millis(200),
+            "What's New composition owns the one 200ms Help-open budget"
         );
     }
 
@@ -3945,6 +3944,107 @@ mod tests {
         assert!(
             !ctrl.key_load_outcome().is_empty(),
             "the rejected-entry outcome is stored on the controller (AC-16 surfacing path)"
+        );
+    }
+
+    #[test]
+    fn status_projection_uses_the_controller_stored_custom_hint_labels() {
+        let mut ctrl = wiring_controller();
+        let keys = BTreeMap::from([
+            (
+                "show_help".to_string(),
+                KeySpec::Many(vec!["F2".into(), "F3".into()]),
+            ),
+            ("dismiss_update".to_string(), KeySpec::One("d".into())),
+        ]);
+        let (bindings, outcome) = input::resolve_bindings(input::registry(), Some(&keys));
+        ctrl.set_keybindings(bindings, outcome);
+        ctrl.set_update(UpdateState {
+            initial: NoticeSnapshot {
+                detected_release: Some(update::Version {
+                    major: 9,
+                    minor: 9,
+                    patch: 9,
+                }),
+                ..NoticeSnapshot::default()
+            },
+            rx: None,
+        });
+
+        let line = ctrl
+            .view_state()
+            .remote_notice_status
+            .expect("the update status is visible");
+        assert_eq!(
+            line,
+            "Update v9.9.9 available · F2 / F3 details · d dismiss"
+        );
+        assert!(
+            !line.contains("herdr plugin install") && !line.contains("install"),
+            "status does not advertise an install or automatic action: {line}"
+        );
+    }
+
+    #[test]
+    fn status_projection_marks_help_unbound_when_a_custom_binding_claims_its_key() {
+        let mut ctrl = wiring_controller();
+        let keys = BTreeMap::from([("refresh".to_string(), KeySpec::One("?".into()))]);
+        let (bindings, outcome) = input::resolve_bindings(input::registry(), Some(&keys));
+        ctrl.set_keybindings(bindings, outcome);
+        ctrl.set_update(UpdateState {
+            initial: NoticeSnapshot {
+                detected_release: Some(update::Version {
+                    major: 9,
+                    minor: 9,
+                    patch: 9,
+                }),
+                ..NoticeSnapshot::default()
+            },
+            rx: None,
+        });
+
+        let line = ctrl
+            .view_state()
+            .remote_notice_status
+            .expect("the update status is visible");
+        assert_eq!(
+            line,
+            "Update v9.9.9 available · (unbound) details · u dismiss"
+        );
+    }
+
+    #[test]
+    fn status_projection_marks_displaced_hint_bindings_unbound() {
+        let mut ctrl = wiring_controller();
+        let keys = BTreeMap::from([
+            ("refresh".to_string(), KeySpec::One("?".into())),
+            ("nav_up".to_string(), KeySpec::One("u".into())),
+        ]);
+        let (bindings, outcome) = input::resolve_bindings(input::registry(), Some(&keys));
+        ctrl.set_keybindings(bindings, outcome);
+        ctrl.set_update(UpdateState {
+            initial: NoticeSnapshot {
+                detected_release: Some(update::Version {
+                    major: 9,
+                    minor: 9,
+                    patch: 9,
+                }),
+                ..NoticeSnapshot::default()
+            },
+            rx: None,
+        });
+
+        let line = ctrl
+            .view_state()
+            .remote_notice_status
+            .expect("the update status is visible");
+        assert_eq!(
+            line,
+            "Update v9.9.9 available · (unbound) details · (unbound) dismiss"
+        );
+        assert!(
+            !line.contains("herdr plugin install") && !line.contains("install"),
+            "status does not advertise an install or automatic action: {line}"
         );
     }
 

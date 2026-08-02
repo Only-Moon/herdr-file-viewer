@@ -6,18 +6,23 @@
 /// The full `CHANGELOG.md`, embedded at compile time (AC-12, AC-13).
 pub const CHANGELOG_MD: &str = include_str!("../CHANGELOG.md");
 
-/// The What's New body source: `CHANGELOG_MD` with the file-meta preamble stripped.
+/// Extract every stable release section from an embedded changelog, excluding its preamble and
+/// any `[Unreleased]` work-in-progress section. Accepted sections retain their source bytes.
 ///
-/// The raw `CHANGELOG.md` opens with the `# Changelog` title, a "Keep a Changelog / Semantic
-/// Versioning" paragraph, and link references — file metadata an in-app "What's New" doesn't want.
-/// This returns the slice starting at the first `## [` version heading, so only the version
-/// sections (`## [..]` + their `### Added`/`### Fixed` entries) render. Falls back to the whole
-/// string if no version heading is found (the const stays whole; the newest-first test reads it).
-pub fn changelog_display() -> &'static str {
-    match CHANGELOG_MD.find("## [") {
-        Some(idx) => &CHANGELOG_MD[idx..],
-        None => CHANGELOG_MD,
-    }
+/// This is intentionally the same narrow heading grammar as the update policy: only exact stable
+/// `MAJOR.MINOR.PATCH` headings are release history. The link references after the final release
+/// remain part of that release's source slice, as they have always been in the Help display.
+pub fn released_changelog(changelog: &str) -> String {
+    crate::update::release_policy::release_sections(changelog)
+        .into_iter()
+        .map(|section| section.text)
+        .collect()
+}
+
+/// The What's New body source: the embedded released changelog, with file metadata and
+/// `[Unreleased]` excluded.
+pub fn changelog_display() -> String {
+    released_changelog(CHANGELOG_MD)
 }
 
 /// The built-in, fixed sections of the help overlay: What's New and About.
@@ -170,8 +175,12 @@ impl HelpState {
 ///    whose double-width mis-renders in the TUI)
 ///
 /// (AC-16, AC-17, AC-18, AC-19)
-pub fn about_text(update: Option<crate::update::version::Version>) -> String {
-    let status = match update {
+///
+/// The complete notice snapshot is the only remote-derived input. This keeps About coupled to the
+/// same already-resolved in-memory state as What's New, rather than giving Help a narrower source
+/// it could refresh independently.
+pub fn about_text(snapshot: &crate::update::NoticeSnapshot) -> String {
+    let status = match snapshot.detected_release {
         Some(v) => format!("Update available: v{v}"),
         None => "Up to date".to_owned(),
     };
@@ -442,8 +451,12 @@ mod tests {
             "changelog_display() must not contain the 'Semantic Versioning' preamble line"
         );
         assert!(
-            shown.starts_with("## ["),
-            "changelog_display() must start at the first '## [' version heading"
+            shown.starts_with("## [") && !shown.starts_with("## [Unreleased]"),
+            "changelog_display() must begin at the newest released version, not Unreleased"
+        );
+        assert!(
+            !shown.contains("## [Unreleased]"),
+            "changelog_display() must exclude the unreleased work-in-progress section"
         );
         // The const stays whole — the preamble is only sliced off for display.
         assert!(
@@ -452,12 +465,12 @@ mod tests {
         );
     }
 
-    // (b) about_text(None) contains the required identity fields (AC-16, AC-17). The version now
-    // lives on the status line; the repo URL is BARE (scheme stripped, no "Repository:" label);
-    // the license reads "<SPDX> License".
+    // (b) About from an empty in-memory snapshot contains the required identity fields (AC-16,
+    // AC-17). The version now lives on the status line; the repo URL is BARE (scheme stripped, no
+    // "Repository:" label); the license reads "<SPDX> License".
     #[test]
     fn about_text_contains_identity_fields() {
-        let text = about_text(None);
+        let text = about_text(&crate::update::NoticeSnapshot::default());
         assert!(
             text.contains(env!("CARGO_PKG_VERSION")),
             "about_text must contain the package version (AC-16)"
@@ -496,7 +509,7 @@ mod tests {
     // line of About — the last non-empty line, below "<SPDX> License".
     #[test]
     fn star_cta_is_the_closing_line() {
-        let text = about_text(None);
+        let text = about_text(&crate::update::NoticeSnapshot::default());
         let lines: Vec<&str> = text.split('\n').collect();
 
         let cta_pos = lines
@@ -673,20 +686,23 @@ mod tests {
             minor: 0,
             patch: 0,
         };
-        let with_update = about_text(Some(v));
+        let with_update = about_text(&crate::update::NoticeSnapshot {
+            detected_release: Some(v),
+            ..Default::default()
+        });
         assert!(
             with_update.contains("Update available"),
-            "about_text(Some(_)) must contain 'Update available'"
+            "About must reflect the snapshot's update"
         );
         assert!(
             with_update.contains("2.0.0"),
-            "about_text(Some(v)) must contain the version string"
+            "About must contain the snapshot version"
         );
 
-        let up_to_date = about_text(None);
+        let up_to_date = about_text(&crate::update::NoticeSnapshot::default());
         assert!(
             up_to_date.contains("Up to date"),
-            "about_text(None) must contain 'Up to date'"
+            "About from an empty snapshot must contain 'Up to date'"
         );
     }
 
@@ -736,11 +752,11 @@ mod tests {
     fn about_text_is_a_pure_function_of_its_cached_argument() {
         // Same argument → byte-identical output across repeated calls (no hidden varying input such
         // as a network/update probe would introduce).
-        let a1 = about_text(None);
-        let a2 = about_text(None);
+        let a1 = about_text(&crate::update::NoticeSnapshot::default());
+        let a2 = about_text(&crate::update::NoticeSnapshot::default());
         assert_eq!(
             a1, a2,
-            "AC-N5: about_text(None) must be deterministic — no network/probe varies its output"
+            "AC-N5: About from an empty snapshot must be deterministic"
         );
 
         let v = Version {
@@ -748,11 +764,15 @@ mod tests {
             minor: 9,
             patch: 9,
         };
-        let b1 = about_text(Some(v));
-        let b2 = about_text(Some(v));
+        let snapshot = crate::update::NoticeSnapshot {
+            detected_release: Some(v),
+            ..Default::default()
+        };
+        let b1 = about_text(&snapshot);
+        let b2 = about_text(&snapshot);
         assert_eq!(
             b1, b2,
-            "AC-N5: about_text(Some(_)) must be deterministic for a fixed cached value"
+            "AC-N5: About must be deterministic for a fixed cached snapshot"
         );
 
         // The ONLY observable difference between the two outputs is the update-status line, i.e. it

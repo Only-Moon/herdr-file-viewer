@@ -50,6 +50,15 @@ fn the_required_test_matrix_does_not_include_windows() {
 }
 
 #[test]
+fn ci_does_not_rebuild_musl_on_every_pull_request() {
+    let w = workflow();
+    assert!(
+        !w.contains("\n  musl:\n") && !w.contains("x86_64-unknown-linux-musl"),
+        "the release workflow retains the musl artifact build, but ci.yml must not duplicate it"
+    );
+}
+
+#[test]
 fn the_windows_job_builds_release_and_runs_cargo_test() {
     let w = workflow();
     let idx = w

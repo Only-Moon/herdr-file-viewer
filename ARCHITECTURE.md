@@ -50,7 +50,7 @@ is unit-testable with stubs.
 | `intent` | The closed set of user intents (one exhaustive enum). |
 | `controller` | Orchestrate intents → state changes; hold ephemeral session state, including the root-bound `AnnotationStore`; dispatch renders to the worker; map mouse events against fed-back geometry; and rebuild root-bound services on a worktree switch. Its owned annotation projection root-joins file targets, follows the applied `content_path` rather than the live cursor, and exposes merged line ranges only when the applied render carries a source map. Feature submodules are `mod`, `mouse`, `help`, `finder`, `picker`, `infile`, `lineselect`, `annotation`, and `git_apply`. One `Modal` enum type-enforces exclusive input ownership. Only a successful root change clears annotations; failure and same-root paths preserve them. Quitting or switching worktree with a non-empty store raises the `Modal::DiscardConfirm` layer (for a quit, outside search/unzoom) rather than silently discarding it; its `y` proceeds only on a successful clipboard write, and a switch re-validates its held target before committing. |
 | `app` | The event loop (`run()`): assemble the live components, then `draw → poll input → route to the controller (or the active modal) → drain finished renders`, until the user closes the viewer. |
-| `update` | The bounded, read-only, fail-silent update check: at most once per 24h a hardened `git ls-remote --tags` (off the UI thread, in a private temp dir) compares the latest release to the running build and feeds the dismissable "update available" banner; opt out via `HERDR_FILE_VIEWER_NO_UPDATE_CHECK`. |
+| `update` | Fixed official HTTPS sources, bounded display-only remote notices through a fail-silent Official Repository Gateway; a 15-second refresh uses optional system `curl` documents (1 MiB each), then atomically publishes a complete, safe-to-delete advisory cache. `update_check` is the sole config setting for both notice types, with `HERDR_FILE_VIEWER_NO_UPDATE_CHECK` as an environment fallback; `404` withdraws a spotlight. |
 | `config` | Load & resolve the read-only TOML config: path resolution (`$HERDR_PLUGIN_CONFIG_DIR`, else XDG fallback), defensive parse (malformed input degrades to defaults, never panics), and precedence (config > env > default) → the `EffectiveSettings` consumed at startup by `editor`, `render`, `opener`, and `update`; it also parses the `[keys]` remapping table into `KeySpec` (string-or-array) entries the `input` bindings resolver layers over the registry. Never writes the file. |
 | `editor` | Hand a file off to `$EDITOR`, or the config's `editor` override (launch only — never reads or writes the file). |
 | `opener` | Read-only OS hand-off for the `O` / `R` keys: a pure per-OS argv builder (open-with-default-app / reveal-in-file-manager, overridable via the config's `open` / `reveal` keys) plus an `Opener` seam over the reused editor `Spawner`, spawned **non-blocking** (no terminal takeover, stdio nulled) so the TUI keeps running. |
@@ -95,14 +95,13 @@ retain file/title markers where applicable but never receive guessed source-line
 - **Git is first-class**, woven through the tree (status markers, colors, changed-only filter,
   baseline toggle) and the content pane (diff view), not a separate mode.
 - **In-memory, ephemeral state only**, including annotations, which start empty and are scoped to
-  the current root. A successful re-root clears them; failed and same-root re-root attempts do not.
-  The one on-disk exception is the advisory, safe-to-delete update-check timestamp cache
-  (`update-check.json` under the cache dir). Apart from that, there is no persistent store; the
-  filesystem and git repo are the read-only source of truth.
+  the current root. A successful re-root clears them; failed and same-root attempts do not. The
+  safe-to-delete `update-check.json` advisory cache is the sole persistent exception; it never
+  changes the viewed root or git repo.
 
 ## Trust boundaries
 
-Three untrusted inputs are handled defensively (see [SECURITY.md](SECURITY.md)):
+Four untrusted inputs are handled defensively (see [SECURITY.md](SECURITY.md)):
 
 1. **File content** is untrusted: fed to renderers on **stdin** (never as an argument), and the
    renderer output is re-sanitized so no escape sequence can drive the terminal.
@@ -111,6 +110,8 @@ Three untrusted inputs are handled defensively (see [SECURITY.md](SECURITY.md)):
    neutralized `core.fsmonitor`/`core.hooksPath`, scrubbed repo-redirecting env). This hardening
    lives in **one** shared builder so it cannot drift between callers.
 3. **The herdr-injected context** is parsed defensively and degrades to a minimal default.
+4. **Official remote-notice documents** come only from fixed HTTPS sources, stay bounded and
+   fail-silent, and pass through terminal-control neutralization before display.
 
 ## Tests
 

@@ -51,7 +51,7 @@ A taste of what the keys do — the [full key & mouse reference](docs/keys.md) h
 | `L` | Copy a `path:line` reference (or the selected lines) to your clipboard |
 | `Z` | Full-screen the current file |
 | `e` / `O` / `R` | Hand off: open in your editor / the OS default app / the file manager |
-| `?` | Help overlay: keys, what's new, settings, about |
+| `?` | Help overlay: What's New first, then keys, settings, and about |
 
 ## Quick start
 
@@ -109,7 +109,7 @@ Native Windows is supported as a **preview** (install works the same way; the op
 
 Full docs live in **[docs/](docs/README.md)**:
 
-- **[Install & updating](docs/install.md)** — prebuilt vs. source, pinning a version, local-dev linking, and the in-app update banner.
+- **[Install & updating](docs/install.md)** — prebuilt vs. source, pinning a version, local-dev linking, and remote notices.
 - **[Summoning the viewer](docs/summoning.md)** — the open actions, the idempotent launcher, split vs. tab, and the `--remote` caveat.
 - **[Usage guide](docs/usage.md)** — a feature-by-feature tour of the whole viewer.
 - **[Keys & mouse](docs/keys.md)** — the complete key table, mouse gestures, and editor hand-off.

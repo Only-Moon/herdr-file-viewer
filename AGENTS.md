@@ -59,14 +59,16 @@ and the spec chain):
 - **Tree Model**: the rooted, gitignore-aware file tree + filters + cursor
 - **Git Service**: read-only git queries (status, baseline, changed-set, diff)
 - **View Policy**: pure decision: which view mode for a file (changed→diff, md→rendered, else→content)
+- **Official Repository Gateway**: fixed-source, bounded, display-only remote notices
 - **Content Renderer**: produce content-pane text by delegating to external CLIs, with guards
 - **Presenter**: draw the two-column layout (ratatui)
 - **Input Dispatcher**: map key events → intents (crossterm)
 - **Session Controller**: orchestrate intents → state changes; holds in-memory session state
 - **Editor Launcher**: hand a file off to an external editor / new herdr pane
 
-State is **in-memory and ephemeral only**: no persistent store in v1; the filesystem and git repo
-are the read-only source of truth. (`ARCHITECTURE.md` is the committed module map; keep it current.)
+State is **in-memory and ephemeral only** except for the safe-to-delete, advisory
+`update-check.json` cache, which never changes the viewed root or git repo.
+(`ARCHITECTURE.md` is the committed module map; keep it current.)
 
 ### Load-bearing constraints (from `constitution.md`)
 
@@ -90,7 +92,9 @@ These shape every decision; violating one is a design error, not a style nit:
   content flows through it.
 - **`ignore` 0.4.26** for fast, `.gitignore`-aware tree walking (do not hand-roll gitignore).
 - **git via the system CLI** (read-only subcommands only), no `git2`/`gix`.
-- **`serde`/`serde_json`** only for parsing `HERDR_PLUGIN_CONTEXT_JSON`.
+- **`serde`/`serde_json`** parse `HERDR_PLUGIN_CONTEXT_JSON` and the advisory cache.
+- **System `curl`** is optional at runtime: it retrieves fixed official HTTPS documents for
+  advisory notices; without it, document retrieval is unavailable without an error.
 - Tests: `cargo test` + ratatui `TestBackend` + **`insta`** (snapshots) + **`expectrl`** (pty e2e).
 - No `tokio` (off-thread rendering uses `std::thread`+`mpsc`), no `clap`. **Minimal-deps house
   style**: adding a crate is a deliberate decision, not a default.

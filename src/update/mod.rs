@@ -1,45 +1,43 @@
-//! Update-available check — tell the user when a newer release exists.
+//! Bounded remote notices for newer release details and one project spotlight.
 //!
-//! A bounded, read-only, fail-silent feature: once per 24h it runs `git ls-remote` against
-//! our own repo (off the UI thread), compares the highest stable tag to the version compiled
-//! into this binary, and — if behind — surfaces a one-line banner. Disabled entirely by the
-//! `HERDR_FILE_VIEWER_NO_UPDATE_CHECK` env var. No new dependencies, no telemetry, no mutation.
+//! Once per 24h, one off-UI-thread coordinator queries the official repository, projects typed
+//! advisory content, publishes a complete safe-to-delete cache snapshot, and updates the one-line
+//! status plus What's New. Failures stay silent; no telemetry or viewed-repository mutation occurs.
 
 pub mod cache;
+pub mod compose;
+pub mod gateway;
+pub mod release_policy;
+pub mod spotlight_policy;
+pub mod status;
 pub mod version;
 
+pub use gateway::{DiscoveryRunner, ObjectId, ReleaseState, ReleaseTag, Source};
 pub use version::Version;
 
-use cache::{Cache, next_cache, should_check};
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use cache::Cache;
+use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
-use version::{latest_stable, newer_than_current};
+use version::{current, newer_than_current};
 
-/// Setting this env var (to anything) disables the update check and banner entirely.
+/// One successful remote check suppresses another for this many seconds.
+pub(crate) const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// One coordinator refresh shares this absolute deadline across discovery and both documents.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Setting this env var (to anything) disables the update check and status notice entirely.
 pub const DISABLE_ENV: &str = "HERDR_FILE_VIEWER_NO_UPDATE_CHECK";
 
-/// The injected probe runner: given the repo URL, returns `git ls-remote`-style stdout. Boxed
-/// + `Send` so the background thread owns it; a type alias keeps signatures readable.
-pub type ProbeRunner = Box<dyn Fn(&str) -> io::Result<String> + Send>;
+/// The only authority the public-source gateway may query (and the source of [`repo_slug`]).
+const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/smarzban/herdr-file-viewer";
 
-/// How long `git ls-remote` may stall mid-transfer before git itself aborts (seconds).
-const PROBE_LOW_SPEED_TIME: &str = "5";
-
-/// Hard wall-clock bound on the whole `git ls-remote` invocation. The low-speed settings only
-/// cover a stalled HTTP *transfer*, not TCP connect / DNS — so a black-holed network could
-/// otherwise hang (and orphan) the `git` child indefinitely. On overrun the child is killed and
-/// the probe fails (→ no banner), matching the fail-silent contract.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The repository URL the probe queries (and the source of [`repo_slug`]).
+/// The fixed official repository HTTPS URL.
 pub fn repo_url() -> &'static str {
-    env!("CARGO_PKG_REPOSITORY")
+    OFFICIAL_REPOSITORY_URL
 }
 
-/// The `owner/repo` slug for the install command, derived from [`repo_url`].
+/// The official `owner/repo` slug, derived from [`repo_url`].
 pub fn repo_slug() -> &'static str {
     repo_url()
         .trim_end_matches('/')
@@ -47,172 +45,133 @@ pub fn repo_slug() -> &'static str {
         .trim_start_matches("http://github.com/")
 }
 
-/// The one-line footer shown when a newer release exists.
-pub fn banner_text(v: &Version) -> String {
-    format!(
-        "↑ v{v} available · herdr plugin install {} · u to dismiss",
-        repo_slug()
-    )
-}
-
-/// Apply the security boundary for invoking `git` against an untrusted environment.
-///
-/// The viewed repository is **untrusted**, and `git` reads the repo-local `.git/config` of
-/// whatever working directory it is in (URL `insteadOf` rewrites, credential helpers, …) — so an
-/// attacker-planted `.git/config` could otherwise redirect or hijack this once-a-day probe. We:
-/// - run in `run_dir`, which the caller guarantees is a **freshly-created private empty dir**
-///   (so it cannot itself contain a `.git/config`), and ceiling discovery to it
-///   (`GIT_CEILING_DIRECTORIES`) so git never walks up to find one — no repo-local config is read,
-///   regardless of where herdr launched the pane;
-/// - pin the transport to `https` (`GIT_ALLOW_PROTOCOL`), so even a (user-global) URL rewrite
-///   can't redirect to a command-capable transport like `ext::` or `file://`;
-/// - never prompt (`GIT_TERMINAL_PROMPT=0`).
-///
-/// The user's own global/system config is intentionally kept — it carries legitimate proxy / CA
-/// settings and is in the user's own trust domain (only the *viewed repo* is untrusted).
-fn harden_git(cmd: &mut Command, run_dir: &Path) {
-    cmd.current_dir(run_dir)
-        .env("GIT_CEILING_DIRECTORIES", run_dir)
-        .env("GIT_ALLOW_PROTOCOL", "https")
-        .env("GIT_TERMINAL_PROMPT", "0");
-}
-
-/// Build the hardened `git ls-remote --tags <url>` command, run from `run_dir` (see
-/// [`harden_git`]). Constructed separately from [`run_git_ls_remote`] so the security boundary is
-/// unit-testable without shelling out.
-fn ls_remote_command(repo_url: &str, run_dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.args(["ls-remote", "--tags", repo_url]);
-    harden_git(&mut cmd, run_dir);
-    cmd.env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
-        .env("GIT_HTTP_LOW_SPEED_TIME", PROBE_LOW_SPEED_TIME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    cmd
-}
-
-/// Production probe runner. Runs the hardened `git ls-remote` from a **freshly-created private,
-/// empty directory** — git reads a `.git/config` in its own cwd, so even the system temp dir
-/// could (in principle) carry one; a directory we just made cannot. The directory is removed
-/// afterwards. The whole invocation is bounded by [`PROBE_TIMEOUT`] so a connect/DNS hang can't
-/// wedge or orphan the `git` child. `Err` on any failure — all of which degrade to "no banner".
-pub fn run_git_ls_remote(repo_url: &str) -> io::Result<String> {
-    let probe_dir = make_private_dir()?; // fresh, exclusively-created, empty, owned by us
-    let result = run_ls_remote_in(repo_url, &probe_dir);
-    let _ = std::fs::remove_dir_all(&probe_dir);
-    result
-}
-
-/// Create a fresh, private, empty directory under the system temp dir and return its path.
-///
-/// Uses **exclusive** creation (`create_dir`, which fails if the path already exists) with an
-/// unpredictable, never-reused name (pid + a nanosecond stamp + a probe counter), retrying on the
-/// rare collision. So the returned directory is guaranteed to be one we just created — never a
-/// pre-existing or attacker-planted path (which `create_dir_all` would silently reuse, letting a
-/// `.git/config` in it influence the probe). The caller removes it when done. `Err` (→ no banner)
-/// if no fresh directory can be made.
-fn make_private_dir() -> io::Result<PathBuf> {
-    let base = std::env::temp_dir();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    for attempt in 0..1024 {
-        let dir = base.join(format!(
-            "herdr-fv-probe-{}-{nanos}-{seq}-{attempt}",
-            std::process::id()
-        ));
-        match std::fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::other(
-        "could not create a private probe directory",
-    ))
-}
-
-/// Distinguishes successive private-probe-dir names within one process.
-static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Spawn the hardened `ls-remote` in `run_dir` and read its stdout, bounded by [`PROBE_TIMEOUT`].
-fn run_ls_remote_in(repo_url: &str, run_dir: &Path) -> io::Result<String> {
-    let mut child = ls_remote_command(repo_url, run_dir).spawn()?;
-    // Read stdout on a worker thread so the wait can be bounded (a hung connect never writes).
-    let stdout = child.stdout.take();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut out) = stdout {
-            let _ = out.read_to_end(&mut buf);
-        }
-        let _ = tx.send(buf);
-    });
-    // A SINGLE combined wall-clock deadline for the whole probe (matching the renderer
-    // call-site): `recv_timeout` can consume most of `PROBE_TIMEOUT` waiting for stdout, so bound
-    // the child wait by what's LEFT — otherwise a `ls-remote` that closes stdout near the deadline
-    // then hangs before exit could spend a second full budget (~2× `PROBE_TIMEOUT` total).
-    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-    match rx.recv_timeout(PROBE_TIMEOUT) {
-        Ok(buf) => match crate::proc::wait_bounded(
-            &mut child,
-            deadline.saturating_duration_since(std::time::Instant::now()),
-        ) {
-            Some(status) if status.success() => Ok(String::from_utf8_lossy(&buf).into_owned()),
-            Some(status) => Err(io::Error::other(format!(
-                "git ls-remote exited with {status}"
-            ))),
-            None => Err(io::Error::other("git ls-remote did not exit")),
-        },
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(io::Error::other("git ls-remote timed out"))
-        }
-    }
-}
-
-/// The startup decision: what to show immediately (from cache) and whether to hit the network.
+/// The startup decision: the cached notice snapshot and whether a remote refresh is eligible.
 pub struct Decision {
-    pub initial: Option<Version>,
-    pub should_check: bool,
+    pub initial: NoticeSnapshot,
+    pub should_refresh: bool,
 }
 
-/// Pure startup decision. `initial` is the cached latest-seen version if it is newer than the
-/// running build (and the feature is enabled); `should_check` is whether the 24h window has
-/// elapsed (and the feature is enabled).
-pub fn decide(disabled: bool, now_unix: u64, cache: &Option<Cache>) -> Decision {
+/// Whether a successful daily check is old enough to permit one new refresh. A timestamp in the
+/// future is eligible immediately rather than suppressing checks forever after clock skew.
+fn refresh_eligible(now_unix: u64, last_check_unix: u64) -> bool {
+    last_check_unix > now_unix || now_unix - last_check_unix >= CHECK_INTERVAL_SECS
+}
+
+/// Pure startup projection. It composes release-detail lifetime and spotlight freshness policies
+/// over bounded cache facts, performs no I/O, and starts no background work.
+pub fn decide(disabled: bool, session_started_at_unix: u64, cache: &Option<Cache>) -> Decision {
     if disabled {
         return Decision {
-            initial: None,
-            should_check: false,
+            initial: NoticeSnapshot::default(),
+            should_refresh: false,
         };
     }
-    let initial = cache
+
+    let detected_release = cache
         .as_ref()
-        .and_then(|c| c.latest_seen.as_deref())
+        .and_then(|cache| cache.latest_seen.as_deref())
         .and_then(Version::parse)
         .and_then(newer_than_current);
-    let last = cache.as_ref().map(|c| c.last_check_unix).unwrap_or(0);
+    let release_details = cached_release_details(cache, detected_release);
+    let spotlight = cached_spotlight(cache, session_started_at_unix);
+
     Decision {
-        initial,
-        should_check: should_check(now_unix, last),
+        initial: NoticeSnapshot {
+            detected_release,
+            release_details,
+            spotlight,
+        },
+        should_refresh: cache
+            .as_ref()
+            .is_none_or(|cache| refresh_eligible(session_started_at_unix, cache.last_check_unix)),
     }
 }
 
-/// Initial banner state + a one-shot receiver for the background check's result.
+fn cached_release_details(
+    cache: &Option<Cache>,
+    detected_release: Option<Version>,
+) -> Option<release_policy::CachedReleaseDetails> {
+    let cached = cache.as_ref().and_then(|cache| {
+        let details = cache.release_details.as_ref()?;
+        Some(release_policy::CachedReleaseDetails {
+            release: Version::parse(&details.release)?,
+            details: details.details.clone(),
+        })
+    });
+
+    match release_policy::cached_release_details(current(), detected_release, cached.as_ref()) {
+        release_policy::CachedReleaseDetailsDecision::Cached(cached) => {
+            let details = release_policy::eligible_release_sections(
+                &cached.details,
+                current(),
+                cached.release,
+            )
+            .concat();
+            (!details.is_empty() && details.len() <= release_policy::MAX_DETAILS_BYTES).then_some(
+                release_policy::CachedReleaseDetails {
+                    release: cached.release,
+                    details,
+                },
+            )
+        }
+        release_policy::CachedReleaseDetailsDecision::Hidden
+        | release_policy::CachedReleaseDetailsDecision::Fetch(_) => None,
+    }
+}
+
+fn cached_spotlight(
+    cache: &Option<Cache>,
+    session_started_at_unix: u64,
+) -> spotlight_policy::SpotlightCache {
+    let Some(cache) = cache else {
+        return spotlight_policy::SpotlightCache::default();
+    };
+    let mut projected = spotlight_policy::SpotlightCache::default();
+    let Some(retrieved_at_unix) = cache.spotlight_retrieved_at_unix else {
+        return projected;
+    };
+    let projection = match (
+        cache.spotlight.as_ref(),
+        spotlight_policy::freshness_at_session_start(session_started_at_unix, retrieved_at_unix),
+    ) {
+        (_, spotlight_policy::Freshness::Future) => return projected,
+        (Some(spotlight), spotlight_policy::Freshness::Fresh) => spotlight_policy::project(
+            spotlight_policy::SpotlightInput::Available(spotlight.clone()),
+        ),
+        (Some(_), spotlight_policy::Freshness::Stale) | (None, _) => {
+            spotlight_policy::SpotlightProjection::Withdrawn
+        }
+    };
+    projected.apply(spotlight_policy::cache_delta(projection, retrieved_at_unix));
+    projected
+}
+
+/// The complete remote-notice state visible to one controller frame.
+///
+/// The controller replaces this value only as a whole, so a completed background result cannot
+/// apply a new release while leaving an old spotlight behind.
+#[derive(Clone, Default)]
+pub struct NoticeSnapshot {
+    /// The latest stable release detected for the fixed official repository, if it is newer than
+    /// the running build.
+    pub detected_release: Option<Version>,
+    /// Immutable details only when they remain tied to the current detected release.
+    pub release_details: Option<release_policy::CachedReleaseDetails>,
+    /// The current project spotlight state, projected from the cache or the same completed
+    /// refresh that supplied the release state.
+    pub spotlight: spotlight_policy::SpotlightCache,
+}
+
+/// Initial notice state + a one-shot receiver for the background check's replacement snapshot.
 pub struct UpdateState {
-    pub initial: Option<Version>,
-    pub rx: Option<mpsc::Receiver<Option<Version>>>,
+    pub initial: NoticeSnapshot,
+    pub rx: Option<mpsc::Receiver<NoticeSnapshot>>,
 }
 
 impl UpdateState {
     pub fn disabled() -> Self {
         UpdateState {
-            initial: None,
+            initial: NoticeSnapshot::default(),
             rx: None,
         }
     }
@@ -224,44 +183,132 @@ pub struct StartDeps {
     pub now_unix: u64,
     pub cache: Option<Cache>,
     pub cache_dir: Option<PathBuf>,
-    pub repo_url: String,
-    pub run: ProbeRunner,
+    pub run: DiscoveryRunner,
+    pub gateway: Box<dyn gateway::Gateway>,
 }
 
-/// Decide, then (if warranted) spawn the background probe. On a **successful** probe the thread
-/// persists the throttle cache (advancing the 24h window + the latest version seen) and sends the
-/// "version to show" (`Some` when newer, `None` when nothing newer) over the channel. On a probe
-/// **failure** it leaves the cache untouched — so the check simply retries next launch — and sends
-/// nothing (the receiver then disconnects, which `Controller::poll` cleans up).
+/// Decide, then (if warranted) run one complete coordinator refresh off the UI thread.
+///
+/// Discovery and both optional document requests receive the same absolute deadline. A determined
+/// discovery advances the daily check in one complete cache snapshot before publishing its UI
+/// snapshot, while unavailable documents preserve their independent valid cache state. An
+/// unavailable discovery sends no replacement and leaves the successful-check timestamp untouched.
 pub fn start_with(deps: StartDeps) -> UpdateState {
     let StartDeps {
         disabled,
         now_unix,
         cache,
         cache_dir,
-        repo_url,
         run,
+        gateway,
     } = deps;
     let decision = decide(disabled, now_unix, &cache);
-    if !decision.should_check {
-        return UpdateState {
-            initial: decision.initial,
-            rx: None,
-        };
+    let initial = decision.initial;
+    if !decision.should_refresh {
+        return UpdateState { initial, rx: None };
     }
+
+    let refresh_initial = initial.clone();
+    let mut refresh_cache = cache.unwrap_or_default();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        // A probe failure leaves the cache as-is (retry next launch) and sends nothing.
-        if let Ok(stdout) = run(&repo_url) {
-            let latest = latest_stable(&stdout);
-            if let Some(dir) = &cache_dir {
-                cache::store(dir, &next_cache(now_unix, latest));
-            }
-            let _ = tx.send(latest.and_then(newer_than_current));
+        let deadline = std::time::Instant::now() + REFRESH_TIMEOUT;
+        let Source::Available(state) = run(deadline) else {
+            return;
+        };
+
+        let latest_release = state.latest_release();
+        let latest = latest_release.map(|release| release.version);
+        let detected_release = latest.and_then(newer_than_current);
+        let (release_details, persisted_release_details) =
+            match release_policy::cached_release_details(
+                current(),
+                detected_release,
+                refresh_initial.release_details.as_ref(),
+            ) {
+                release_policy::CachedReleaseDetailsDecision::Cached(details) => {
+                    (Some(details.clone()), None)
+                }
+                release_policy::CachedReleaseDetailsDecision::Hidden => (None, None),
+                release_policy::CachedReleaseDetailsDecision::Fetch(detected) => {
+                    let fetched = latest_release.and_then(|release| {
+                        let Source::Available(Some(bytes)) = gateway.changelog(release, deadline)
+                        else {
+                            return None;
+                        };
+                        let changelog = std::str::from_utf8(&bytes).ok()?;
+                        let sections = release_policy::eligible_release_sections(
+                            changelog,
+                            current(),
+                            detected,
+                        );
+                        let details = sections.concat();
+                        (!details.is_empty() && details.len() <= release_policy::MAX_DETAILS_BYTES)
+                            .then_some(release_policy::CachedReleaseDetails {
+                                release: detected,
+                                details,
+                            })
+                    });
+                    let persisted =
+                        fetched
+                            .as_ref()
+                            .map(|details| cache::PersistedReleaseDetails {
+                                release: details.release.to_string(),
+                                details: details.details.clone(),
+                            });
+                    (fetched, persisted)
+                }
+            };
+
+        let latest_seen = latest.map(|version| version.to_string());
+        if refresh_cache.latest_seen != latest_seen {
+            refresh_cache.release_details = None;
         }
+        refresh_cache.last_check_unix = now_unix;
+        refresh_cache.latest_seen = latest_seen;
+        if let Some(release_details) = persisted_release_details {
+            refresh_cache.release_details = Some(release_details);
+        }
+
+        let mut spotlight = refresh_initial.spotlight.clone();
+        if spotlight_policy::should_retrieve(now_unix, &spotlight) {
+            let source = match gateway.spotlight(&state, deadline) {
+                Source::Available(Some(bytes)) => {
+                    spotlight_policy::SpotlightInput::Available(bytes)
+                }
+                Source::Available(None) => spotlight_policy::SpotlightInput::Missing,
+                Source::Unavailable => spotlight_policy::SpotlightInput::Unavailable,
+            };
+            let policy_delta =
+                spotlight_policy::cache_delta(spotlight_policy::project(source), now_unix);
+            match &policy_delta {
+                spotlight_policy::SpotlightCacheDelta::Accepted {
+                    spotlight,
+                    retrieved_at_unix,
+                } => {
+                    refresh_cache.spotlight = Some(spotlight.source.clone());
+                    refresh_cache.spotlight_retrieved_at_unix = Some(*retrieved_at_unix);
+                }
+                spotlight_policy::SpotlightCacheDelta::Withdrawn { retrieved_at_unix } => {
+                    refresh_cache.spotlight = None;
+                    refresh_cache.spotlight_retrieved_at_unix = Some(*retrieved_at_unix);
+                }
+                spotlight_policy::SpotlightCacheDelta::Preserve => {}
+            }
+            spotlight.apply(policy_delta);
+        }
+
+        if let Some(dir) = cache_dir.as_deref() {
+            cache::store(dir, &refresh_cache);
+        }
+        let _ = tx.send(NoticeSnapshot {
+            detected_release,
+            release_details,
+            spotlight,
+        });
     });
     UpdateState {
-        initial: decision.initial,
+        initial,
         rx: Some(rx),
     }
 }
@@ -291,159 +338,392 @@ pub fn start_default_with(disabled: bool) -> UpdateState {
         now_unix,
         cache,
         cache_dir,
-        repo_url: repo_url().to_string(),
-        run: Box::new(run_git_ls_remote),
+        run: Box::new(gateway::discover_release_state),
+        gateway: Box::new(gateway::DocumentGateway::new()),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cache::CHECK_INTERVAL_SECS;
     use version::current;
+
+    fn future_version(offset: u32) -> Version {
+        Version {
+            major: current().major + offset,
+            minor: 0,
+            patch: 0,
+        }
+    }
+
+    #[test]
+    fn startup_decision_disabled_returns_an_empty_snapshot_and_skips_refresh() {
+        let release = future_version(1);
+        let spotlight = b"# Project\nbody\n".to_vec();
+        let cache = Some(Cache {
+            last_check_unix: 10,
+            latest_seen: Some(release.to_string()),
+            release_details: Some(cache::PersistedReleaseDetails {
+                release: release.to_string(),
+                details: "## [next]\n- cached details\n".into(),
+            }),
+            spotlight: Some(spotlight),
+            spotlight_retrieved_at_unix: Some(10_000),
+            ..Cache::default()
+        });
+
+        let decision = decide(true, 10_000, &cache);
+
+        assert!(decision.initial.detected_release.is_none());
+        assert!(decision.initial.release_details.is_none());
+        assert!(decision.initial.spotlight.status_title().is_none());
+        assert!(decision.initial.spotlight.whats_new_body().is_none());
+        assert!(!decision.should_refresh);
+    }
+
+    #[test]
+    fn startup_decision_throttles_a_cache_younger_than_one_day() {
+        let last_check_unix = 10_000;
+        let decision = decide(
+            false,
+            last_check_unix + CHECK_INTERVAL_SECS - 1,
+            &Some(Cache {
+                last_check_unix,
+                ..Cache::default()
+            }),
+        );
+
+        assert!(
+            !decision.should_refresh,
+            "strictly less than 86,400 elapsed seconds is throttled"
+        );
+    }
+
+    #[test]
+    fn startup_decision_refreshes_at_the_boundary_and_for_a_future_cache_clock() {
+        let last_check_unix = 10_000;
+        let cache = Some(Cache {
+            last_check_unix,
+            ..Cache::default()
+        });
+
+        assert!(
+            decide(false, last_check_unix + CHECK_INTERVAL_SECS, &cache).should_refresh,
+            "exactly 86,400 elapsed seconds is eligible"
+        );
+        assert!(
+            decide(false, last_check_unix - 1, &cache).should_refresh,
+            "a future cache timestamp is eligible rather than throttling forever"
+        );
+    }
+
+    #[test]
+    fn startup_decision_projects_details_only_for_the_matching_newer_release() {
+        let release = future_version(1);
+        let details = format!("## [{release}]\n- cached details\n");
+        let decision = decide(
+            false,
+            10_000,
+            &Some(Cache {
+                latest_seen: Some(release.to_string()),
+                release_details: Some(cache::PersistedReleaseDetails {
+                    release: release.to_string(),
+                    details: details.clone(),
+                }),
+                ..Cache::default()
+            }),
+        );
+
+        assert_eq!(decision.initial.detected_release, Some(release));
+        let projected = decision
+            .initial
+            .release_details
+            .as_ref()
+            .expect("matching newer release details remain usable");
+        assert_eq!(projected.release, release);
+        assert_eq!(projected.details, details);
+    }
+
+    #[test]
+    fn startup_decision_reprojects_cached_details_after_an_intermediate_install() {
+        let intermediate = current();
+        let detected = future_version(1);
+        let detected_section = format!("## [{detected}]\n- detected bytes\n");
+        let intermediate_section = format!("## [{intermediate}]\r\n- installed bytes\r\n");
+        let cache = Some(Cache {
+            latest_seen: Some(detected.to_string()),
+            release_details: Some(cache::PersistedReleaseDetails {
+                release: detected.to_string(),
+                details: format!("{detected_section}{intermediate_section}"),
+            }),
+            ..Cache::default()
+        });
+
+        let projected = decide(false, 10_000, &cache)
+            .initial
+            .release_details
+            .expect("only sections newer than this installed build remain visible");
+        assert_eq!(projected.release, detected);
+        assert_eq!(
+            projected.details, detected_section,
+            "the eligible cached section retains its exact original bytes"
+        );
+
+        let empty_cache = Some(Cache {
+            latest_seen: Some(detected.to_string()),
+            release_details: Some(cache::PersistedReleaseDetails {
+                release: detected.to_string(),
+                details: intermediate_section,
+            }),
+            ..Cache::default()
+        });
+        assert!(
+            decide(false, 10_000, &empty_cache)
+                .initial
+                .release_details
+                .is_none(),
+            "cached details with no section above the installed build stay hidden"
+        );
+    }
+
+    #[test]
+    fn startup_decision_hides_caught_up_and_superseded_release_details() {
+        let caught_up = current();
+        let older = future_version(1);
+        let newer = future_version(2);
+
+        let caught_up_decision = decide(
+            false,
+            10_000,
+            &Some(Cache {
+                latest_seen: Some(caught_up.to_string()),
+                release_details: Some(cache::PersistedReleaseDetails {
+                    release: caught_up.to_string(),
+                    details: "caught up details".into(),
+                }),
+                ..Cache::default()
+            }),
+        );
+        assert!(caught_up_decision.initial.detected_release.is_none());
+        assert!(caught_up_decision.initial.release_details.is_none());
+
+        let superseded_decision = decide(
+            false,
+            10_000,
+            &Some(Cache {
+                latest_seen: Some(newer.to_string()),
+                release_details: Some(cache::PersistedReleaseDetails {
+                    release: older.to_string(),
+                    details: "superseded details".into(),
+                }),
+                ..Cache::default()
+            }),
+        );
+        assert_eq!(superseded_decision.initial.detected_release, Some(newer));
+        assert!(superseded_decision.initial.release_details.is_none());
+    }
+
+    #[test]
+    fn startup_decision_projects_fresh_spotlight_and_hides_stale_spotlight() {
+        let session_started_at_unix = 1_000_000;
+        let spotlight = b"# Project\nbody\n".to_vec();
+        let fresh = decide(
+            false,
+            session_started_at_unix,
+            &Some(Cache {
+                spotlight: Some(spotlight.clone()),
+                spotlight_retrieved_at_unix: Some(
+                    session_started_at_unix - CHECK_INTERVAL_SECS + 1,
+                ),
+                ..Cache::default()
+            }),
+        )
+        .initial;
+        assert_eq!(fresh.spotlight.status_title(), Some("Project"));
+        assert_eq!(fresh.spotlight.whats_new_body(), Some(b"body\n".as_slice()));
+
+        let stale = decide(
+            false,
+            session_started_at_unix,
+            &Some(Cache {
+                spotlight: Some(spotlight),
+                spotlight_retrieved_at_unix: Some(session_started_at_unix - CHECK_INTERVAL_SECS),
+                ..Cache::default()
+            }),
+        )
+        .initial;
+        assert!(stale.spotlight.status_title().is_none());
+        assert!(stale.spotlight.whats_new_body().is_none());
+    }
+
+    #[test]
+    fn startup_decision_preserves_withdrawal_freshness_without_fabricating_content() {
+        let session_started_at_unix = 1_000_000;
+        let fresh_retrieved_at_unix = session_started_at_unix - CHECK_INTERVAL_SECS + 1;
+        let fresh = decide(
+            false,
+            session_started_at_unix,
+            &Some(Cache {
+                spotlight_retrieved_at_unix: Some(fresh_retrieved_at_unix),
+                ..Cache::default()
+            }),
+        )
+        .initial
+        .spotlight;
+
+        assert_eq!(fresh.retrieved_at_unix(), Some(fresh_retrieved_at_unix));
+        assert!(fresh.status_title().is_none());
+        assert!(fresh.whats_new_body().is_none());
+        assert!(
+            !spotlight_policy::should_retrieve(session_started_at_unix, &fresh),
+            "a fresh persisted withdrawal remains throttled for this session"
+        );
+
+        let stale = decide(
+            false,
+            session_started_at_unix,
+            &Some(Cache {
+                spotlight_retrieved_at_unix: Some(session_started_at_unix - CHECK_INTERVAL_SECS),
+                ..Cache::default()
+            }),
+        )
+        .initial
+        .spotlight;
+        assert_eq!(
+            stale.retrieved_at_unix(),
+            Some(session_started_at_unix - CHECK_INTERVAL_SECS)
+        );
+        assert!(spotlight_policy::should_retrieve(
+            session_started_at_unix,
+            &stale
+        ));
+
+        let unavailable = decide(false, session_started_at_unix, &Some(Cache::default()))
+            .initial
+            .spotlight;
+        assert_eq!(unavailable.retrieved_at_unix(), None);
+        assert!(spotlight_policy::should_retrieve(
+            session_started_at_unix,
+            &unavailable
+        ));
+
+        let invalid = decide(
+            false,
+            session_started_at_unix,
+            &Some(Cache {
+                spotlight: Some(b"not a spotlight document\n".to_vec()),
+                spotlight_retrieved_at_unix: Some(fresh_retrieved_at_unix),
+                ..Cache::default()
+            }),
+        )
+        .initial
+        .spotlight;
+        assert_eq!(invalid.retrieved_at_unix(), Some(fresh_retrieved_at_unix));
+        assert!(invalid.status_title().is_none());
+        assert!(invalid.whats_new_body().is_none());
+        assert!(
+            !spotlight_policy::should_retrieve(session_started_at_unix, &invalid),
+            "invalid present content is a conclusive withdrawal, not an unavailable result"
+        );
+    }
+
+    #[test]
+    fn stale_spotlight_reappears_after_a_fresh_identical_refresh() {
+        let session_started_at_unix = 1_000_000;
+        let spotlight = b"# Project\nbody\n".to_vec();
+        let mut refreshed = decide(
+            false,
+            session_started_at_unix,
+            &Some(Cache {
+                spotlight: Some(spotlight.clone()),
+                spotlight_retrieved_at_unix: Some(session_started_at_unix - CHECK_INTERVAL_SECS),
+                ..Cache::default()
+            }),
+        )
+        .initial
+        .spotlight;
+
+        assert!(refreshed.status_title().is_none());
+        assert!(refreshed.whats_new_body().is_none());
+
+        refreshed.apply(spotlight_policy::cache_delta(
+            spotlight_policy::project(spotlight_policy::SpotlightInput::Available(spotlight)),
+            session_started_at_unix,
+        ));
+
+        assert_eq!(refreshed.status_title(), Some("Project"));
+        assert_eq!(
+            refreshed.whats_new_body(),
+            Some(b"body\n".as_slice()),
+            "fresh content restores What's New"
+        );
+    }
+
+    #[test]
+    fn startup_decision_projects_fresh_spotlight_in_status_and_whats_new() {
+        let session_started_at_unix = 1_000_000;
+        let initial = decide(
+            false,
+            session_started_at_unix,
+            &Some(Cache {
+                spotlight: Some(b"# Project\nbody\n".to_vec()),
+                spotlight_retrieved_at_unix: Some(session_started_at_unix - 1),
+                ..Cache::default()
+            }),
+        )
+        .initial;
+
+        assert_eq!(initial.spotlight.status_title(), Some("Project"));
+        assert_eq!(
+            initial.spotlight.whats_new_body(),
+            Some(b"body\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn startup_decision_fixes_spotlight_freshness_at_session_start() {
+        let session_started_at_unix = 1_000_000;
+        let cache = Some(Cache {
+            spotlight: Some(b"# Project\nbody\n".to_vec()),
+            spotlight_retrieved_at_unix: Some(session_started_at_unix - CHECK_INTERVAL_SECS + 1),
+            ..Cache::default()
+        });
+        let initial = decide(false, session_started_at_unix, &cache).initial;
+        let later = decide(false, session_started_at_unix + CHECK_INTERVAL_SECS, &cache).initial;
+
+        assert_eq!(initial.spotlight.status_title(), Some("Project"));
+        assert!(
+            later.spotlight.status_title().is_none(),
+            "a later session independently re-evaluates its own startup freshness"
+        );
+        assert_eq!(
+            initial.spotlight.status_title(),
+            Some("Project"),
+            "the existing session keeps its startup projection without a live-clock recheck"
+        );
+    }
+
+    fn available_releases(releases: Vec<ReleaseTag>) -> Source<ReleaseState> {
+        Source::Available(
+            ReleaseState::new(
+                ObjectId::parse("0123456789012345678901234567890123456789").unwrap(),
+                releases,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn available_release(version: Version) -> Source<ReleaseState> {
+        available_releases(vec![ReleaseTag::new(
+            version,
+            ObjectId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        )])
+    }
 
     #[test]
     fn repo_slug_is_owner_repo() {
         // Derived from CARGO_PKG_REPOSITORY so it stays correct if the repo moves.
         assert_eq!(repo_slug(), "smarzban/herdr-file-viewer");
-    }
-
-    #[test]
-    fn banner_names_the_version_and_install_command() {
-        let v = Version {
-            major: 1,
-            minor: 1,
-            patch: 0,
-        };
-        let b = banner_text(&v);
-        assert!(b.contains("1.1.0"), "names the version: {b}");
-        assert!(
-            b.contains("herdr plugin install smarzban/herdr-file-viewer"),
-            "shows install cmd: {b}"
-        );
-        assert!(b.contains('u'), "mentions the dismiss key: {b}");
-    }
-
-    #[test]
-    fn ls_remote_command_is_hardened_against_untrusted_repo_config() {
-        // Security regression: the probe must not let the (untrusted) viewed repo's git config
-        // influence it. It runs from the given private run-dir with repo discovery ceilinged to
-        // it, pins the transport to https, and never prompts — so no repo-local `.git/config` is
-        // read (and the run-dir itself is a fresh empty dir, so it can't carry one either).
-        use std::ffi::OsStr;
-        let run_dir = std::path::Path::new("/some/private/probe-dir");
-        let cmd = ls_remote_command(repo_url(), run_dir);
-        let env: std::collections::HashMap<_, _> = cmd
-            .get_envs()
-            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
-            .collect();
-        assert_eq!(
-            cmd.get_current_dir(),
-            Some(run_dir),
-            "probe runs from its private run-dir, never the viewed repo / process cwd"
-        );
-        assert_eq!(
-            env.get(OsStr::new("GIT_CEILING_DIRECTORIES"))
-                .map(|v| v.as_os_str()),
-            Some(run_dir.as_os_str()),
-            "git must not walk up out of the run-dir to discover (and read) any repo's config"
-        );
-        assert_eq!(
-            env.get(OsStr::new("GIT_ALLOW_PROTOCOL"))
-                .map(|v| v.to_str().unwrap_or("")),
-            Some("https"),
-            "transport pinned to https so a URL rewrite can't reach ext::/file://"
-        );
-        assert_eq!(
-            env.get(OsStr::new("GIT_TERMINAL_PROMPT"))
-                .map(|v| v.to_str().unwrap_or("")),
-            Some("0"),
-            "a credential prompt must never block the probe"
-        );
-    }
-
-    #[test]
-    fn make_private_dir_is_fresh_empty_and_unique() {
-        // The probe dir must be freshly created (exclusive), empty, and never the same path twice
-        // — so a pre-existing/planted directory can't be reused as the probe cwd.
-        let a = make_private_dir().expect("first private dir");
-        let b = make_private_dir().expect("second private dir");
-        assert_ne!(a, b, "successive calls return distinct, never-reused paths");
-        for d in [&a, &b] {
-            assert!(d.is_dir(), "exists as a directory: {d:?}");
-            assert_eq!(
-                std::fs::read_dir(d).unwrap().count(),
-                0,
-                "freshly created → empty (no planted .git): {d:?}"
-            );
-        }
-        // Exclusive creation: creating the same path again must fail, not silently reuse it.
-        assert_eq!(
-            std::fs::create_dir(&a).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
-    }
-
-    #[test]
-    fn hardened_git_ignores_a_malicious_repo_local_insteadof() {
-        // Round-2 regression: a malicious repo-local `url.*.insteadOf` must NOT rewrite the probe
-        // URL when git runs under `harden_git` (fresh private dir + ceiling). `git ls-remote
-        // --get-url` resolves the URL *without any network*, so this is hermetic.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!(
-            "hfv-insteadof-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        let evil = base.join("evil-repo");
-        let clean = base.join("clean");
-        std::fs::create_dir_all(&evil).unwrap();
-        std::fs::create_dir_all(&clean).unwrap();
-
-        // Make `evil` a repo whose config rewrites our GitHub URL to an attacker host.
-        let init = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&evil)
-            .status();
-        if init.map(|s| !s.success()).unwrap_or(true) {
-            let _ = std::fs::remove_dir_all(&base);
-            return; // git unavailable → the construction test still covers the boundary
-        }
-        let _ = Command::new("git")
-            .args([
-                "config",
-                "url.https://evil.invalid/.insteadOf",
-                "https://github.com/",
-            ])
-            .current_dir(&evil)
-            .status();
-
-        let url = repo_url();
-        let get_url = |cmd: &mut Command| -> String {
-            cmd.args(["ls-remote", "--get-url", url]);
-            let out = cmd.output().expect("git --get-url");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        // Precondition: run *inside* the evil repo with no hardening → the rewrite DOES apply.
-        let mut unhardened = Command::new("git");
-        unhardened.current_dir(&evil);
-        assert!(
-            get_url(&mut unhardened).contains("evil.invalid"),
-            "precondition: the malicious repo-local insteadOf rewrites the URL"
-        );
-        // Hardened (fresh private dir): the rewrite must NOT apply — the URL is unchanged.
-        let mut hardened = Command::new("git");
-        harden_git(&mut hardened, &clean);
-        assert_eq!(
-            get_url(&mut hardened),
-            url,
-            "harden_git must ignore the repo-local insteadOf and keep the trusted URL"
-        );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -454,17 +734,18 @@ mod tests {
         let cache = Some(Cache {
             last_check_unix: 1_000,
             latest_seen: Some(newer.clone()),
+            ..Cache::default()
         });
         let state = start_with(StartDeps {
             disabled: false,
             now_unix: 1_000 + 10, // well within the 24h window
             cache,
             cache_dir: None,
-            repo_url: "x".into(),
             run: Box::new(|_| panic!("must not probe when the cache is fresh")),
+            gateway: unavailable_test_gateway(),
         });
         assert_eq!(
-            state.initial,
+            state.initial.detected_release,
             Version::parse(&newer),
             "banner shown from cache"
         );
@@ -475,64 +756,194 @@ mod tests {
     }
 
     #[test]
-    fn decide_uses_cache_for_the_initial_banner_and_gates_the_check() {
+    fn startup_decision_uses_cache_for_the_initial_banner_and_gates_the_check() {
         let newer = format!("{}.{}.{}", current().major + 1, 0, 0);
         let cache = Some(Cache {
             last_check_unix: 1_000,
             latest_seen: Some(newer.clone()),
+            ..Cache::default()
         });
 
         // Fresh cache (within 24h), behind → show banner from cache, no network.
         let d = decide(false, 1_000 + 10, &cache);
-        assert_eq!(d.initial, Version::parse(&newer));
-        assert!(!d.should_check, "fresh cache → no check");
+        assert_eq!(d.initial.detected_release, Version::parse(&newer));
+        assert!(!d.should_refresh, "fresh cache → no check");
 
         // Stale cache (>24h) → still show cached banner, AND check.
         let d = decide(false, 1_000 + CHECK_INTERVAL_SECS + 1, &cache);
-        assert_eq!(d.initial, Version::parse(&newer));
-        assert!(d.should_check, "stale → check");
+        assert_eq!(d.initial.detected_release, Version::parse(&newer));
+        assert!(d.should_refresh, "stale → check");
 
         // Disabled → never a banner, never a check, whatever the cache says.
         let d = decide(true, 10_000_000, &cache);
-        assert_eq!(d.initial, None);
-        assert!(!d.should_check);
+        assert!(d.initial.detected_release.is_none());
+        assert!(!d.should_refresh);
 
-        // No cache → no initial banner, but do check (real clock vs last=0).
+        // No cache → no initial banner, but do check.
         let d = decide(false, 10_000_000, &None);
-        assert_eq!(d.initial, None);
-        assert!(d.should_check);
+        assert!(d.initial.detected_release.is_none());
+        assert!(d.should_refresh);
 
         // Cache says we're up-to-date (current version) → no banner.
         let same = current().to_string();
         let upcache = Some(Cache {
             last_check_unix: 0,
             latest_seen: Some(same),
+            ..Cache::default()
         });
-        assert_eq!(decide(false, 0, &upcache).initial, None);
+        assert!(
+            decide(false, 0, &upcache)
+                .initial
+                .detected_release
+                .is_none()
+        );
     }
 
     #[test]
-    fn start_with_delivers_a_newer_version_over_the_channel() {
-        // A fake probe reporting a newer tag → the receiver yields it; no real network.
-        let newer = current().major + 1;
-        let stdout = format!("aaa\trefs/tags/v{newer}.0.0\n");
+    fn refresh_worker_keeps_details_for_the_same_release() {
+        let detected = future_version(1);
+        let details = format!("## [{detected}]\n- cached details\n");
         let dir = std::env::temp_dir().join(format!("hfv-startwith-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let spotlight = b"# Project\nexact spotlight bytes\n".to_vec();
+        let cached = Cache {
+            latest_seen: Some(detected.to_string()),
+            release_details: Some(cache::PersistedReleaseDetails {
+                release: detected.to_string(),
+                details: details.clone(),
+            }),
+            spotlight: Some(spotlight.clone()),
+            spotlight_retrieved_at_unix: Some(CHECK_INTERVAL_SECS * 9 + 1),
+            ..Cache::default()
+        };
+        cache::store(&dir, &cached);
         let state = start_with(StartDeps {
             disabled: false,
-            now_unix: CHECK_INTERVAL_SECS * 10, // force should_check
-            cache: None,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache: Some(cached),
             cache_dir: Some(dir.clone()),
-            repo_url: "fake-url".to_string(),
-            run: Box::new(move |_url| Ok(stdout.clone())),
+            run: Box::new(move |_| available_release(detected)),
+            gateway: unavailable_test_gateway(),
         });
-        let rx = state.rx.expect("a check was scheduled");
+        let UpdateState { rx, .. } = state;
         let got = rx
+            .expect("a check was scheduled")
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("result arrives");
-        assert_eq!(got, Version::parse(&format!("{newer}.0.0")));
-        // And the cache was written so a re-run wouldn't re-probe.
-        assert!(cache::load(&dir).is_some());
+        assert_eq!(got.detected_release, Some(detected));
+        assert_eq!(
+            got.release_details,
+            Some(release_policy::CachedReleaseDetails {
+                release: detected,
+                details,
+            }),
+            "a successful probe for the same release keeps exact cached details"
+        );
+        assert_eq!(got.spotlight.status_title(), Some("Project"));
+        let persisted = cache::load(&dir).expect("successful probe stores the complete cache");
+        assert_eq!(persisted.spotlight.as_deref(), Some(spotlight.as_slice()));
+        assert_eq!(
+            persisted.spotlight_retrieved_at_unix,
+            Some(CHECK_INTERVAL_SECS * 9 + 1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_worker_drops_over_cap_release_details_but_keeps_the_release() {
+        let detected = future_version(1);
+        let oversized = format!(
+            "## [{detected}]\n- {}\n",
+            "d".repeat(release_policy::MAX_DETAILS_BYTES)
+        );
+        let snapshot = refreshed(refresh_with(
+            Some(Cache::default()),
+            Box::new(move |_| available_release(detected)),
+            TestGateway {
+                changelog: Source::Available(Some(oversized.into_bytes())),
+                spotlight: Source::Unavailable,
+            },
+        ));
+
+        assert_eq!(snapshot.detected_release, Some(detected));
+        assert!(
+            snapshot.release_details.is_none(),
+            "over-cap details degrade to the plain install guidance, never an error"
+        );
+    }
+
+    #[test]
+    fn refresh_worker_clears_details_for_a_superseding_release() {
+        let cached_release = future_version(1);
+        let superseding_release = future_version(2);
+        let state = start_with(StartDeps {
+            disabled: false,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache: Some(Cache {
+                latest_seen: Some(cached_release.to_string()),
+                release_details: Some(cache::PersistedReleaseDetails {
+                    release: cached_release.to_string(),
+                    details: format!("## [{cached_release}]\n- details\n"),
+                }),
+                ..Cache::default()
+            }),
+            cache_dir: None,
+            run: Box::new(move |_| available_release(superseding_release)),
+            gateway: unavailable_test_gateway(),
+        });
+        assert!(
+            state.initial.release_details.is_some(),
+            "the valid cached state reaches the refresh coordinator"
+        );
+
+        let got = state
+            .rx
+            .expect("a check was scheduled")
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("result arrives");
+
+        assert_eq!(got.detected_release, Some(superseding_release));
+        assert!(
+            got.release_details.is_none(),
+            "details for an older release must not accompany a newer detected release"
+        );
+    }
+
+    #[test]
+    fn refresh_worker_clears_cached_release_when_no_stable_tag_exists() {
+        let cached_release = future_version(1);
+        let dir = std::env::temp_dir().join(format!("hfv-no-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cached = Cache {
+            latest_seen: Some(cached_release.to_string()),
+            release_details: Some(cache::PersistedReleaseDetails {
+                release: cached_release.to_string(),
+                details: "## [cached]\n- details\n".into(),
+            }),
+            ..Cache::default()
+        };
+        cache::store(&dir, &cached);
+        let state = start_with(StartDeps {
+            disabled: false,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache: Some(cached),
+            cache_dir: Some(dir.clone()),
+            run: Box::new(|_| available_releases(Vec::new())),
+            gateway: unavailable_test_gateway(),
+        });
+
+        let UpdateState { rx, .. } = state;
+        let got = rx
+            .expect("a check was scheduled")
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("result arrives");
+
+        assert!(got.detected_release.is_none());
+        assert!(got.release_details.is_none());
+        let persisted = cache::load(&dir).expect("successful probe stores the complete cache");
+        assert_eq!(persisted.last_check_unix, CHECK_INTERVAL_SECS * 10);
+        assert!(persisted.latest_seen.is_none());
+        assert!(persisted.release_details.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -543,10 +954,10 @@ mod tests {
             now_unix: 0,
             cache: None,
             cache_dir: None,
-            repo_url: "x".into(),
             run: Box::new(|_| panic!("must not probe when disabled")),
+            gateway: unavailable_test_gateway(),
         });
-        assert!(state.initial.is_none() && state.rx.is_none());
+        assert!(state.initial.detected_release.is_none() && state.rx.is_none());
     }
 
     #[test]
@@ -560,8 +971,370 @@ mod tests {
         // config `update_check = true`.
         let state = start_default_with(true);
         assert!(
-            state.initial.is_none() && state.rx.is_none(),
+            state.initial.detected_release.is_none() && state.rx.is_none(),
             "disabled=true → the disabled sentinel, regardless of the env"
         );
+    }
+
+    #[derive(Clone)]
+    struct TestGateway {
+        changelog: Source<Option<Vec<u8>>>,
+        spotlight: Source<Option<Vec<u8>>>,
+    }
+
+    impl gateway::Gateway for TestGateway {
+        fn changelog(
+            &self,
+            _release: &ReleaseTag,
+            _deadline: std::time::Instant,
+        ) -> Source<Option<Vec<u8>>> {
+            self.changelog.clone()
+        }
+
+        fn spotlight(
+            &self,
+            _state: &ReleaseState,
+            _deadline: std::time::Instant,
+        ) -> Source<Option<Vec<u8>>> {
+            self.spotlight.clone()
+        }
+    }
+
+    fn unavailable_test_gateway() -> Box<dyn gateway::Gateway> {
+        Box::new(TestGateway {
+            changelog: Source::Unavailable,
+            spotlight: Source::Unavailable,
+        })
+    }
+
+    struct DeadlineGateway {
+        deadlines: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+        changelog: Source<Option<Vec<u8>>>,
+        spotlight: Source<Option<Vec<u8>>>,
+    }
+
+    impl gateway::Gateway for DeadlineGateway {
+        fn changelog(
+            &self,
+            _release: &ReleaseTag,
+            deadline: std::time::Instant,
+        ) -> Source<Option<Vec<u8>>> {
+            self.deadlines.lock().unwrap().push(deadline);
+            self.changelog.clone()
+        }
+
+        fn spotlight(
+            &self,
+            _state: &ReleaseState,
+            deadline: std::time::Instant,
+        ) -> Source<Option<Vec<u8>>> {
+            self.deadlines.lock().unwrap().push(deadline);
+            self.spotlight.clone()
+        }
+    }
+
+    fn refresh_with(
+        cache: Option<Cache>,
+        run: DiscoveryRunner,
+        gateway: TestGateway,
+    ) -> UpdateState {
+        start_with(StartDeps {
+            disabled: false,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache,
+            cache_dir: None,
+            run,
+            gateway: Box::new(gateway),
+        })
+    }
+
+    fn refreshed(state: UpdateState) -> NoticeSnapshot {
+        state
+            .rx
+            .expect("stale cache schedules one refresh")
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("determined discovery publishes one replacement snapshot")
+    }
+
+    #[test]
+    fn failed_discovery_preserves_the_successful_check_time() {
+        let dir =
+            std::env::temp_dir().join(format!("hfv-discovery-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cached = Cache {
+            last_check_unix: CHECK_INTERVAL_SECS * 8,
+            latest_seen: Some(future_version(1).to_string()),
+            ..Cache::default()
+        };
+        cache::store(&dir, &cached);
+        let state = start_with(StartDeps {
+            disabled: false,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache: Some(cached),
+            cache_dir: Some(dir.clone()),
+            run: Box::new(|_| Source::Unavailable),
+            gateway: unavailable_test_gateway(),
+        });
+
+        assert_eq!(
+            state.initial.detected_release,
+            Some(future_version(1)),
+            "a failed discovery leaves the initial cached state alone"
+        );
+        let UpdateState { rx, .. } = state;
+        assert!(matches!(
+            rx.expect("failure still closes the one-shot receiver")
+                .recv_timeout(std::time::Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(
+            cache::load(&dir)
+                .expect("unavailable discovery preserves the prior cache")
+                .last_check_unix,
+            CHECK_INTERVAL_SECS * 8,
+            "unavailable discovery cannot advance the only successful-check time"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn determined_discovery_advances_its_timestamp_through_every_document_failure() {
+        let now = CHECK_INTERVAL_SECS * 10;
+        let dir = std::env::temp_dir().join(format!("hfv-document-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cached = Cache {
+            last_check_unix: CHECK_INTERVAL_SECS * 8,
+            ..Cache::default()
+        };
+        cache::store(&dir, &cached);
+        let state = start_with(StartDeps {
+            disabled: false,
+            now_unix: now,
+            cache: Some(cached),
+            cache_dir: Some(dir.clone()),
+            run: Box::new(move |_| available_release(future_version(1))),
+            gateway: Box::new(TestGateway {
+                changelog: Source::Unavailable,
+                spotlight: Source::Unavailable,
+            }),
+        });
+        let UpdateState { rx, .. } = state;
+        let snapshot = rx
+            .expect("stale cache schedules one refresh")
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("determined discovery publishes one replacement snapshot");
+
+        assert_eq!(snapshot.detected_release, Some(future_version(1)));
+        assert!(snapshot.release_details.is_none());
+        assert!(snapshot.spotlight.status_title().is_none());
+        let persisted = cache::load(&dir)
+            .expect("the complete cache snapshot is stored before its UI snapshot is published");
+        assert_eq!(persisted.last_check_unix, now);
+        assert_eq!(persisted.latest_seen, Some(future_version(1).to_string()));
+        assert!(persisted.release_details.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eligible_start_runs_one_background_refresh() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = std::sync::Arc::clone(&calls);
+        let state = start_with(StartDeps {
+            disabled: false,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache: Some(Cache::default()),
+            cache_dir: None,
+            run: Box::new(move |_| {
+                worker_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                available_releases(Vec::new())
+            }),
+            gateway: unavailable_test_gateway(),
+        });
+
+        let _ = refreshed(state);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn refresh_passes_one_absolute_deadline_to_discovery_and_both_documents() {
+        let release = future_version(1);
+        let deadlines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let discovery_deadlines = std::sync::Arc::clone(&deadlines);
+        let state = start_with(StartDeps {
+            disabled: false,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache: Some(Cache::default()),
+            cache_dir: None,
+            run: Box::new(move |deadline| {
+                discovery_deadlines.lock().unwrap().push(deadline);
+                available_release(release)
+            }),
+            gateway: Box::new(DeadlineGateway {
+                deadlines: std::sync::Arc::clone(&deadlines),
+                changelog: Source::Available(Some(
+                    format!("## [{release}]\n- details\n").into_bytes(),
+                )),
+                spotlight: Source::Available(Some(b"# Project\nbody\n".to_vec())),
+            }),
+        });
+        let _ = refreshed(state);
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 3, "discovery plus both documents run once");
+        assert!(
+            deadlines.windows(2).all(|pair| pair[0] == pair[1]),
+            "every source operation receives the coordinator's one absolute deadline"
+        );
+    }
+
+    #[test]
+    fn changelog_and_spotlight_partial_successes_are_independent() {
+        let release = future_version(1);
+        let changelog = format!("## [{release}]\n- details\n");
+        let details = refreshed(refresh_with(
+            Some(Cache::default()),
+            Box::new(move |_| available_release(release)),
+            TestGateway {
+                changelog: Source::Available(Some(changelog.into_bytes())),
+                spotlight: Source::Unavailable,
+            },
+        ));
+        assert_eq!(
+            details.release_details,
+            Some(release_policy::CachedReleaseDetails {
+                release,
+                details: format!("## [{release}]\n- details\n"),
+            })
+        );
+        assert!(details.spotlight.status_title().is_none());
+
+        let spotlight = refreshed(refresh_with(
+            Some(Cache::default()),
+            Box::new(move |_| available_release(release)),
+            TestGateway {
+                changelog: Source::Unavailable,
+                spotlight: Source::Available(Some(b"# Project\nbody\n".to_vec())),
+            },
+        ));
+        assert!(spotlight.release_details.is_none());
+        assert_eq!(spotlight.spotlight.status_title(), Some("Project"));
+    }
+
+    #[test]
+    fn stale_spotlight_refresh_accepts_or_withdraws_independently() {
+        let stale = Cache {
+            spotlight: Some(b"# Old\nold body\n".to_vec()),
+            spotlight_retrieved_at_unix: Some(CHECK_INTERVAL_SECS * 9),
+            ..Cache::default()
+        };
+        let accepted = refreshed(refresh_with(
+            Some(stale.clone()),
+            Box::new(|_| available_releases(Vec::new())),
+            TestGateway {
+                changelog: Source::Unavailable,
+                spotlight: Source::Available(Some(b"# New\nnew body\n".to_vec())),
+            },
+        ));
+        assert_eq!(accepted.spotlight.status_title(), Some("New"));
+        assert_eq!(
+            accepted.spotlight.whats_new_body(),
+            Some(b"new body\n".as_slice())
+        );
+
+        let withdrawn = refreshed(refresh_with(
+            Some(stale),
+            Box::new(|_| available_releases(Vec::new())),
+            TestGateway {
+                changelog: Source::Unavailable,
+                spotlight: Source::Available(None),
+            },
+        ));
+        assert!(withdrawn.spotlight.status_title().is_none());
+        assert!(withdrawn.spotlight.whats_new_body().is_none());
+        assert_eq!(
+            withdrawn.spotlight.retrieved_at_unix(),
+            Some(CHECK_INTERVAL_SECS * 10)
+        );
+    }
+
+    #[test]
+    fn same_release_details_survive_source_failure_but_catch_up_and_supersede_hide_them() {
+        let cached_release = future_version(1);
+        let cached_details = release_policy::CachedReleaseDetails {
+            release: cached_release,
+            details: format!("## [{cached_release}]\n- cached details\n"),
+        };
+        let cache = Cache {
+            latest_seen: Some(cached_release.to_string()),
+            release_details: Some(cache::PersistedReleaseDetails {
+                release: cached_release.to_string(),
+                details: cached_details.details.clone(),
+            }),
+            ..Cache::default()
+        };
+        let same_release = refreshed(refresh_with(
+            Some(cache.clone()),
+            Box::new(move |_| available_release(cached_release)),
+            TestGateway {
+                changelog: Source::Unavailable,
+                spotlight: Source::Unavailable,
+            },
+        ));
+        assert_eq!(same_release.release_details, Some(cached_details));
+
+        let caught_up = refreshed(refresh_with(
+            Some(cache.clone()),
+            Box::new(|_| available_release(current())),
+            TestGateway {
+                changelog: Source::Unavailable,
+                spotlight: Source::Unavailable,
+            },
+        ));
+        assert!(caught_up.detected_release.is_none());
+        assert!(caught_up.release_details.is_none());
+
+        let superseded = refreshed(refresh_with(
+            Some(cache),
+            Box::new(move |_| available_release(future_version(2))),
+            TestGateway {
+                changelog: Source::Unavailable,
+                spotlight: Source::Unavailable,
+            },
+        ));
+        assert_eq!(superseded.detected_release, Some(future_version(2)));
+        assert!(superseded.release_details.is_none());
+    }
+
+    #[test]
+    fn changelog_without_eligible_sections_has_no_durable_release_details() {
+        let release = future_version(1);
+        let dir =
+            std::env::temp_dir().join(format!("hfv-empty-release-details-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = start_with(StartDeps {
+            disabled: false,
+            now_unix: CHECK_INTERVAL_SECS * 10,
+            cache: Some(Cache::default()),
+            cache_dir: Some(dir.clone()),
+            run: Box::new(move |_| available_release(release)),
+            gateway: Box::new(TestGateway {
+                changelog: Source::Available(Some(
+                    b"# Changelog\n\n## [Unreleased]\n- pending\n".to_vec(),
+                )),
+                spotlight: Source::Unavailable,
+            }),
+        });
+
+        let UpdateState { rx, .. } = state;
+        let snapshot = rx
+            .expect("stale cache schedules one refresh")
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("determined discovery publishes one replacement snapshot");
+        assert_eq!(snapshot.detected_release, Some(release));
+        assert!(snapshot.release_details.is_none());
+
+        let persisted = cache::load(&dir).expect("the determined discovery stores its check");
+        assert_eq!(persisted.latest_seen, Some(release.to_string()));
+        assert!(persisted.release_details.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

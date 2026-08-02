@@ -18,6 +18,10 @@ use herdr_file_viewer::intent::Intent;
 use herdr_file_viewer::opener::{Opener, OpenerOutcome};
 use herdr_file_viewer::presenter::{Focus, PaneGeometry};
 use herdr_file_viewer::render::Renderers;
+use herdr_file_viewer::update::spotlight_policy::{
+    SpotlightCache, SpotlightInput, cache_delta, project,
+};
+use herdr_file_viewer::update::{NoticeSnapshot, UpdateState, Version};
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::layout::Rect;
 use ratatui::text::Text;
@@ -9053,6 +9057,38 @@ fn show_help_opens_help_overlay_with_whats_new_active_and_non_empty_bodies() {
 }
 
 #[test]
+fn dismissing_the_status_row_keeps_spotlight_content_readable_in_whats_new() {
+    let dir = TempDir::new();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    let mut spotlight = SpotlightCache::default();
+    spotlight.apply(cache_delta(
+        project(SpotlightInput::Available(
+            b"# Project\nSpotlight body remains readable\n".to_vec(),
+        )),
+        1,
+    ));
+    ctrl.set_update(UpdateState {
+        initial: NoticeSnapshot {
+            spotlight,
+            ..NoticeSnapshot::default()
+        },
+        rx: None,
+    });
+
+    assert!(
+        ctrl.handle(Intent::DismissUpdate).redraw,
+        "u hides the visible row"
+    );
+    assert!(ctrl.view_state().remote_notice_status.is_none());
+    ctrl.handle(Intent::ShowHelp);
+    assert!(
+        flatten_text(ctrl.help_state().expect("Help opens").active_body())
+            .contains("Spotlight body remains readable"),
+        "the status-only dismissal must not change the Help snapshot"
+    );
+}
+
+#[test]
 fn open_help_resets_double_click_state() {
     // R3 item 2: open_help must clear last_click (mirrors open_finder), so a tree click made just
     // before the overlay opened can't pair with a same-row click made just after it closes and be
@@ -9261,44 +9297,75 @@ fn whats_new_body_falls_back_to_plain_text_when_renderer_is_absent() {
     );
 }
 
-/// A Renderers whose markdown command WORKS but is deliberately slow — it sleeps 2s then echoes
-/// stdin (`sh -c 'sleep 2 && cat'`). Used to prove `open_help` bounds the synchronous on-thread
-/// render with the help-specific timeout (FIX-B / AC-22): it must return well before the 2s sleep,
-/// falling back to plain text. (`sh`/`sleep`/`cat` are POSIX — Linux & macOS.)
-fn slow_markdown_renderers() -> Renderers {
+const HELP_STALL_FIXTURE_NAME: &str = "help_stalled_markdown_renderer_fixture";
+const HELP_STALL_MARKER_PREFIX: &str = "--hfv-help-stall-marker=";
+
+/// The command is this test binary itself, so the deadline proof has no POSIX shell dependency.
+/// Keep the trailing `-` after `--`: `with_wrap_width` inserts its `-w` arguments before it, where
+/// libtest treats them as fixture arguments rather than its own flags.
+fn slow_markdown_renderers(marker: &std::path::Path) -> Renderers {
     Renderers {
-        markdown: vec!["sh".into(), "-c".into(), "sleep 2 && cat".into()],
+        markdown: vec![
+            std::env::current_exe()
+                .expect("controller test binary path")
+                .display()
+                .to_string(),
+            "--exact".into(),
+            HELP_STALL_FIXTURE_NAME.into(),
+            "--".into(),
+            format!("{HELP_STALL_MARKER_PREFIX}{}", marker.display()),
+            "-".into(),
+        ],
         diff: vec!["cat".into()],
         full_diff: vec!["cat".into()],
         syntax: vec!["cat".into()],
-        // The SHARED render timeout is generous (5s). FIX-B must NOT lean on it — the help path
-        // installs its own ~250ms bound — so we set this high to prove the bound is help-specific.
+        // This is deliberately generous: Help must use its own shared 200 ms deadline.
         timeout: Duration::from_secs(5),
     }
 }
 
 #[test]
-fn open_help_bounds_a_slow_markdown_render_to_the_help_budget() {
-    // FIX-B (AC-22): the What's New render is synchronous on the input thread. A slow/wedged
-    // markdown renderer must NOT freeze input for the shared 5s timeout — open_help bounds it with
-    // a help-specific ~250ms timeout and falls back to plain text. With a renderer that sleeps 2s,
-    // handle(ShowHelp) must return well under 1s (proving the bound) and the body must be the
-    // plain-text fallback (still the raw changelog), exercising a REAL subprocess render on open.
+fn help_stalled_markdown_renderer_fixture() {
+    if let Some(marker) = std::env::args().find_map(|argument| {
+        argument
+            .strip_prefix(HELP_STALL_MARKER_PREFIX)
+            .map(std::path::PathBuf::from)
+    }) {
+        std::fs::write(marker, "started").expect("fixture writes stall handshake");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[test]
+fn open_help_uses_the_composers_single_200ms_budget() {
+    // T-29: a current-exe fixture writes its handshake before stalling. The handshake rules out a
+    // missing/malformed renderer false positive before this test accepts Help's deadline fallback.
     let dir = TempDir::new();
-    let mut ctrl = controller_with_renderers(dir.path(), slow_markdown_renderers());
+    let marker = std::env::temp_dir().join(format!(
+        "hfv-help-stall-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let mut ctrl = controller_with_renderers(dir.path(), slow_markdown_renderers(&marker));
 
     let start = Instant::now();
     ctrl.handle(Intent::ShowHelp);
     let elapsed = start.elapsed();
 
+    let spawned_and_stalled = marker.exists();
+    let _ = std::fs::remove_file(&marker);
     assert!(
-        ctrl.help_open(),
-        "help must open even when the markdown renderer is slow"
+        spawned_and_stalled,
+        "the current-exe renderer fixture must start and stall before Help falls back"
     );
     assert!(
-        elapsed < Duration::from_secs(1),
-        "FIX-B/AC-22: open_help must return well under the 2s renderer sleep (the help-specific \
-         timeout bounds the input-thread block) — took {elapsed:?}"
+        elapsed < Duration::from_millis(300),
+        "T-29: Help must stay within its 200 ms budget plus bounded scheduling/reap slack: {elapsed:?}"
+    );
+    assert!(
+        ctrl.help_open(),
+        "help must open even when the markdown renderer stalls"
     );
 
     let state = ctrl.help_state().expect("help_state() must be Some");
@@ -10125,12 +10192,11 @@ fn open_help_builds_exactly_two_sections_whats_new_and_about() {
     );
 }
 
-// AC-18/AC-15 (T-9): once `set_settings_display` has injected a formatted Settings body,
-// `open_help` appends a THIRD "Settings" section (after What's New/About) whose body is
-// non-empty. A controller that never calls the setter (the test above) keeps the two-section
-// overlay unchanged — this is additive, opt-in wiring.
+// AC-32/AC-33/AC-54 (T-18): once the live startup path has injected both optional display
+// sections, Help opens on What's New. Keybindings, Settings, and About retain their relative
+// order, and their scroll offsets remain individual state across tab navigation.
 #[test]
-fn open_help_appends_settings_section_when_display_is_set() {
+fn open_help_orders_optional_sections_after_whats_new_and_keeps_independent_scroll() {
     use herdr_file_viewer::config::{EffectiveSettings, LoadOutcome};
     use herdr_file_viewer::help::SettingsWired;
 
@@ -10167,30 +10233,53 @@ fn open_help_appends_settings_section_when_display_is_set() {
         std::path::Path::new("/cfg/config.toml"),
         &wired,
     );
+    ctrl.set_keybindings_display();
 
     ctrl.handle(Intent::ShowHelp);
     let state = ctrl
         .help_state()
         .expect("help_state() must be Some after ShowHelp");
-
-    let labels = state.section_labels();
-    assert!(
-        labels.contains(&"Settings"),
-        "AC-18: section_labels() must contain 'Settings' once set_settings_display was called: {labels:?}"
+    assert_eq!(
+        state.active_index(),
+        0,
+        "What's New is active at index zero whenever Help opens"
     );
     assert_eq!(
-        labels,
-        vec!["What's New", "Settings", "About"],
-        "with only Settings injected, the overlay order is What's New, Settings, About"
+        state.section_labels(),
+        vec!["What's New", "Keybindings", "Settings", "About"],
+        "the fully injected live Help order is What's New, Keybindings, Settings, About"
+    );
+    assert!(
+        !state.sections[2].body.lines.is_empty(),
+        "the injected Settings section body remains non-empty"
     );
 
-    let settings_idx = labels
-        .iter()
-        .position(|l| *l == "Settings")
-        .expect("Settings label present");
-    assert!(
-        !state.sections[settings_idx].body.lines.is_empty(),
-        "the Settings section body must be non-empty"
+    // Give each tab a distinct offset, cycling once through all four tabs back to What's New.
+    ctrl.handle_help_key(key(KeyCode::Char('j')));
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    for _ in 0..2 {
+        ctrl.handle_help_key(key(KeyCode::Char('j')));
+    }
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    for _ in 0..3 {
+        ctrl.handle_help_key(key(KeyCode::Char('j')));
+    }
+    ctrl.handle_help_key(key(KeyCode::Tab));
+    for _ in 0..4 {
+        ctrl.handle_help_key(key(KeyCode::Char('j')));
+    }
+    ctrl.handle_help_key(key(KeyCode::Tab));
+
+    let state = ctrl.help_state().expect("Help remains open while tabbing");
+    assert_eq!(state.active_index(), 0, "Tab wraps back to What's New");
+    assert_eq!(
+        state
+            .sections
+            .iter()
+            .map(|section| section.scroll)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "each Help section retains its own vertical scroll across tab navigation"
     );
 }
 
@@ -10234,8 +10323,8 @@ fn help_path_issues_no_git_command() {
 // or required an update probe (the absence of an `update_rx` is undisturbed — help reads the cached
 // field directly, it does not start a check).
 #[test]
-fn help_path_reads_cached_update_status_and_issues_no_network_probe() {
-    use herdr_file_viewer::update::{UpdateState, Version};
+fn help_path_derives_about_status_from_cached_notice_snapshot_without_network_probe() {
+    use herdr_file_viewer::update::{NoticeSnapshot, UpdateState, Version};
 
     let dir = TempDir::new();
     let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
@@ -10249,12 +10338,15 @@ fn help_path_reads_cached_update_status_and_issues_no_network_probe() {
         patch: 7,
     };
     ctrl.set_update(UpdateState {
-        initial: Some(cached),
+        initial: NoticeSnapshot {
+            detected_release: Some(cached),
+            ..Default::default()
+        },
         rx: None,
     });
 
-    // Open help → the About section body is assembled from `self.update_available` (the cached
-    // value), never a fresh probe. Section index 1 is About.
+    // Open help → the About section body projects the snapshot's cached detected release, never
+    // a fresh probe. Section index 1 is About.
     ctrl.handle(Intent::ShowHelp);
     let state = ctrl.help_state().expect("help_state() Some after ShowHelp");
     let about = flatten_text(&state.sections[1].body);
@@ -10271,7 +10363,7 @@ fn help_path_reads_cached_update_status_and_issues_no_network_probe() {
     // Re-open with the cached value cleared to None → "Up to date", again from the cached field
     // only. This double-check pins that the line is a pure projection of the cached status.
     ctrl.set_update(UpdateState {
-        initial: None,
+        initial: NoticeSnapshot::default(),
         rx: None,
     });
     ctrl.handle(Intent::ShowHelp);
@@ -10791,5 +10883,34 @@ fn changed_jump_expands_a_collapsed_directory_to_reach_the_file() {
         selected_name(&ctrl),
         "Deep.java",
         "] expands the collapsed ancestors and lands on the changed file"
+    );
+}
+
+// ---- remote-notice status-hint labels (AC-42) -----------------------------------------
+
+#[test]
+fn controller_exposes_update_status_with_its_default_resolved_labels() {
+    let dir = TempDir::new();
+    let (mut controller, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    controller.set_update(UpdateState {
+        initial: NoticeSnapshot {
+            detected_release: Some(Version {
+                major: 9,
+                minor: 9,
+                patch: 9,
+            }),
+            ..NoticeSnapshot::default()
+        },
+        rx: None,
+    });
+
+    let line = controller
+        .view_state()
+        .remote_notice_status
+        .expect("a detected release projects one status line");
+    assert_eq!(line, "Update v9.9.9 available · ? details · u dismiss");
+    assert!(
+        !line.contains("herdr plugin install") && !line.contains("install"),
+        "status never presents an install command or automatic action: {line}"
     );
 }

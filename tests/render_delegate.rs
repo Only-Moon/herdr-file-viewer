@@ -4,11 +4,24 @@
 //! Renderer commands are injected: `cat` echoes stdin (a working renderer), a nonexistent
 //! program simulates a missing one — so the tests never depend on glow/delta/bat.
 
-use herdr_file_viewer::render::{Caps, Prepared, Renderers, render};
+use herdr_file_viewer::render::{
+    Caps, Prepared, Renderers, render, render_markdown_section, to_text,
+};
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::text::Text;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+static MARKER_ID: AtomicU64 = AtomicU64::new(0);
+
+fn marker_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "hfv-render-section-{}-{}-{name}",
+        std::process::id(),
+        MARKER_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 fn cat() -> Renderers {
     Renderers {
@@ -26,6 +39,102 @@ fn flatten(t: &Text) -> String {
         .flat_map(|l| l.spans.iter())
         .map(|s| s.content.as_ref())
         .collect()
+}
+
+#[test]
+fn markdown_section_uses_the_injected_command_at_the_requested_width() {
+    // `sh -c` sees these trailing args as $0/$1/$2; assert that the existing width rewriter
+    // replaced `-w 0` before the delegate receives one document on stdin.
+    let command = vec![
+        "sh".into(),
+        "-c".into(),
+        "test \"$1\" = -w && test \"$2\" = 71 && cat".into(),
+        "section".into(),
+        "-w".into(),
+        "0".into(),
+        "-".into(),
+    ];
+    let document = "# One document\n\nThis is the only section.";
+    let (text, notice) = render_markdown_section(
+        &command,
+        document,
+        to_text(document),
+        71,
+        Instant::now() + Duration::from_secs(1),
+    );
+
+    assert!(flatten(&text).contains("This is the only section."));
+    assert!(notice.is_none(), "the bounded delegate succeeded");
+}
+
+#[test]
+fn expired_markdown_section_uses_the_precomputed_fallback_without_spawning_a_delegate() {
+    let marker = marker_path("expired");
+    let command = vec![
+        "sh".into(),
+        "-c".into(),
+        "touch \"$1\"; cat".into(),
+        "section".into(),
+        marker.display().to_string(),
+    ];
+    let fallback = Text::raw("precomputed safe fallback");
+    let (text, notice) = render_markdown_section(
+        &command,
+        "a potentially MiB-sized source document",
+        fallback,
+        71,
+        Instant::now() - Duration::from_millis(1),
+    );
+    let spawned = marker.exists();
+    let _ = std::fs::remove_file(&marker);
+
+    assert!(!spawned, "an expired deadline must not spawn the delegate");
+    assert_eq!(flatten(&text), "precomputed safe fallback");
+    assert!(
+        notice.unwrap().to_lowercase().contains("timed out"),
+        "the existing Markdown fallback notice is retained"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn late_markdown_section_delegate_is_killed_and_reaped() {
+    let marker = marker_path("late");
+    // The busy loop is shell-built-in, so the recorded PID is the direct delegate child rather
+    // than a separately spawned `sleep` descendant. `kill -0` must fail after the section call.
+    let command = vec![
+        "sh".into(),
+        "-c".into(),
+        "echo $$ > \"$1\"; while :; do :; done".into(),
+        "section".into(),
+        marker.display().to_string(),
+    ];
+    let timeout = Duration::from_millis(150);
+    let start = Instant::now();
+    let document = "# Safe fallback";
+    let (text, notice) =
+        render_markdown_section(&command, document, to_text(document), 71, start + timeout);
+    let elapsed = start.elapsed();
+    let pid = std::fs::read_to_string(&marker).expect("delegate recorded its PID");
+    let reaped = !Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill is available on Unix")
+        .success();
+    let _ = std::fs::remove_file(&marker);
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a late delegate must not block unboundedly: {elapsed:?}"
+    );
+    assert!(reaped, "the late delegate must be killed and reaped");
+    assert!(flatten(&text).contains("# Safe fallback"));
+    assert!(
+        notice.unwrap().to_lowercase().contains("timed out"),
+        "the timeout keeps the existing Markdown fallback behavior"
+    );
 }
 
 #[test]

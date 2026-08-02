@@ -5,8 +5,9 @@ Requirements: **herdr 0.7.0+**, on **Linux** or **macOS** (native Windows
 runtime. The viewer shells out to the system `git` CLI (read-only subcommands) for the
 git-aware tree (status markers, changed-only filter, baseline toggle) and the diff view.
 Without git the viewer still opens, but those features are degraded (no status colors, no
-diffs). The optional renderers (`glow` / `delta` / `bat`) are separate. See
-[external renderers](renderers.md).
+diffs). The optional renderers (`glow` / `delta` / `bat`) are separate.
+The system `curl` is optional: without it, document retrieval is unavailable without an error.
+See [external renderers](renderers.md).
 
 > **No Rust toolchain needed when a prebuilt exists.** `herdr plugin install smarzban/herdr-file-viewer`
 > downloads a prebuilt, SHA-256-verified binary for your platform (macOS arm64/x86_64, Linux x86_64,
@@ -55,11 +56,8 @@ so two quick steps remain:
 
 ## Updating
 
-herdr has no plugin auto-update, so the viewer tells you when a new release exists: open it
-(`prefix+f`) and, if you're behind, a status line appears at the bottom naming the new version
-and the command to update. Press `u` to dismiss it for the session.
-
-To update, just re-run the install. It pulls the latest:
+herdr has no plugin auto-update. An advisory status row can point to `?` for release details.
+Installation remains manual: re-run the install yourself to get the latest:
 
 ```bash
 herdr plugin install smarzban/herdr-file-viewer
@@ -68,7 +66,6 @@ herdr plugin install smarzban/herdr-file-viewer
 - You **don't** need `--ref` to stay current; it only *pins* a specific version (and a pin stays
   pinned until you change it).
 - Want a heads-up the moment a release ships? On GitHub, **Watch → Custom → Releases**.
-- Prefer no network check? Set `HERDR_FILE_VIEWER_NO_UPDATE_CHECK` in the pane's environment
-  (to any value, the var's mere presence disables the check) and both the check and banner
-  are disabled entirely. The check otherwise runs at most once per 24h, off the UI thread,
-  over a read-only `git ls-remote`, and never blocks or fails the viewer when offline.
+- Prefer no remote notices? Set [`update_check = false`](configuration.md), or set
+  `HERDR_FILE_VIEWER_NO_UPDATE_CHECK` when the config key is absent. The check otherwise runs at
+  most once per 24h and never blocks the viewer when offline.

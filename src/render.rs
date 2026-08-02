@@ -280,6 +280,33 @@ pub(crate) fn with_wrap_width(command: &[String], width: u16) -> Vec<String> {
     out
 }
 
+/// Render exactly one untrusted Markdown document for a Help section using the injected command.
+///
+/// `deadline` is the one Help-open absolute deadline, supplied by the composer. `fallback` was
+/// terminal-neutralized before that budget was spent, so expiration never scans the document again.
+/// The normal path still applies the width rewrite, output cap, ANSI neutralizer, and existing
+/// capability-specific fallback notice.
+pub fn render_markdown_section(
+    markdown_command: &[String],
+    document: &str,
+    fallback: Text<'static>,
+    width: u16,
+    deadline: Instant,
+) -> (Text<'static>, Option<String>) {
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        return markdown_section_timeout(fallback);
+    }
+    let command = with_wrap_width(markdown_command, width);
+    delegate_markdown_section(&command, document, fallback, deadline)
+}
+
+fn markdown_section_timeout(fallback: Text<'static>) -> (Text<'static>, Option<String>) {
+    (
+        fallback,
+        Some(RendererError::Timeout.notice(capability(ViewMode::RenderedMarkdown))),
+    )
+}
+
 /// Substitute the `{name}` placeholder in a renderer command with the selected file name,
 /// so a stdin-fed renderer (e.g. `bat --file-name={name}`) can still infer the language —
 /// keeping the secure stdin design while enabling syntax highlighting (AC-10).
@@ -350,18 +377,39 @@ fn delegate(
 ) -> (Text<'static>, Option<String>) {
     match run_renderer(command, input, timeout) {
         Ok(out) => (to_text(&out), base_notice),
-        Err(err) => {
-            // Map the typed failure to a short, actionable notice. The raw OS errno / io::Error
-            // detail is kept on the error but NOT surfaced in the default notice — a user can't
-            // act on "No such file or directory (os error 2)", but can act on "renderer (glow)
-            // not found; install it or see docs/renderers.md" (AC-24/25).
-            let fallback = err.notice(capability(mode));
-            let notice = match base_notice {
-                Some(prev) => format!("{prev}\n{fallback}"),
-                None => fallback,
-            };
-            (to_text(input), Some(notice))
-        }
+        Err(err) => (
+            to_text(input),
+            Some(fallback_notice(err, mode, base_notice)),
+        ),
+    }
+}
+
+/// The Help-only adapter receives a fallback prepared by the composer before it lets a renderer
+/// consume time. Unlike [`delegate`], this failure path must not scan the source document again.
+fn delegate_markdown_section(
+    command: &[String],
+    input: &str,
+    fallback: Text<'static>,
+    deadline: Instant,
+) -> (Text<'static>, Option<String>) {
+    match run_renderer_until(command, input, deadline) {
+        Ok(out) => (to_text(&out), None),
+        Err(err) => (
+            fallback,
+            Some(fallback_notice(err, ViewMode::RenderedMarkdown, None)),
+        ),
+    }
+}
+
+/// Map a typed failure to the existing short, actionable user-facing notice, preserving a prior
+/// truncation notice when a general file/diff render already has one.
+fn fallback_notice(err: RendererError, mode: ViewMode, base_notice: Option<String>) -> String {
+    // The raw OS errno / io::Error detail is retained by `RendererError`, never shown here: a user
+    // can act on the capability and remediation, not "No such file or directory (os error 2)".
+    let fallback = err.notice(capability(mode));
+    match base_notice {
+        Some(prev) => format!("{prev}\n{fallback}"),
+        None => fallback,
     }
 }
 
@@ -422,15 +470,27 @@ fn renderer_command(command: &[String]) -> Result<Command, String> {
     Ok(cmd)
 }
 
-/// Spawn a renderer, feed `input` on stdin (writer thread, avoids a pipe deadlock), read
-/// stdout (reader thread), and bound the wait by `timeout` — a wedged renderer is killed
-/// and reported as failed so the plain-text fallback kicks in. `Err` on a missing program,
-/// non-zero exit, or timeout. The command is trusted (operator-configured); only the stdin
-/// content is untrusted, so there is no argument injection.
+/// General file/diff rendering: the wall-clock bound is measured from this call and spans spawn,
+/// capture, and exit — one deadline, never stacked phase budgets.
 fn run_renderer(
     command: &[String],
     input: &str,
     timeout: Duration,
+) -> Result<String, RendererError> {
+    run_renderer_until(command, input, Instant::now() + timeout)
+}
+
+/// Spawn a renderer, feed `input` on stdin (writer thread, avoiding a pipe deadlock), then capture
+/// stdout on a reader thread through the caller's absolute deadline.
+///
+/// The deadline bounds the wait for useful output only: on overrun the child is killed and reaped
+/// **unconditionally** (see [`crate::proc::terminate_and_reap`]), so the call may briefly outlive
+/// the deadline rather than ever leaking a zombie. Killing the child closes both pipes, which
+/// releases the stdin writer and stdout reader threads.
+fn run_renderer_until(
+    command: &[String],
+    input: &str,
+    deadline: Instant,
 ) -> Result<String, RendererError> {
     let prog = command
         .first()
@@ -438,6 +498,9 @@ fn run_renderer(
         .ok_or_else(|| RendererError::Failed {
             detail: "empty renderer command".to_string(),
         })?;
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        return Err(RendererError::Timeout);
+    }
     let mut child = renderer_command(command)
         .map_err(|e| RendererError::Failed { detail: e })?
         .spawn()
@@ -467,44 +530,32 @@ fn run_renderer(
     let stdout = child.stdout.take();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        // Cap the captured output so a renderer spewing unbounded data can't exhaust memory.
-        let mut buf = Vec::new();
-        if let Some(out) = stdout {
-            let _ = out.take(MAX_RENDER_OUTPUT).read_to_end(&mut buf);
-        }
+        let buf = stdout.map(capture_renderer_output).unwrap_or_default();
         let _ = tx.send(buf);
     });
 
-    // A SINGLE combined wall-clock deadline for the whole invocation (the doc'd "per-invocation
-    // wall-clock bound"), NOT `timeout` applied twice. The stdout phase below waits up to
-    // `timeout`, then the Ok-path exit-wait gets only the REMAINING budget — so a renderer that
-    // closes stdout late and then lingers on exit can't burn ~2× the timeout (which, for the
-    // synchronous help render, would blow AC-22's responsiveness budget). See item 1 / AC-22.
-    let deadline = Instant::now() + timeout;
-    match rx.recv_timeout(timeout) {
-        Ok(buf) => {
-            // stdout closed; the process should exit promptly. Bound that wait by what's LEFT of
-            // the single deadline, so a renderer that closes stdout then hangs is still killed and
-            // the TOTAL never exceeds `timeout` (no indefinite block, no doubled budget).
-            match crate::proc::wait_bounded(
-                &mut child,
-                deadline.saturating_duration_since(Instant::now()),
-            ) {
-                Some(status) if status.success() => Ok(String::from_utf8_lossy(&buf).into_owned()),
-                Some(status) => Err(RendererError::Failed {
-                    detail: format!("exited with {status}"),
-                }),
-                None => Err(RendererError::Failed {
-                    detail: "did not exit".to_string(),
-                }),
-            }
-        }
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(buf) => match crate::proc::wait_until(&mut child, deadline) {
+            Some(status) if status.success() => Ok(String::from_utf8_lossy(&buf).into_owned()),
+            Some(status) => Err(RendererError::Failed {
+                detail: format!("exited with {status}"),
+            }),
+            // `wait_until` killed and reaped the child on overrun.
+            None => Err(RendererError::Timeout),
+        },
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = crate::proc::terminate_and_reap(&mut child);
             Err(RendererError::Timeout)
         }
     }
+}
+
+/// Capture no more than [`MAX_RENDER_OUTPUT`] bytes. A blocked read is released when the child is
+/// killed at the deadline and its stdout pipe closes.
+fn capture_renderer_output(stdout: impl Read) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = stdout.take(MAX_RENDER_OUTPUT).read_to_end(&mut buf);
+    buf
 }
 
 /// Ingest (possibly untrusted) content into ratatui `Text`. Cursor-movement and
@@ -512,18 +563,40 @@ fn run_renderer(
 /// kept and mapped into spans by `ansi-to-tui` (AC-27). The result can only ever paint the
 /// viewer's own region — it carries no terminal-control operations.
 pub fn to_text(raw: &str) -> Text<'static> {
-    let cleaned = strip_terminal_control(raw);
+    // The shared scanner keeps SGR only for this styled content path; status titles use the same
+    // scanner through `neutralize_plain_text`, where SGR is dropped with every other control.
+    let cleaned = neutralize_terminal_control(raw, ControlMode::Styled);
     cleaned.clone().into_text().unwrap_or_else(|_| {
-        // If ANSI parsing fails, the kept SGR runs still contain raw ESC bytes — strip
-        // ALL ESC on the fallback so no control byte ever reaches the terminal (AC-27).
-        Text::raw(cleaned.replace('\u{1b}', ""))
+        // If ANSI parsing fails, remove retained SGR while preserving the content's line structure.
+        plain_text_with_line_breaks(&cleaned)
     })
 }
 
-/// Remove cursor/screen-control escape sequences, keeping only SGR (`…m`) styling so it
-/// can be mapped to ratatui styles downstream. Operates on bytes (control sequences are
-/// ASCII) and preserves all other (UTF-8) content verbatim.
-fn strip_terminal_control(raw: &str) -> String {
+/// Return one safe visible plain-text line from hostile input by dropping every terminal control,
+/// including SGR styling, C0/C1 bytes, and cursor/screen-control escape sequences. Unicode text is
+/// otherwise retained verbatim. Used for remote status titles; content rendering uses the same
+/// scanner with SGR retained for ratatui styling.
+pub fn neutralize_plain_text(raw: &str) -> String {
+    neutralize_terminal_control(raw, ControlMode::OneLine)
+}
+
+fn plain_text_with_line_breaks(raw: &str) -> Text<'static> {
+    Text::raw(neutralize_terminal_control(raw, ControlMode::Plain))
+}
+
+#[derive(Clone, Copy)]
+enum ControlMode {
+    /// Keep SGR for `ansi-to-tui` and preserve content line structure.
+    Styled,
+    /// Drop all controls including SGR, preserving content line structure.
+    Plain,
+    /// Drop all controls and line separators for status titles.
+    OneLine,
+}
+
+/// Remove terminal-control escape sequences according to the destination's presentation needs.
+/// Operates on bytes (control sequences are ASCII) and preserves all other UTF-8 content verbatim.
+fn neutralize_terminal_control(raw: &str, mode: ControlMode) -> String {
     let bytes = raw.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -537,8 +610,8 @@ fn strip_terminal_control(raw: &str) -> String {
                     while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
                         j += 1;
                     }
-                    if j < bytes.len() && bytes[j] == b'm' {
-                        out.extend_from_slice(&bytes[start..=j]); // keep SGR styling
+                    if matches!(mode, ControlMode::Styled) && j < bytes.len() && bytes[j] == b'm' {
+                        out.extend_from_slice(&bytes[start..=j]); // keep SGR styling for `to_text`
                     }
                     // else: drop the whole control sequence (cursor move, erase, …)
                     i = if j < bytes.len() { j + 1 } else { j };
@@ -567,11 +640,12 @@ fn strip_terminal_control(raw: &str) -> String {
             // some terminals act on these, so drop the whole 2-byte sequence.
             i += 2;
         } else {
-            // Drop other C0 control bytes (BEL/BS/CR/FF/VT/…) and DEL, which can still
-            // ring the bell, backspace, or carriage-return to overwrite/spoof a line.
-            // Keep only newline and tab.
+            // Drop C0 controls and DEL, which can ring the bell, backspace, or overwrite/spoof
+            // a line. Content modes keep newline/tab; a status title keeps neither.
             let b = bytes[i];
-            let is_c0_control = b < 0x20 && b != b'\n' && b != b'\t';
+            let preserves_line_structure = !matches!(mode, ControlMode::OneLine);
+            let is_c0_control =
+                b < 0x20 && (!preserves_line_structure || (b != b'\n' && b != b'\t'));
             if !is_c0_control && b != 0x7f {
                 out.push(b);
             }
@@ -589,6 +663,33 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static N: AtomicU64 = AtomicU64::new(0);
+    const RENDERER_FIXTURE_NAME: &str = "render::tests::renderer_fixture";
+    const RENDERER_FIXTURE_ARG: &str = "--hfv-render-fixture=";
+
+    fn renderer_fixture_command(mode: &str) -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .expect("test binary path")
+                .display()
+                .to_string(),
+            "--exact".to_string(),
+            RENDERER_FIXTURE_NAME.to_string(),
+            "--".to_string(),
+            format!("{RENDERER_FIXTURE_ARG}{mode}"),
+        ]
+    }
+
+    #[test]
+    fn renderer_fixture() {
+        let mode = std::env::args().find_map(|argument| {
+            argument
+                .strip_prefix(RENDERER_FIXTURE_ARG)
+                .map(str::to_owned)
+        });
+        if mode.as_deref() == Some("stall") {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
 
     fn tmp(name: &str, bytes: &[u8]) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -898,10 +999,43 @@ mod tests {
     }
 
     #[test]
+    fn renderer_never_spawns_after_an_expired_deadline() {
+        // The nonexistent program would return NotFound if a spawn were attempted; Timeout
+        // proves the expired deadline is checked before any process is created.
+        let result = run_renderer_until(
+            &["renderer-must-not-run".to_string()],
+            "input",
+            Instant::now() - Duration::from_millis(1),
+        );
+
+        assert!(
+            matches!(result, Err(RendererError::Timeout)),
+            "an already-expired deadline must fail before spawning"
+        );
+    }
+
+    #[test]
+    fn general_renderer_timeout_has_one_bounded_reap_tail() {
+        let started = Instant::now();
+        let result = run_renderer(
+            &renderer_fixture_command("stall"),
+            "input",
+            Duration::from_millis(100),
+        );
+
+        assert!(matches!(result, Err(RendererError::Timeout)));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "the full capture window plus bounded reap tail must not become an unbounded wait"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_renderer_bounds_total_wall_clock_to_a_single_timeout_on_slow_exit() {
         // R3 item 1 / AC-22: `run_renderer` must enforce a SINGLE combined wall-clock deadline,
         // not apply `timeout` twice (once waiting for stdout, again waiting for exit). This
-        // exercises the Ok→wait_bounded slow-exit path: `cat` echoes stdin then closes stdout
+        // exercises the Ok→wait_until slow-exit path: `cat` echoes stdin then closes stdout
         // (fast EOF → the recv_timeout(stdout) phase returns promptly), but the shell then sleeps
         // 2s before exiting — so the exit-wait is what would burn a second full `timeout` under
         // the old code. The combined deadline caps the TOTAL at roughly one `timeout`.
@@ -914,7 +1048,7 @@ mod tests {
         // still returns Ok), THEN lingers ~2s before exiting (so the Ok-path exit-wait would burn
         // a SECOND full timeout under the bug). `exec 1>&-` closes stdout precisely at the phase
         // boundary so the reader thread sees EOF and `recv_timeout` returns Ok → the slow-exit
-        // `wait_bounded` path. Under the 2× bug: ~0.8×+1.0× ≈ 1.8×. Under the single combined
+        // `wait_until` path. Under the 2× bug: ~0.8×+1.0× ≈ 1.8×. Under the single combined
         // deadline: ~0.8× + remaining(~0.2×) ≈ 1.0×.
         let cmd = vec![
             "sh".to_string(),
@@ -935,6 +1069,14 @@ mod tests {
              took {elapsed:?} (the 2× bug would take ~{:?})",
             timeout.mul_f32(1.8)
         );
+    }
+
+    #[test]
+    fn ansi_parse_fallback_preserves_content_line_structure() {
+        let text = plain_text_with_line_breaks("\x1b[31mfirst\nsecond\tcolumn");
+        assert_eq!(text.lines.len(), 2, "fallback preserves line breaks");
+        assert_eq!(text.lines[0].spans[0].content, "first");
+        assert_eq!(text.lines[1].spans[0].content, "second\tcolumn");
     }
 
     #[test]

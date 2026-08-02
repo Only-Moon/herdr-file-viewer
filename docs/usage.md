@@ -335,20 +335,18 @@ Read-only: it changes only *what you're viewing*, never the branch or any files.
 
 ## In-app help
 
-Press `?` to open a view-only **help overlay** with sections for **Keybindings** (every action's
-config-var name, effective keys, and description, marking your customizations), **What's New** (the
-latest changelog, rendered as markdown), **Settings** (your effective configuration), and **About**
-(version, repo, license, and update status). Keyboard and mouse; `Esc` or `q` closes it. A `? help`
-hint rides the content pane's bottom border so the overlay is discoverable without already knowing
-the key.
+`?` opens **What's New** first in the view-only **help overlay**, followed by **Keybindings**
+(every action's config-var name, effective keys, and description, marking your customizations),
+**Settings** (your effective configuration), and **About** (version, repo, license, and update
+status). Keyboard and mouse; `Esc` or `q` closes it. A `? help` hint rides the content pane's bottom
+border so the overlay is discoverable without already knowing the key.
 
 ## Staying up to date
 
-The viewer checks for a new release at most once a day (off the UI thread, over a read-only
-`git ls-remote`) and, when you're behind, shows an "update available" banner naming the new version
-and the update command. Press `u` to dismiss it for the session. The check and banner can be turned
-off — see [install & updating](install.md#updating) and the `update_check`
-[config key](configuration.md).
+The viewer can show an advisory status row for a newer release or project spotlight. `?` opens
+**What's New** first; `u` dismisses the whole advisory status row for this session only. It is
+display-only and never installs, opens, or copies anything. Control remote notices with
+[`update_check`](configuration.md).
 
 ## Using the mouse
 

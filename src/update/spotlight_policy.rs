@@ -1,0 +1,546 @@
+//! Pure policy for accepting, caching, and projecting the remote project spotlight.
+//!
+//! This module owns no I/O or clock. Its caller supplies the remote input, the session-start
+//! timestamp, and successful retrieval timestamps, then applies the returned cache deltas.
+
+use super::CHECK_INTERVAL_SECS;
+use crate::render::neutralize_plain_text;
+
+/// The result of retrieving the remote spotlight source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpotlightInput {
+    /// The remote source existed and supplied these exact bytes.
+    Available(Vec<u8>),
+    /// The remote source was definitively absent (for example, a missing document).
+    Missing,
+    /// Retrieval failed, so it is not evidence that any cached spotlight was withdrawn.
+    Unavailable,
+}
+
+/// An accepted spotlight. Its source and body retain exact remote bytes for cache reuse and Help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedSpotlight {
+    /// The byte-exact whole document, retained only for cache reuse.
+    pub(crate) source: Vec<u8>,
+    /// The first nonblank level-one heading, neutralized for a one-line status display.
+    pub title: String,
+    /// Every byte after the consumed title line, retained without rewriting.
+    pub body: Vec<u8>,
+}
+
+/// The three meaningful source projections: usable content, an explicit withdrawal, or no result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpotlightProjection {
+    Accepted(AcceptedSpotlight),
+    Withdrawn,
+    Unavailable,
+}
+
+/// The most visible title characters an accepted spotlight may contribute to the one-line status.
+///
+/// A longer neutralized heading is truncated, never rejected: the title is display copy. The cap
+/// bounds the per-frame formatting/sanitizing cost and absurd lengths; the presenter still clips
+/// the drawn row to the pane, so display width is its concern, not this policy's.
+pub const MAX_TITLE_CHARS: usize = 160;
+
+/// The largest raw heading line accepted as a title source.
+///
+/// The whole accepted document is persisted to the cache and re-neutralized at every session
+/// start, so a megabyte single-line heading must be rejected outright rather than truncated after
+/// the neutralize pass has already paid for it.
+pub const MAX_TITLE_LINE_BYTES: usize = 4 * 1024;
+
+/// The largest accepted spotlight body. A display-only introduction never needs more; bounding it
+/// here (rather than only at the 1 MiB transfer cap) keeps every downstream cost — the cache
+/// field, the Help compose pre-pass, and the renderer input — proportionate to real content.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Project remote input without side effects.
+///
+/// A usable document is valid UTF-8 whose first nonblank line is a `# ` heading with a nonempty
+/// visible title, and whose body fits [`MAX_BODY_BYTES`]; an oversized body is a conclusive
+/// withdrawal, exactly like malformed content. Leading blank lines are only locating metadata; the
+/// stored body starts directly after the consumed title line. All body bytes are copied exactly,
+/// including terminal-looking bytes which remain for the renderer's normal boundary.
+pub fn project(input: SpotlightInput) -> SpotlightProjection {
+    match input {
+        SpotlightInput::Unavailable => SpotlightProjection::Unavailable,
+        SpotlightInput::Missing => SpotlightProjection::Withdrawn,
+        SpotlightInput::Available(bytes) => accept(bytes)
+            .map(SpotlightProjection::Accepted)
+            .unwrap_or(SpotlightProjection::Withdrawn),
+    }
+}
+
+fn accept(bytes: Vec<u8>) -> Option<AcceptedSpotlight> {
+    let source = std::str::from_utf8(&bytes).ok()?;
+    let mut offset = 0;
+
+    for line in source.split_inclusive('\n') {
+        let line_without_ending = line.trim_end_matches(['\r', '\n']);
+        if line_without_ending.trim().is_empty() {
+            offset += line.len();
+            continue;
+        }
+        let raw_title = line_without_ending.strip_prefix("# ")?;
+        if line_without_ending.len() > MAX_TITLE_LINE_BYTES {
+            return None;
+        }
+        // The shared scanner removes terminal controls. Status presentation also excludes
+        // Unicode formatting and line-separator characters that can reorder or split its one
+        // line, then trims BEFORE capping the visible length — so whitespace padding cannot
+        // truncate a real title away, and a hostile heading cannot flood the status row.
+        let neutralized = neutralize_plain_text(raw_title)
+            .chars()
+            .filter(|character| {
+                !matches!(
+                    character,
+                    '\u{61c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{2060}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                )
+            })
+            .collect::<String>();
+        let title = neutralized
+            .trim()
+            .chars()
+            .take(MAX_TITLE_CHARS)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        if title.is_empty() {
+            return None;
+        }
+        let body_start = offset + line.len();
+        if bytes.len() - body_start > MAX_BODY_BYTES {
+            return None;
+        }
+        return Some(AcceptedSpotlight {
+            source: bytes.clone(),
+            title,
+            body: bytes[body_start..].to_vec(),
+        });
+    }
+
+    None
+}
+
+/// Whether a cache timestamp was fresh at the fixed beginning of this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    Fresh,
+    Stale,
+    /// The persisted retrieval time is later than this session start, so clock skew must recheck.
+    Future,
+}
+
+/// Measure freshness from the supplied session start, never from a live clock.
+pub fn freshness_at_session_start(
+    session_started_at_unix: u64,
+    retrieved_at_unix: u64,
+) -> Freshness {
+    if retrieved_at_unix > session_started_at_unix {
+        return Freshness::Future;
+    }
+    if session_started_at_unix - retrieved_at_unix >= CHECK_INTERVAL_SECS {
+        Freshness::Stale
+    } else {
+        Freshness::Fresh
+    }
+}
+
+/// The in-memory cache shape for a project spotlight.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpotlightCache {
+    accepted: Option<AcceptedSpotlight>,
+    retrieved_at_unix: Option<u64>,
+}
+
+/// A cache mutation selected by a source projection. Applying `Preserve` is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpotlightCacheDelta {
+    Accepted {
+        spotlight: AcceptedSpotlight,
+        retrieved_at_unix: u64,
+    },
+    Withdrawn {
+        retrieved_at_unix: u64,
+    },
+    Preserve,
+}
+
+/// Convert a source projection into a pure cache delta with an explicit retrieval time.
+pub fn cache_delta(projection: SpotlightProjection, retrieved_at_unix: u64) -> SpotlightCacheDelta {
+    match projection {
+        SpotlightProjection::Accepted(spotlight) => SpotlightCacheDelta::Accepted {
+            spotlight,
+            retrieved_at_unix,
+        },
+        SpotlightProjection::Withdrawn => SpotlightCacheDelta::Withdrawn { retrieved_at_unix },
+        SpotlightProjection::Unavailable => SpotlightCacheDelta::Preserve,
+    }
+}
+
+impl SpotlightCache {
+    /// Apply a selected delta. Withdrawal clears accepted content while recording the successful
+    /// retrieval time for future session-start freshness decisions.
+    pub fn apply(&mut self, delta: SpotlightCacheDelta) {
+        match delta {
+            SpotlightCacheDelta::Accepted {
+                spotlight,
+                retrieved_at_unix,
+            } => {
+                self.accepted = Some(spotlight);
+                self.retrieved_at_unix = Some(retrieved_at_unix);
+            }
+            SpotlightCacheDelta::Withdrawn { retrieved_at_unix } => {
+                self.accepted = None;
+                self.retrieved_at_unix = Some(retrieved_at_unix);
+            }
+            SpotlightCacheDelta::Preserve => {}
+        }
+    }
+
+    /// The successful retrieval timestamp, if this cache has one.
+    pub fn retrieved_at_unix(&self) -> Option<u64> {
+        self.retrieved_at_unix
+    }
+
+    /// The status title for the accepted spotlight, if any.
+    pub fn status_title(&self) -> Option<&str> {
+        self.accepted
+            .as_ref()
+            .map(|spotlight| spotlight.title.as_str())
+    }
+
+    /// The accepted What's New body.
+    pub fn whats_new_body(&self) -> Option<&[u8]> {
+        self.accepted
+            .as_ref()
+            .map(|spotlight| spotlight.body.as_slice())
+    }
+}
+
+/// Whether a refresh for the session that started at `session_started_at_unix` should attempt one
+/// spotlight retrieval: yes unless the cache holds a retrieval that was still fresh at session
+/// start. Freshness is measured from the fixed session start, never a live clock.
+pub fn should_retrieve(session_started_at_unix: u64, cache: &SpotlightCache) -> bool {
+    match cache.retrieved_at_unix {
+        Some(retrieved_at_unix) => {
+            freshness_at_session_start(session_started_at_unix, retrieved_at_unix)
+                != Freshness::Fresh
+        }
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::update::CHECK_INTERVAL_SECS as FRESHNESS_SECS;
+
+    fn accepted(input: &str) -> AcceptedSpotlight {
+        match project(SpotlightInput::Available(input.as_bytes().to_vec())) {
+            SpotlightProjection::Accepted(spotlight) => spotlight,
+            other => panic!("expected an accepted spotlight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepted_input_consumes_the_first_nonblank_h1_and_preserves_body_bytes() {
+        // These cases use mixed line endings and terminal-looking bytes in the body. The policy
+        // validates only enough to select the title: all accepted source/body bytes remain exact.
+        let cases = [
+            (
+                "leading blanks and CRLF title",
+                "\n\r\n# Project Café\r\nbody\x1b[2J\r\n",
+                "Project Café",
+                b"body\x1b[2J\r\n".as_slice(),
+            ),
+            (
+                "body without a final newline",
+                "# Tokyo 東京\nlast body bytes",
+                "Tokyo 東京",
+                b"last body bytes".as_slice(),
+            ),
+            (
+                "heading-only document",
+                "# Only title",
+                "Only title",
+                b"".as_slice(),
+            ),
+        ];
+
+        for (name, input, title, body) in cases {
+            let spotlight = accepted(input);
+            assert_eq!(spotlight.title, title, "{name}: title from the H1");
+            assert_eq!(spotlight.body, body, "{name}: all body bytes are exact");
+        }
+    }
+
+    #[test]
+    fn accepted_titles_are_neutralized_at_the_policy_boundary() {
+        let cases = [
+            (
+                "control and bidi characters",
+                "# be\x1b[2Jfore\x07 \u{9b}\u{202e}spoof\u{202c}\u{200d}ed\u{2028}end\nbody\n",
+                "before spoofedend",
+            ),
+            (
+                "OSC hyperlink",
+                "# before\x1b]8;;https://evil.invalid/\x1b\\after\nbody\n",
+                "beforeafter",
+            ),
+            (
+                "OSC clipboard",
+                "# before\x1b]52;c;c3RvbGVu\x07after\nbody\n",
+                "beforeafter",
+            ),
+            ("malformed escape", "# before\x1b[31\nbody\n", "before"),
+            ("Unicode", "# Café 東京\nbody\n", "Café 東京"),
+        ];
+
+        for (name, input, expected_title) in cases {
+            let spotlight = accepted(input);
+            assert_eq!(
+                spotlight.title, expected_title,
+                "{name}: title is neutralized"
+            );
+            assert_eq!(
+                spotlight.title.lines().count(),
+                1,
+                "{name}: status title is one visible line"
+            );
+            assert_eq!(spotlight.body, b"body\n", "{name}: body stays exact");
+        }
+    }
+
+    #[test]
+    fn accepted_titles_are_capped_and_oversized_bodies_withdraw() {
+        let long_heading = format!("# {}\nbody\n", "T".repeat(MAX_TITLE_CHARS * 2));
+        let spotlight = accepted(&long_heading);
+        assert_eq!(
+            spotlight.title.chars().count(),
+            MAX_TITLE_CHARS,
+            "a hostile heading length is truncated, not accepted verbatim"
+        );
+
+        let padded = format!("# {}Padded Title\nbody\n", " ".repeat(MAX_TITLE_CHARS * 2));
+        assert_eq!(
+            accepted(&padded).title,
+            "Padded Title",
+            "whitespace padding is trimmed before the cap, never counted against the title"
+        );
+
+        let heading_line_over_cap = format!("# {}\nbody\n", "T".repeat(MAX_TITLE_LINE_BYTES));
+        assert_eq!(
+            project(SpotlightInput::Available(
+                heading_line_over_cap.into_bytes()
+            )),
+            SpotlightProjection::Withdrawn,
+            "an over-cap heading line withdraws before the neutralize pass pays for it"
+        );
+
+        let exact_body = format!("# Title\n{}", "b".repeat(MAX_BODY_BYTES - 1)) + "\n";
+        assert!(
+            matches!(
+                project(SpotlightInput::Available(exact_body.into_bytes())),
+                SpotlightProjection::Accepted(_)
+            ),
+            "a body at the cap remains acceptable"
+        );
+        let oversized = format!("# Title\n{}", "b".repeat(MAX_BODY_BYTES + 1));
+        assert_eq!(
+            project(SpotlightInput::Available(oversized.into_bytes())),
+            SpotlightProjection::Withdrawn,
+            "an over-cap body is a conclusive withdrawal, like any invalid document"
+        );
+    }
+
+    #[test]
+    fn missing_invalid_or_headingless_input_withdraws_while_unavailable_is_distinct() {
+        let withdrawn = [
+            SpotlightInput::Missing,
+            SpotlightInput::Available(Vec::new()),
+            SpotlightInput::Available(b" \r\n\t".to_vec()),
+            SpotlightInput::Available(vec![b'#', b' ', 0xff]),
+            SpotlightInput::Available(b"ordinary body without a heading\n".to_vec()),
+            SpotlightInput::Available(b"# \r\nbody\n".to_vec()),
+        ];
+
+        for input in withdrawn {
+            assert_eq!(project(input), SpotlightProjection::Withdrawn);
+        }
+        assert_eq!(
+            project(SpotlightInput::Unavailable),
+            SpotlightProjection::Unavailable,
+            "a failed retrieval is not evidence that the remote source withdrew the spotlight"
+        );
+    }
+
+    #[test]
+    fn freshness_uses_session_start_not_the_live_clock_and_reports_future_cache_time() {
+        let start = 1_000_000;
+        assert_eq!(
+            freshness_at_session_start(start, start - FRESHNESS_SECS + 1),
+            Freshness::Fresh,
+            "one second below the 24h boundary remains fresh"
+        );
+        assert_eq!(
+            freshness_at_session_start(start, start - FRESHNESS_SECS),
+            Freshness::Stale,
+            "at exactly 24h the cache is stale"
+        );
+        assert_eq!(
+            freshness_at_session_start(start, start + 1),
+            Freshness::Future,
+            "a cache timestamp later than session start is an explicit clock-skew state"
+        );
+    }
+
+    #[test]
+    fn a_session_start_retrieval_is_fresh_for_that_session() {
+        let session_start = 1_000_000;
+        let mut cache = SpotlightCache::default();
+        cache.apply(cache_delta(
+            project(SpotlightInput::Available(b"# Current\nbody\n".to_vec())),
+            session_start,
+        ));
+
+        assert!(
+            !should_retrieve(session_start, &cache),
+            "a retrieval stamped at session start is fresh for that session"
+        );
+    }
+
+    #[test]
+    fn unavailable_preserves_accepted_status_and_whats_new_body() {
+        let mut cache = SpotlightCache::default();
+        cache.apply(cache_delta(
+            project(SpotlightInput::Available(b"# First\nfirst body\n".to_vec())),
+            10,
+        ));
+        let before_unavailable = cache.clone();
+        cache.apply(cache_delta(SpotlightProjection::Unavailable, 20));
+        assert_eq!(
+            cache, before_unavailable,
+            "unavailable input preserves every cache field"
+        );
+        assert_eq!(cache.status_title(), Some("First"));
+        assert_eq!(cache.whats_new_body(), Some(b"first body\n".as_slice()));
+
+        cache.apply(cache_delta(
+            project(SpotlightInput::Available(
+                b"# First\nchanged body\n".to_vec(),
+            )),
+            40,
+        ));
+        assert_eq!(cache.status_title(), Some("First"));
+        assert_eq!(cache.whats_new_body(), Some(b"changed body\n".as_slice()));
+    }
+
+    #[test]
+    fn session_retrieves_without_a_cache_and_rechecks_stale_or_future_cache_times() {
+        let session_started_at_unix = 1_000_000;
+
+        assert!(
+            should_retrieve(session_started_at_unix, &SpotlightCache::default()),
+            "an absent retrieval timestamp requires a first retrieval"
+        );
+
+        let stale = SpotlightCache {
+            retrieved_at_unix: Some(session_started_at_unix - FRESHNESS_SECS),
+            ..SpotlightCache::default()
+        };
+        assert!(
+            should_retrieve(session_started_at_unix, &stale),
+            "the exact freshness boundary requires retrieval"
+        );
+
+        let future = SpotlightCache {
+            retrieved_at_unix: Some(session_started_at_unix + 1),
+            ..SpotlightCache::default()
+        };
+        assert!(
+            should_retrieve(session_started_at_unix, &future),
+            "a future cache timestamp requires retrieval"
+        );
+    }
+
+    #[test]
+    fn withdrawal_then_reacceptance_restores_the_spotlight_status() {
+        let input = b"# Title\nbody\n".to_vec();
+        let mut cache = SpotlightCache::default();
+        cache.apply(cache_delta(
+            project(SpotlightInput::Available(input.clone())),
+            10,
+        ));
+        cache.apply(cache_delta(SpotlightProjection::Withdrawn, 20));
+        cache.apply(cache_delta(project(SpotlightInput::Available(input)), 30));
+
+        assert_eq!(
+            cache.status_title(),
+            Some("Title"),
+            "an accepted spotlight always reaches status policy"
+        );
+    }
+
+    #[test]
+    fn withdrawn_delta_clears_accepted_content_but_records_the_retrieval_time() {
+        let mut cache = SpotlightCache::default();
+        cache.apply(cache_delta(
+            project(SpotlightInput::Available(b"# Title\nbody\n".to_vec())),
+            10,
+        ));
+
+        cache.apply(cache_delta(SpotlightProjection::Withdrawn, 20));
+        assert_eq!(cache.accepted, None);
+        assert_eq!(cache.retrieved_at_unix(), Some(20));
+        assert_eq!(cache.status_title(), None);
+        assert_eq!(cache.whats_new_body(), None);
+    }
+
+    #[test]
+    fn conclusive_withdrawals_throttle_fresh_sessions_but_unavailable_state_does_not() {
+        let session_started_at_unix = 1_000_000;
+        let fresh_retrieved_at_unix = session_started_at_unix - FRESHNESS_SECS + 1;
+
+        let mut withdrawn = SpotlightCache::default();
+        withdrawn.apply(cache_delta(
+            SpotlightProjection::Withdrawn,
+            fresh_retrieved_at_unix,
+        ));
+        assert_eq!(withdrawn.status_title(), None);
+        assert_eq!(withdrawn.whats_new_body(), None);
+        assert!(
+            !should_retrieve(session_started_at_unix, &withdrawn),
+            "a fresh withdrawal is a successful retrieval"
+        );
+
+        let mut invalid = SpotlightCache::default();
+        invalid.apply(cache_delta(
+            project(SpotlightInput::Available(b"no heading\n".to_vec())),
+            fresh_retrieved_at_unix,
+        ));
+        assert_eq!(invalid, withdrawn, "invalid present content withdraws");
+
+        let mut stale = SpotlightCache::default();
+        stale.apply(cache_delta(
+            SpotlightProjection::Withdrawn,
+            session_started_at_unix - FRESHNESS_SECS,
+        ));
+        assert!(
+            should_retrieve(session_started_at_unix, &stale),
+            "a stale withdrawal retries"
+        );
+        assert!(
+            should_retrieve(session_started_at_unix, &SpotlightCache::default()),
+            "unavailable state has no successful retrieval timestamp"
+        );
+    }
+}
