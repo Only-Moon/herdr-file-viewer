@@ -168,6 +168,25 @@ fn keys_doc_documents_line_select_key() {
 }
 
 #[test]
+fn pinned_preview_resize_docs_describe_horizontal_space() {
+    // The previews sit side-by-side. `{` / `}` move their shared horizontal divider; wording them
+    // as vertical space would describe a different layout and mislead users configuring the keys.
+    assert!(
+        KEYS_DOC.contains("shrink / grow its horizontal share"),
+        "docs/keys.md must describe pinned-preview resizing as changing its horizontal share"
+    );
+    for description in [
+        "Give the pinned preview less horizontal space",
+        "Give the pinned preview more horizontal space",
+    ] {
+        assert!(
+            CONFIG_DOC.contains(description),
+            "docs/configuration.md must describe pinned-preview resizing as changing horizontal space: {description}"
+        );
+    }
+}
+
+#[test]
 fn keys_doc_documents_reveal_open_keys() {
     assert!(
         KEYS_DOC.contains("`O`"),

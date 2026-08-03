@@ -696,6 +696,72 @@ fn pin_preview_intent_invokes_the_existing_snapshot_lifecycle() {
 }
 
 #[test]
+fn preview_resize_intents_move_only_the_pinned_share_and_preserve_it_across_repinning() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    let tree_split = ctrl.split_pct();
+
+    ctrl.handle(Intent::ShrinkPreview);
+    assert_eq!(ctrl.view_state().preview_split_pct, 45);
+    assert_eq!(
+        ctrl.split_pct(),
+        tree_split,
+        "preview resize must not move the tree divider"
+    );
+
+    for _ in 0..10 {
+        ctrl.handle(Intent::ShrinkPreview);
+    }
+    assert_eq!(
+        ctrl.view_state().preview_split_pct,
+        20,
+        "shrink clamps at 20%"
+    );
+
+    for _ in 0..20 {
+        ctrl.handle(Intent::GrowPreview);
+    }
+    assert_eq!(
+        ctrl.view_state().preview_split_pct,
+        80,
+        "grow clamps at 80%"
+    );
+    assert_eq!(
+        ctrl.split_pct(),
+        tree_split,
+        "preview resize must not move the tree divider"
+    );
+
+    ctrl.handle(Intent::PinPreview);
+    assert!(ctrl.view_state().pinned.is_none());
+    ctrl.handle(Intent::PinPreview);
+    assert!(ctrl.view_state().pinned.is_some());
+    assert_eq!(
+        ctrl.view_state().preview_split_pct,
+        80,
+        "repinning preserves the ratio"
+    );
+    assert_eq!(
+        ctrl.split_pct(),
+        tree_split,
+        "repinning must not move the tree divider"
+    );
+}
+
+#[test]
+fn preview_resize_intents_are_inert_without_a_pin() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut ctrl = controller(dir.path());
+    let ratio = ctrl.view_state().preview_split_pct;
+    let tree_split = ctrl.split_pct();
+
+    assert!(!ctrl.handle(Intent::ShrinkPreview).redraw);
+    assert!(!ctrl.handle(Intent::GrowPreview).redraw);
+    assert_eq!(ctrl.view_state().preview_split_pct, ratio);
+    assert_eq!(ctrl.split_pct(), tree_split);
+}
+
+#[test]
 fn pinning_a_different_file_replaces_one_frozen_snapshot_without_rendering() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();

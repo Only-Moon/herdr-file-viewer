@@ -85,6 +85,12 @@ pub enum Intent {
     ShrinkTree,
     /// Widen the tree column (move the tree/content divider right).
     GrowTree,
+    /// Shrink the frozen preview's share of the preview area by five percentage points. Inert
+    /// without a pin; it never moves the outer tree/content divider.
+    ShrinkPreview,
+    /// Grow the frozen preview's share of the preview area by five percentage points. Inert
+    /// without a pin; it never moves the outer tree/content divider.
+    GrowPreview,
     /// Force content-line wrapping on/off, overriding the per-mode default (so long lines in
     /// code and diffs can be wrapped on demand instead of truncated).
     ToggleWrap,
@@ -166,7 +172,7 @@ pub enum Intent {
 impl Intent {
     /// Every intent variant — lets the dispatcher and tests enumerate the closed set so
     /// keyboard-completeness (AC-18) and the no-file/git-mutation invariant (AC-N3) stay checkable.
-    pub const ALL: [Intent; 42] = [
+    pub const ALL: [Intent; 44] = [
         Intent::NavUp,
         Intent::NavDown,
         Intent::PageUp,
@@ -192,6 +198,8 @@ impl Intent {
         Intent::ToggleFocus,
         Intent::ShrinkTree,
         Intent::GrowTree,
+        Intent::ShrinkPreview,
+        Intent::GrowPreview,
         Intent::ToggleWrap,
         Intent::ToggleZoom,
         Intent::PinPreview,
@@ -249,6 +257,8 @@ mod tests {
                 | Intent::ToggleFocus
                 | Intent::ShrinkTree
                 | Intent::GrowTree
+                | Intent::ShrinkPreview
+                | Intent::GrowPreview
                 | Intent::ToggleWrap
                 | Intent::ToggleZoom
                 | Intent::PinPreview
@@ -338,11 +348,11 @@ mod tests {
     }
 
     #[test]
-    fn all_length_is_42() {
+    fn all_length_is_44() {
         assert_eq!(
             Intent::ALL.len(),
-            42,
-            "Intent::ALL must have exactly 42 variants"
+            44,
+            "Intent::ALL must have exactly 44 variants"
         );
     }
 

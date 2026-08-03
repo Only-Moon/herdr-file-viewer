@@ -1281,6 +1281,27 @@ mod tests {
     }
 
     #[test]
+    fn keybindings_text_lists_the_pinned_preview_resize_defaults() {
+        // The generated Help model is sourced from the registry, so the two resize actions remain
+        // discoverable alongside pin_preview without a second hand-maintained key list.
+        let text = keybindings_text(
+            input::registry(),
+            &input::default_bindings(),
+            &input::KeyLoadOutcome::default(),
+        );
+        for (name, key) in [("shrink_preview", "{"), ("grow_preview", "}")] {
+            let row = text
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(name))
+                .unwrap_or_else(|| panic!("Help must contain the {name} action"));
+            assert!(
+                row.split_whitespace().any(|word| word == key),
+                "{name} must show its default {key:?}:\n{row}"
+            );
+        }
+    }
+
+    #[test]
     fn keybindings_text_groups_actions_under_their_category_header() {
         // AC-19 (grouping): each action renders under its category header, and the headers appear in
         // CATEGORY_ORDER (like herdr's grouped keybinds list).

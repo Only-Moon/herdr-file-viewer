@@ -164,6 +164,11 @@ const SPLIT_MIN: u16 = crate::config::MIN_TREE_WIDTH;
 const SPLIT_MAX: u16 = crate::config::MAX_TREE_WIDTH;
 /// How many percentage points one resize keypress moves the divider.
 const SPLIT_STEP: u16 = 5;
+/// Bounds and one-key increment for the pinned/active preview divider. These are independent of
+/// the outer tree/content split: a pin is the only precondition for mutating this ratio.
+const PREVIEW_SPLIT_MIN: u16 = 20;
+const PREVIEW_SPLIT_MAX: u16 = 80;
+const PREVIEW_SPLIT_STEP: u16 = 5;
 // The floor for an INTERACTIVE resize (grow/shrink keys, divider drag), below the config/startup
 // floor `SPLIT_MIN`. A hand resize may pull the tree narrower than the startup minimum — down to the
 // same 10% the Presenter's `columns()` renders at — so on a wide pane the tree can be shrunk below a
@@ -2157,6 +2162,8 @@ impl Controller {
             Intent::ToggleFocus => self.toggle_focus(),
             Intent::ShrinkTree => self.resize_split(-(SPLIT_STEP as i16)),
             Intent::GrowTree => self.resize_split(SPLIT_STEP as i16),
+            Intent::ShrinkPreview => self.resize_preview_split(-(PREVIEW_SPLIT_STEP as i16)),
+            Intent::GrowPreview => self.resize_preview_split(PREVIEW_SPLIT_STEP as i16),
             Intent::ToggleWrap => self.toggle_wrap(),
             Intent::ToggleZoom => self.toggle_zoom(),
             Intent::PinPreview => self.pin_active_preview(),
@@ -3032,6 +3039,19 @@ impl Controller {
         let next =
             (self.split_pct as i16 + delta).clamp(self.split_floor_pct() as i16, SPLIT_MAX as i16);
         self.split_pct = next as u16;
+        Effects::redraw()
+    }
+
+    /// Move only the divider between the frozen and active previews. A missing pin leaves every
+    /// session field unchanged, including the retained ratio, so the actions are truly inert until
+    /// a reference preview exists.
+    fn resize_preview_split(&mut self, delta: i16) -> Effects {
+        if self.pinned_snapshot.is_none() {
+            return Effects::noop();
+        }
+        self.preview_split_pct = (self.preview_split_pct as i16 + delta)
+            .clamp(PREVIEW_SPLIT_MIN as i16, PREVIEW_SPLIT_MAX as i16)
+            as u16;
         Effects::redraw()
     }
 

@@ -185,6 +185,8 @@ customized).
 | | `toggle_focus` | `Tab` | Move focus between the tree and content columns |
 | | `shrink_tree` | `<` | Narrow the tree column |
 | | `grow_tree` | `>` | Widen the tree column |
+| | `shrink_preview` | `{` | Give the pinned preview less horizontal space |
+| | `grow_preview` | `}` | Give the pinned preview more horizontal space |
 | | `toggle_wrap` | `w` | Force content-line wrapping on or off |
 | | `toggle_zoom` | `z` | Hide the tree so content fills the frame, or restore the split |
 | | `pin_preview` | `p` | Pin or unpin the settled preview as a reference |
@@ -223,7 +225,7 @@ and annotation-overview `j`/`k`/arrows, `Enter`/`e`, `d`, uppercase `D`, `y`, `E
 the finder and `:` / `/` prompts. Remapping a global action never changes these local modal keys.
 
 **Bindable keys** are the modifier-free surface the viewer already uses: any printable or shifted
-character (`g`, `<`, `?`, and capitals such as `A`, `D`, and `W` are each their own key), plus the named keys
+character (`g`, `<`, `{`, `?`, and capitals such as `A`, `D`, and `W` are each their own key), plus the named keys
 `Tab`, `Enter`, `Esc`, the four arrows, `Home`, `End`, `PageUp`, `PageDown`, `Space`, `Backspace`,
 `Delete`, `Insert`, and `F1` through `F12` (named keys are matched case-insensitively). There are
 **no `Ctrl` / `Alt` chords**: a chord never fires a viewer action, so terminal combinations like
