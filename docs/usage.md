@@ -204,9 +204,9 @@ focused preview. On a narrow pane, the focused region takes the full width inste
 two previews below their **40-column floor**; use `Tab` to compare the other one.
 
 The reference is display-only. Actions that need the live selection — including `Enter`, `:`, `e`,
-`O`, `R`, `a`, `A`, `v`, `D`, `w`, and `Z` — are **unavailable from the pinned preview** and show a
-short notice; `Tab` to the active preview or tree to use them. This keeps a frozen reference from
-silently acting on a newer tree selection.
+`L`, `O`, `R`, `a`, `A`, `v`, `D`, `w`, and `Z` — are **unavailable from the pinned preview** and
+show a short notice; `Tab` to the active preview or tree to use them. This keeps a frozen reference
+from silently acting on a newer tree selection.
 
 Use `{` / `}` to shrink or grow the pin in 5-point steps (20–80%) without moving the tree/content
 split. They move the **preview divider** between the pinned and active previews and do nothing when

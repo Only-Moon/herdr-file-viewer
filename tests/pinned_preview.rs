@@ -1365,6 +1365,49 @@ fn mouse_routes_pinned_scroll_and_preview_divider_drag_without_touching_active()
 }
 
 #[test]
+fn preview_divider_drag_maps_the_cursor_column_to_a_proportional_pinned_share() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    // Measured geometry: the preview area spans columns 40..90, divider at 65.
+    ctrl.set_pane_geometry(PaneGeometry {
+        preview_area_x: 40,
+        preview_area_width: 50,
+        preview_divider_x: Some(65),
+        pinned_inner: Some(Rect::new(40, 1, 8, 4)),
+        content_inner: Some(Rect::new(65, 1, 8, 4)),
+        ..PaneGeometry::default()
+    });
+
+    // Interior columns must map proportionally — (column − area x) / area width — not merely
+    // clamp or snap toward the drag direction. 51 and 79 sit one step inside the 20/80 clamp,
+    // so a snap-to-extremes mapping cannot satisfy them.
+    for (column, expected_pct) in [(51, 22), (55, 30), (65, 50), (72, 64), (79, 78)] {
+        ctrl.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 65,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        ctrl.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        ctrl.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            ctrl.view_state().preview_split_pct,
+            expected_pct,
+            "dragging the divider to column {column} maps to a {expected_pct}% pinned share"
+        );
+    }
+}
+
+#[test]
 fn pinned_scrollbar_press_and_drag_preserve_the_active_selection() {
     let (_dir, mut ctrl) = pin_ready_controller();
     ctrl.set_pane_geometry(PaneGeometry {
