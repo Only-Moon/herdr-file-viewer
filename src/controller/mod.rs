@@ -2808,23 +2808,34 @@ impl Controller {
         }
     }
 
-    /// Copy the selected node's path to the clipboard (`y` repo-relative, `Y` absolute). Works
-    /// for files and directories alike — copying a path mutates nothing (AC-N3). The outcome is
-    /// surfaced as a transient notice ("Copied …" / a clipboard-failure message). Inert when
-    /// nothing is selected. The repo-relative form falls back to the absolute path for a node
-    /// outside the tree root (there is no relative form to give), which in practice cannot
-    /// happen since every node is under the root.
+    /// Copy the selected node's path to the clipboard (`y` repo-relative, `Y` absolute), or the
+    /// captured origin of a focused pinned preview. Works for files and directories alike —
+    /// copying a path mutates nothing (AC-N3). The outcome is surfaced as a transient notice
+    /// ("Copied …" / a clipboard-failure message). Inert when nothing is selected. The
+    /// repo-relative form falls back to the absolute path for a node outside the tree root (there
+    /// is no relative form to give), which in practice cannot happen since every node is under
+    /// the root.
     fn copy_path(&mut self, kind: PathKind) -> Effects {
-        let Some(node) = self.tree.selected() else {
-            return Effects::noop();
-        };
-        let raw = match kind {
-            PathKind::Absolute => node.path.to_string_lossy().into_owned(),
-            PathKind::Repo => self
-                .rel(&node.path)
-                .unwrap_or_else(|| node.path.clone())
-                .to_string_lossy()
-                .into_owned(),
+        let raw = if self.focus == Focus::Pinned {
+            let Some(origin) = self.pinned_document().map(PreviewDocument::origin) else {
+                return Effects::noop();
+            };
+            match kind {
+                PathKind::Absolute => origin.absolute_path().to_string_lossy().into_owned(),
+                PathKind::Repo => origin.root_relative_path().to_string_lossy().into_owned(),
+            }
+        } else {
+            let Some(node) = self.tree.selected() else {
+                return Effects::noop();
+            };
+            match kind {
+                PathKind::Absolute => node.path.to_string_lossy().into_owned(),
+                PathKind::Repo => self
+                    .rel(&node.path)
+                    .unwrap_or_else(|| node.path.clone())
+                    .to_string_lossy()
+                    .into_owned(),
+            }
         };
         // A filename is untrusted — an attacker can craft one in a browsed repo, and a path may
         // legally contain control bytes: ESC/BEL (a terminal escape, e.g. a forged OSC 52) or a

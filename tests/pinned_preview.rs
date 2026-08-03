@@ -21,7 +21,7 @@ use ratatui::text::Text;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -133,6 +133,29 @@ fn controller(root: &Path) -> Controller {
         common::resolved(root.to_path_buf(), false),
         Baseline::Head,
         components,
+    )
+}
+
+/// Build a controller whose clipboard log remains observable after construction.
+fn controller_with_recording_clipboard(root: &Path) -> (Controller, Arc<Mutex<Vec<String>>>) {
+    let clipboard = common::RecordingClipboard::default();
+    let copied = Arc::clone(&clipboard.copied);
+    let components = Components {
+        providers: Box::new(|_resolved| RootProviders {
+            git: Arc::new(StubGit),
+            content: Box::new(Lines),
+        }),
+        editor: Box::new(NoopEditor),
+        clipboard: Box::new(clipboard),
+        renderers: None,
+    };
+    (
+        Controller::new(
+            common::resolved(root.to_path_buf(), false),
+            Baseline::Head,
+            components,
+        ),
+        copied,
     )
 }
 
@@ -324,6 +347,72 @@ fn pinned_unavailable_actions_are_consumed_with_a_notice() {
         assert_eq!(opener_calls.load(Ordering::SeqCst), 0, "{intent:?}");
         assert!(copied.lock().unwrap().is_empty(), "{intent:?}");
     }
+}
+
+#[test]
+fn pinned_y_copies_the_captured_root_relative_path_after_re_root() {
+    let original_root = TempDir::new();
+    let original_file = original_root.path().join("pinned.rs");
+    std::fs::write(&original_file, "original\n").unwrap();
+    let new_root = TempDir::new();
+    std::fs::write(new_root.path().join("current.rs"), "current\n").unwrap();
+    let (mut ctrl, copied) = controller_with_recording_clipboard(original_root.path());
+
+    await_content(&mut ctrl);
+    ctrl.handle(Intent::PinPreview);
+    ctrl.re_root(new_root.path());
+    await_content(&mut ctrl);
+    std::fs::remove_dir_all(original_root.path()).unwrap();
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::CopyRepoPath);
+
+    assert_eq!(
+        copied.lock().unwrap().as_slice(),
+        ["pinned.rs"],
+        "pinned y uses its captured origin, not the current tree or filesystem"
+    );
+}
+
+// Windows forbids control bytes in filesystem entry names. The controller's sanitizer is
+// platform-independent, but this end-to-end proof needs a hostile path that can be pinned.
+#[cfg(unix)]
+#[test]
+fn pinned_capital_y_copies_a_sanitized_captured_absolute_path_after_root_removal() {
+    let original_root = TempDir::new();
+    let hostile_name = "pin\u{1b}[2J\u{7}\n.rs";
+    let original_file = original_root.path().join(hostile_name);
+    std::fs::write(&original_file, "original\n").unwrap();
+    let expected = original_file
+        .to_string_lossy()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>();
+    let new_root = TempDir::new();
+    std::fs::write(new_root.path().join("current.rs"), "current\n").unwrap();
+    let (mut ctrl, copied) = controller_with_recording_clipboard(original_root.path());
+
+    await_content(&mut ctrl);
+    ctrl.handle(Intent::PinPreview);
+    ctrl.re_root(new_root.path());
+    await_content(&mut ctrl);
+    std::fs::remove_dir_all(original_root.path()).unwrap();
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::CopyAbsPath);
+
+    let copied = copied.lock().unwrap();
+    assert_eq!(
+        copied.as_slice(),
+        [expected],
+        "pinned Y uses the captured absolute origin without reading its removed root"
+    );
+    assert!(
+        copied[0].chars().all(|ch| !ch.is_control()),
+        "clipboard text never carries hostile terminal or paste control characters"
+    );
 }
 
 #[test]
