@@ -94,6 +94,19 @@ mod tests {
     }
 
     #[test]
+    fn target_for_maps_each_focus_to_its_interaction_surface() {
+        assert_eq!(target_for(Focus::Tree, Intent::NavDown), ActionTarget::Tree);
+        assert_eq!(
+            target_for(Focus::Content, Intent::NavDown),
+            ActionTarget::Active
+        );
+        assert_eq!(
+            target_for(Focus::Pinned, Intent::NavDown),
+            ActionTarget::Pinned
+        );
+    }
+
+    #[test]
     fn pinned_rejection_set_is_exact() {
         let unavailable = [
             Intent::Activate,

@@ -3910,6 +3910,53 @@ mod tests {
         assert_eq!(ctrl.page_step(), 7, "and it tracks a resize");
     }
 
+    #[test]
+    fn scroll_pinned_to_line_uses_the_pinned_viewport_width_for_wrapped_rows() {
+        let mut ctrl = wiring_controller();
+        ctrl.pinned_snapshot = Some(PinnedSnapshot {
+            document: PreviewDocument::new(
+                Text::raw(
+                    [
+                        "x".repeat(25),  // 3 rows at the pinned width of 10
+                        "y".repeat(11),  // 2 more rows
+                        "target".into(), // source line 3 starts at display row 5
+                        "tail".into(),
+                        "tail".into(),
+                        "tail".into(),
+                    ]
+                    .join("\n"),
+                ),
+                Vec::new(),
+                None,
+                PreviewPresentation::new(ViewMode::SyntaxContent, true, false),
+                PreviewOrigin::new(
+                    PathBuf::from("/worktrees/pinned"),
+                    BranchState::Named("pinned".into()),
+                    PathBuf::from("/worktrees/pinned/file.rs"),
+                    PathBuf::from("file.rs"),
+                ),
+            ),
+            interaction: PreviewInteractionState {
+                viewport_width: 10,
+                viewport_height: 2,
+                ..PreviewInteractionState::default()
+            },
+        });
+
+        ctrl.scroll_pinned_to_line(3);
+
+        assert_eq!(
+            ctrl.pinned_interaction().map(|state| state.vertical_scroll),
+            Some(5),
+            "source line 3 follows the 3 + 2 wrapped rows before it"
+        );
+        assert_ne!(
+            ctrl.pinned_interaction().map(|state| state.vertical_scroll),
+            Some(2),
+            "the pinned source line must not use a naive line-minus-one offset"
+        );
+    }
+
     struct ChangedGit {
         path: PathBuf,
     }

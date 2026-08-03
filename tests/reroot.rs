@@ -13,9 +13,11 @@ use herdr_file_viewer::controller::{
     RenderResult, RootProviders,
 };
 use herdr_file_viewer::git::{Baseline, Status};
+use herdr_file_viewer::infile::SearchState;
 use herdr_file_viewer::intent::Intent;
 use herdr_file_viewer::presenter::Focus;
 use herdr_file_viewer::root::Resolved;
+use herdr_file_viewer::search::Match;
 use herdr_file_viewer::tree::NodeKind;
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::text::Text;
@@ -232,11 +234,25 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
     poll_until(&mut ctrl, Duration::from_secs(5), |c| {
         c.active_document().is_some()
     });
+    {
+        let interaction = ctrl.active_interaction_mut();
+        interaction.vertical_scroll = 7;
+        interaction.horizontal_scroll = 3;
+        interaction.search = Some(SearchState {
+            query: "fake".into(),
+            matches: vec![Match {
+                line: 0,
+                start: 0,
+                end: 4,
+            }],
+            current: 0,
+        });
+    }
     assert!(ctrl.handle(Intent::PinPreview).redraw);
-    assert!(
-        ctrl.view_state().pinned.is_some(),
-        "precondition: preview is pinned"
-    );
+    let pinned_before = ctrl
+        .view_state()
+        .pinned
+        .expect("precondition: preview is pinned");
     assert_eq!(ctrl.view_state().preview_split_pct, 50);
     ctrl.handle(Intent::ToggleChangedOnly); // changed-only back on (the carried pref state)
     ctrl.handle(Intent::ToggleZoom); // zoom on, focus → content
@@ -269,17 +285,55 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
     );
     assert!(ctrl.hide_hidden(), "hide_hidden carried (#46)");
     assert_eq!(ctrl.baseline(), Baseline::Base, "baseline carried");
-    assert!(ctrl.view_state().pinned.is_some(), "pin survives re_root");
+    let pinned_after = ctrl.view_state().pinned.expect("pin survives re_root");
+    assert_eq!(
+        pinned_after.content, pinned_before.content,
+        "frozen content"
+    );
+    assert_eq!(
+        pinned_after.notices, pinned_before.notices,
+        "content notices"
+    );
+    assert_eq!(pinned_after.origin, pinned_before.origin, "captured origin");
+    assert_eq!(pinned_after.scroll, pinned_before.scroll, "vertical scroll");
+    assert_eq!(
+        pinned_after.hscroll, pinned_before.hscroll,
+        "horizontal scroll"
+    );
+    match (&pinned_after.search, &pinned_before.search) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(actual.matches, expected.matches, "search matches");
+            assert_eq!(actual.current, expected.current, "current search match");
+        }
+        _ => panic!("re-root changed pinned search presence"),
+    }
     assert_eq!(
         ctrl.view_state().preview_split_pct,
         50,
         "pin ratio survives re_root"
     );
 
-    // Navigation/view state is RESET (AC-13).
+    // Navigation/view state is RESET (AC-13), but the frozen pin's query is still available
+    // when focus returns to it after the switch.
     assert_eq!(ctrl.tree().cursor(), 0, "cursor back at the root row");
     assert!(!ctrl.zoomed(), "unzoomed after re_root");
     assert_eq!(ctrl.focus(), Focus::Tree, "focus back on the tree");
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    assert!(
+        ctrl.view_state()
+            .prompt
+            .as_deref()
+            .is_some_and(|status| status.contains("Search: fake (1/1)")),
+        "captured pinned search query survives the re-root"
+    );
+    ctrl.handle(Intent::ToggleFocus);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(
+        ctrl.focus(),
+        Focus::Tree,
+        "focus cycle returns to the reset tree focus"
+    );
 
     // the git-derived state (status markers + the changed-only filter built from the
     // changed-set) now fills in ASYNCHRONOUSLY, applied by `poll` rather than synchronously in

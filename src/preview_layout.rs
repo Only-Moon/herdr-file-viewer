@@ -266,18 +266,38 @@ mod tests {
     #[test]
     fn pin_split_floor_cannot_be_bypassed_by_ratio() {
         for ratio in [20, 50, 80] {
-            let result = layout(LayoutInput {
-                area: Rect::new(0, 0, 138, 10),
-                has_pin: true,
-                preview_split_pct: ratio,
-                tree_split_pct: 40,
-                tree_max_cols: u16::MAX,
-                ..LayoutInput::new(Rect::default())
-            });
-            assert!(
-                !(result.pinned.is_some() && result.active.is_some()),
-                "ratio {ratio} must not bypass the preview floor"
-            );
+            for focus in [
+                PreviewFocus::Tree,
+                PreviewFocus::Pinned,
+                PreviewFocus::Active,
+            ] {
+                let result = layout(LayoutInput {
+                    area: Rect::new(0, 0, 138, 10),
+                    has_pin: true,
+                    focus,
+                    preview_split_pct: ratio,
+                    tree_split_pct: 40,
+                    tree_max_cols: u16::MAX,
+                    ..LayoutInput::new(Rect::default())
+                });
+                assert!(
+                    !(result.pinned.is_some() && result.active.is_some()),
+                    "ratio {ratio} must not bypass the preview floor"
+                );
+                let visible_regions = [result.tree, result.pinned, result.active]
+                    .into_iter()
+                    .flatten()
+                    .count();
+                assert_eq!(
+                    visible_regions, 1,
+                    "narrow fallback at ratio {ratio} must retain exactly the focused region"
+                );
+                match focus {
+                    PreviewFocus::Tree => assert_eq!(result.tree, Some(result.body)),
+                    PreviewFocus::Pinned => assert_eq!(result.pinned, Some(result.body)),
+                    PreviewFocus::Active => assert_eq!(result.active, Some(result.body)),
+                }
+            }
         }
     }
 

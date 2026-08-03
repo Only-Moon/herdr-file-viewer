@@ -12,15 +12,18 @@ use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::infile::SearchState;
 use herdr_file_viewer::intent::Intent;
 use herdr_file_viewer::opener::{Opener, OpenerOutcome};
-use herdr_file_viewer::presenter::{Focus, PaneGeometry, PreviewViewports, draw};
+use herdr_file_viewer::presenter::{
+    Focus, PaneGeometry, PreviewProjection, PreviewViewports, draw,
+};
 use herdr_file_viewer::preview::PreviewPresentation;
 use herdr_file_viewer::search::Match;
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::layout::Rect;
-use ratatui::text::Text;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -37,6 +40,28 @@ impl GitService for StubGit {
 
     fn changed_set(&self, _baseline: Baseline) -> BTreeMap<std::path::PathBuf, Status> {
         BTreeMap::new()
+    }
+
+    fn diff(&self, _path: &Path, _baseline: Baseline, _full_context: bool) -> String {
+        String::new()
+    }
+
+    fn diff_directory(&self, _path: &Path, _baseline: Baseline) -> String {
+        String::new()
+    }
+}
+
+struct ChangedGit {
+    changed: BTreeMap<PathBuf, Status>,
+}
+
+impl GitService for ChangedGit {
+    fn status(&self) -> BTreeMap<PathBuf, Status> {
+        self.changed.clone()
+    }
+
+    fn changed_set(&self, _baseline: Baseline) -> BTreeMap<PathBuf, Status> {
+        self.changed.clone()
     }
 
     fn diff(&self, _path: &Path, _baseline: Baseline, _full_context: bool) -> String {
@@ -85,6 +110,37 @@ impl ContentProvider for DiskContent {
             content: Text::raw(std::fs::read_to_string(path).unwrap()),
             notices: Vec::new(),
             source: None,
+        }
+    }
+}
+
+/// A rendered-Markdown fixture with presentation-specific styling and renderer notices.
+/// Returning a distinct fallback for any other mode makes the test assert the policy selected
+/// rendered Markdown before it freezes the display representation.
+struct NoticedMarkdown;
+
+impl ContentProvider for NoticedMarkdown {
+    fn render(&self, _path: &Path, mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        match mode {
+            ViewMode::RenderedMarkdown => RenderResult {
+                content: Text::from(Line::from(vec![
+                    Span::styled(
+                        "rendered markdown",
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" preview needle one needle two"),
+                ])),
+                notices: vec![
+                    "markdown renderer notice".into(),
+                    "wrapped table truncated".into(),
+                ],
+                source: None,
+            },
+            _ => RenderResult {
+                content: Text::raw("unexpected non-markdown presentation"),
+                notices: vec!["wrong presentation".into()],
+                source: None,
+            },
         }
     }
 }
@@ -199,17 +255,66 @@ fn await_content_containing(ctrl: &mut Controller, expected: &str) {
     }
 }
 
-fn assert_provider_call_count_stays(calls: &AtomicUsize, expected: usize) {
-    let deadline = Instant::now() + Duration::from_millis(250);
-    while Instant::now() < deadline {
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            expected,
-            "content provider call count changed during the bounded quiet period"
+fn await_active_relative_path(ctrl: &mut Controller, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ctrl
+        .active_document()
+        .is_none_or(|document| document.origin().root_relative_path() != Path::new(expected))
+    {
+        ctrl.poll();
+        assert!(
+            Instant::now() < deadline,
+            "active preview never rendered {expected:?}"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(calls.load(Ordering::SeqCst), expected);
+}
+
+/// Compare every pinned field that represents the frozen display and independent interaction.
+/// `PreviewProjection` intentionally has no blanket equality because its active-only overlays do
+/// not, so keep the pin oracle explicit rather than silently comparing a subset.
+fn assert_pinned_projection_eq(actual: &PreviewProjection, expected: &PreviewProjection) {
+    assert_eq!(actual.content, expected.content, "displayed styled lines");
+    assert_eq!(actual.notices, expected.notices, "content-specific notices");
+    assert_eq!(actual.title, expected.title, "captured title");
+    assert_eq!(actual.rendering, expected.rendering, "rendering state");
+    assert_eq!(actual.scroll, expected.scroll, "vertical scroll");
+    assert_eq!(actual.hscroll, expected.hscroll, "horizontal scroll");
+    assert_eq!(actual.rows, expected.rows, "display-row extent");
+    assert_eq!(actual.wrap, expected.wrap, "wrapping presentation");
+    assert_eq!(actual.pad_left, expected.pad_left, "presentation inset");
+    assert_eq!(actual.origin, expected.origin, "captured origin");
+    assert_eq!(
+        actual.flash.is_none(),
+        expected.flash.is_none(),
+        "flash presence"
+    );
+    assert_eq!(
+        actual.line_select.is_none(),
+        expected.line_select.is_none(),
+        "line selection presence"
+    );
+    assert_eq!(
+        actual.selection.is_none(),
+        expected.selection.is_none(),
+        "character selection presence"
+    );
+    match (&actual.search, &expected.search) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(actual.matches, expected.matches, "search matches");
+            assert_eq!(actual.current, expected.current, "current search match");
+        }
+        (None, None) => {}
+        _ => panic!("search presence changed"),
+    }
+}
+
+fn assert_provider_call_count_stays(calls: &AtomicUsize, expected: usize) {
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        expected,
+        "pinning is synchronous state copying and must not dispatch content rendering"
+    );
 }
 
 fn draw_viewports(ctrl: &Controller, width: u16, height: u16) -> PreviewViewports {
@@ -255,6 +360,115 @@ fn pin_focus_cycles_and_removal_returns_focus_to_active() {
     ctrl.handle(Intent::PinPreview);
     assert!(ctrl.view_state().pinned.is_none());
     assert_eq!(ctrl.focus(), Focus::Content);
+}
+
+#[test]
+fn pinned_search_navigation_moves_only_the_pinned_search_and_viewport_with_wrap_notices() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    {
+        let active = ctrl.active_interaction_mut();
+        active.vertical_scroll = 6;
+        active.search = Some(SearchState {
+            query: "active search stays put".into(),
+            matches: vec![Match {
+                line: 12,
+                start: 0,
+                end: 6,
+            }],
+            current: 0,
+        });
+    }
+    // Re-pin after seeding active state so the pin's own prompt has a separate starting point.
+    ctrl.handle(Intent::PinPreview);
+    ctrl.handle(Intent::PinPreview);
+    ctrl.set_preview_viewports(PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    let active_before = ctrl.active_interaction().clone();
+
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+
+    ctrl.handle(Intent::NextMatch);
+    let pinned = ctrl.view_state().pinned.expect("pin remains present");
+    assert_eq!(pinned.search.as_ref().map(|search| search.current), Some(1));
+    assert_eq!(pinned.scroll, 1, "next match scrolls the pinned viewport");
+    assert_eq!(ctrl.active_interaction(), &active_before);
+
+    ctrl.handle(Intent::PrevMatch);
+    let pinned = ctrl.view_state().pinned.expect("pin remains present");
+    assert_eq!(pinned.search.as_ref().map(|search| search.current), Some(0));
+    assert_eq!(
+        pinned.scroll, 0,
+        "previous match scrolls the pinned viewport back"
+    );
+    assert_eq!(ctrl.active_interaction(), &active_before);
+
+    ctrl.handle(Intent::PrevMatch);
+    let pinned = ctrl.view_state().pinned.expect("pin remains present");
+    assert_eq!(
+        pinned.search.as_ref().map(|search| search.current),
+        Some(19)
+    );
+    assert_eq!(
+        pinned.scroll, 16,
+        "wrapped previous match reaches pinned bottom"
+    );
+    assert_eq!(ctrl.action_notice(), Some("Search: wrapped to last match"));
+    assert_eq!(ctrl.active_interaction(), &active_before);
+
+    ctrl.handle(Intent::NextMatch);
+    let pinned = ctrl.view_state().pinned.expect("pin remains present");
+    assert_eq!(pinned.search.as_ref().map(|search| search.current), Some(0));
+    assert_eq!(pinned.scroll, 0, "wrapped next match returns to pinned top");
+    assert_eq!(ctrl.action_notice(), Some("Search: wrapped to first match"));
+    assert_eq!(ctrl.active_interaction(), &active_before);
+}
+
+#[test]
+fn pinned_search_cancel_restores_its_saved_scroll_and_clears_the_search() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    for _ in 0..3 {
+        ctrl.handle(Intent::NavDown);
+    }
+    let saved_scroll = ctrl
+        .view_state()
+        .pinned
+        .expect("pin remains present")
+        .scroll;
+    assert_eq!(saved_scroll, 3, "precondition: pinned preview was scrolled");
+
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(
+        ctrl.view_state()
+            .pinned
+            .expect("pin remains present")
+            .scroll,
+        0,
+        "incremental search moved the pinned viewport before cancellation"
+    );
+
+    ctrl.handle_prompt_key(key(KeyCode::Esc));
+    let pinned = ctrl.view_state().pinned.expect("pin remains present");
+    assert_eq!(
+        pinned.scroll, saved_scroll,
+        "Esc restores pinned prompt scroll"
+    );
+    assert!(
+        pinned.search.is_none(),
+        "Esc clears pinned search highlights"
+    );
 }
 
 #[test]
@@ -740,6 +954,24 @@ fn no_pin_navigation_does_not_add_content_provider_work() {
 }
 
 #[test]
+fn loading_pin_attempt_is_rejected_with_the_rendering_notice_and_no_snapshot() {
+    let loading_root = TempDir::new();
+    std::fs::write(loading_root.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut loading = controller(loading_root.path());
+
+    assert!(
+        loading.active_document().is_none(),
+        "loading is not pinnable"
+    );
+    assert!(loading.pin_active_preview().redraw);
+    assert_eq!(
+        loading.action_notice(),
+        Some("Cannot pin while preview is rendering")
+    );
+    assert!(loading.view_state().pinned.is_none());
+}
+
+#[test]
 fn loading_directory_and_empty_tree_are_not_active_documents() {
     let loading_root = TempDir::new();
     std::fs::write(loading_root.path().join("preview.rs"), "placeholder\n").unwrap();
@@ -768,30 +1000,83 @@ fn loading_directory_and_empty_tree_are_not_active_documents() {
 #[test]
 fn pin_lifecycle_clones_the_settled_preview_and_toggles_the_same_identity() {
     let dir = TempDir::new();
-    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
-    let mut ctrl = controller(dir.path());
-    await_content(&mut ctrl);
-    ctrl.set_content_viewport(40, 5);
+    std::fs::write(dir.path().join("preview.md"), "placeholder\n").unwrap();
+    let components = Components {
+        providers: Box::new(|_resolved| RootProviders {
+            git: Arc::new(StubGit),
+            content: Box::new(NoticedMarkdown),
+        }),
+        editor: Box::new(NoopEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_content_containing(&mut ctrl, "rendered markdown preview");
+    assert_eq!(
+        ctrl.active_document()
+            .expect("settled Markdown document")
+            .presentation()
+            .view_mode(),
+        ViewMode::RenderedMarkdown,
+        "the pin captures a rendered-Markdown presentation, not just syntax content"
+    );
+    let active_content = ctrl.content().clone();
+    let active_notices = ctrl.view_state().active.notices;
     let interaction = ctrl.active_interaction_mut();
     interaction.vertical_scroll = 7;
     interaction.horizontal_scroll = 3;
     interaction.search = Some(SearchState {
         query: "needle".into(),
-        matches: vec![Match {
-            line: 4,
-            start: 7,
-            end: 13,
-        }],
-        current: 0,
+        matches: vec![
+            Match {
+                line: 0,
+                start: 26,
+                end: 32,
+            },
+            Match {
+                line: 0,
+                start: 37,
+                end: 43,
+            },
+        ],
+        current: 1,
     });
 
     assert!(ctrl.pin_active_preview().redraw);
     let pin = ctrl.view_state().pinned.expect("settled file is pinned");
-    assert_eq!(pin.content, *ctrl.content());
+    assert_eq!(
+        pin.content, active_content,
+        "styled displayed lines are frozen"
+    );
+    assert_eq!(
+        pin.notices, active_notices,
+        "content-specific renderer notices are frozen with the presentation"
+    );
     assert_eq!(pin.scroll, 7);
     assert_eq!(pin.hscroll, 3);
-    assert_eq!(pin.search.expect("copied search").matches.len(), 1);
+    assert_eq!(
+        pin.search.as_ref().map(|search| search.matches.len()),
+        Some(2)
+    );
+    assert_eq!(
+        pin.search.as_ref().map(|search| search.current),
+        Some(1),
+        "the captured search keeps its non-zero current match"
+    );
     assert_eq!(ctrl.view_state().preview_split_pct, 50);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    assert!(
+        ctrl.view_state()
+            .prompt
+            .as_deref()
+            .is_some_and(|status| status.contains("Search: needle (2/2)")),
+        "the captured search keeps its query as well as its current match"
+    );
 
     assert!(ctrl.pin_active_preview().redraw);
     assert!(
@@ -1119,6 +1404,209 @@ fn rejected_pin_attempts_leave_no_file_and_directory_targets_explained() {
     assert!(directory.pin_active_preview().redraw);
     assert!(directory.view_state().pinned.is_none());
     assert_eq!(directory.action_notice(), Some("Cannot pin a directory"));
+
+    let existing_root = TempDir::new();
+    std::fs::create_dir(existing_root.path().join("folder")).unwrap();
+    std::fs::write(existing_root.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut existing = controller(existing_root.path());
+    // The directory sorts first. Pin the file, then return to the ineligible directory.
+    existing.handle(Intent::NavDown);
+    await_content(&mut existing);
+    {
+        let interaction = existing.active_interaction_mut();
+        interaction.vertical_scroll = 7;
+        interaction.horizontal_scroll = 3;
+        interaction.search = Some(SearchState {
+            query: "needle".into(),
+            matches: vec![Match {
+                line: 4,
+                start: 7,
+                end: 13,
+            }],
+            current: 0,
+        });
+    }
+    existing.pin_active_preview();
+    let before = existing.view_state().pinned.expect("file pin precondition");
+    existing.handle(Intent::NavUp);
+    assert!(
+        existing.active_document().is_none(),
+        "directory is ineligible"
+    );
+
+    existing.pin_active_preview();
+    assert_eq!(existing.action_notice(), Some("Cannot pin a directory"));
+    let after = existing
+        .view_state()
+        .pinned
+        .expect("directory rejection keeps the existing pin");
+    assert_pinned_projection_eq(&after, &before);
+
+    // Empty the tree after the file was frozen. The next rejected pin is AC-4's no-selection
+    // path, which must retain the already-captured document rather than treating no selection as
+    // a request to clear it.
+    std::fs::remove_dir(existing_root.path().join("folder")).unwrap();
+    std::fs::remove_file(existing_root.path().join("preview.rs")).unwrap();
+    existing.handle(Intent::Refresh);
+    assert!(existing.tree().selected().is_none(), "no file is selected");
+    assert!(
+        existing.active_document().is_none(),
+        "empty tree is ineligible"
+    );
+
+    existing.pin_active_preview();
+    assert_eq!(
+        existing.action_notice(),
+        Some("Cannot pin: no file is selected")
+    );
+    let after_no_selection = existing
+        .view_state()
+        .pinned
+        .expect("no-selection rejection keeps the existing pin");
+    assert_pinned_projection_eq(&after_no_selection, &before);
+}
+
+#[test]
+fn changed_file_jumps_from_pinned_focus_retarget_only_the_active_preview() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+    let changed = BTreeMap::from([
+        (PathBuf::from("a.rs"), Status::Modified),
+        (PathBuf::from("b.rs"), Status::Modified),
+    ]);
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(ChangedGit {
+                changed: changed.clone(),
+            }),
+            content: Box::new(Lines),
+        }),
+        editor: Box::new(NoopEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+    await_active_relative_path(&mut ctrl, "a.rs");
+    {
+        let active = ctrl.active_interaction_mut();
+        active.vertical_scroll = 6;
+        active.horizontal_scroll = 3;
+        active.search = Some(SearchState {
+            query: "needle".into(),
+            matches: vec![Match {
+                line: 4,
+                start: 7,
+                end: 13,
+            }],
+            current: 0,
+        });
+    }
+    ctrl.handle(Intent::PinPreview);
+    ctrl.set_preview_viewports(PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    let pinned_before = ctrl.view_state().pinned.expect("pin precondition");
+    let pinned_search_status = ctrl
+        .view_state()
+        .prompt
+        .expect("pinned search status exposes the captured query");
+    let active_before = ctrl
+        .active_document()
+        .expect("active document precondition")
+        .origin()
+        .identity();
+
+    ctrl.handle(Intent::NextChanged);
+    await_active_relative_path(&mut ctrl, "b.rs");
+    let active_after_next = ctrl
+        .active_document()
+        .expect("next changed document")
+        .origin()
+        .identity();
+    assert_ne!(
+        active_after_next, active_before,
+        "next changed retargets active"
+    );
+    assert_eq!(ctrl.focus(), Focus::Pinned, "pinned focus stays put");
+    let pinned_after_next = ctrl.view_state().pinned.expect("pin remains present");
+    assert_pinned_projection_eq(&pinned_after_next, &pinned_before);
+    assert_eq!(ctrl.view_state().prompt, Some(pinned_search_status.clone()));
+
+    ctrl.handle(Intent::PrevChanged);
+    await_active_relative_path(&mut ctrl, "a.rs");
+    assert_eq!(
+        ctrl.active_document()
+            .expect("previous changed document")
+            .origin()
+            .identity(),
+        active_before,
+        "previous changed retargets only the active preview back"
+    );
+    assert_eq!(ctrl.focus(), Focus::Pinned, "pinned focus stays put");
+    let pinned_after_prev = ctrl.view_state().pinned.expect("pin remains present");
+    assert_pinned_projection_eq(&pinned_after_prev, &pinned_before);
+    assert_eq!(ctrl.view_state().prompt, Some(pinned_search_status));
+}
+
+#[test]
+fn active_scroll_and_search_leave_the_pinned_interaction_unchanged() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::NavDown);
+    ctrl.handle(Intent::Expand);
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    let pinned_before = ctrl
+        .view_state()
+        .pinned
+        .expect("pinned interaction precondition");
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::NavDown);
+    ctrl.handle(Intent::Expand);
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(
+        ctrl.active_interaction().search.is_some(),
+        "precondition: active search committed"
+    );
+
+    let pinned_after = ctrl.view_state().pinned.expect("pin remains present");
+    assert_eq!(pinned_after.scroll, pinned_before.scroll);
+    assert_eq!(pinned_after.hscroll, pinned_before.hscroll);
+    match (&pinned_after.search, &pinned_before.search) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(actual.matches, expected.matches);
+            assert_eq!(actual.current, expected.current);
+        }
+        _ => panic!("active interaction changed pinned search presence"),
+    }
+    ctrl.handle(Intent::ToggleFocus);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    assert!(
+        ctrl.view_state()
+            .prompt
+            .as_deref()
+            .is_some_and(|status| status.contains("Search: needle (1/20)")),
+        "active search changes cannot replace the pinned query"
+    );
 }
 
 #[test]
