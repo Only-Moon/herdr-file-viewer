@@ -202,9 +202,27 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
     session
         .expect("Esc clear")
         .expect("the post-unpin search committed before dismissal and close");
-    session.send("q").expect("clear post-unpin active search");
+    // Esc is the unambiguous search-dismiss key. Use the help overlay as a redraw barrier before
+    // closing it and sending the actual quit key, rather than relying on a fixed sleep between two
+    // overloaded `q` presses. This also proves the prompt has released ownership of the next key.
+    session
+        .send("\x1b")
+        .expect("dismiss post-unpin active search");
+    // A bare ESC must be separated from the next byte or crossterm may decode the pair as Alt+?.
+    // This is an input framing gap, not a viewer-settling wait: the help marker below remains the
+    // deterministic barrier for the resulting redraw.
     std::thread::sleep(Duration::from_millis(150));
-
+    session
+        .send("?")
+        .expect("open a redraw barrier after search dismissal");
+    session
+        .expect("What's New")
+        .expect("search dismissal completed before the help overlay opened");
+    session.send("\t").expect("switch help sections");
+    session
+        .expect("Keybindings")
+        .expect("the help overlay redraw completed after search dismissal");
+    session.send("q").expect("dismiss the help overlay");
     session.send("q").expect("close the viewer");
     session.expect(Eof).expect("the journey exits cleanly");
     match session.get_process().wait().expect("reap journey viewer") {
