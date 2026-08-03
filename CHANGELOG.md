@@ -5,22 +5,22 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries are short on purpose; follow the
 `→` links for the full detail.
 
-## [Unreleased]
+## [1.15.0] - 2026-08-03
 
 ### Added
-- Advisory remote notices: release details and project spotlights in the status row and **What's New**; `u` dismisses the advisory status row for this session. Display-only. → [usage](docs/usage.md#staying-up-to-date)
 - Bundled `herdr-file-viewer` agent skill: agents can resolve a file, source location, or function definition and open it in a fresh Files pane. Includes safe target handling, an explicit user-confirmation prompt for proactive offers, and platform guidance. → [agent skill](skills/herdr-file-viewer/SKILL.md) · [usage](docs/usage.md#teach-your-agent)
 - `show_ignored`: show gitignored (and git-excluded) files at startup, exactly as if the `i` key had already been pressed once. `.git/` stays hidden regardless, and the `i` key still toggles the state during the session. Off by default. Thanks @leonfox28 for the suggestion (#119) → [configuration](docs/configuration.md)
-- `compact_dirs`: draw a chain of single-child directories as one row (`src/main/java/br/com` instead of six indented rows), in both the full tree and the changed-only view. Off by default; worth turning on when your paths are deeper than your pane is wide. → [configuration](docs/configuration.md) · [usage](docs/usage.md#the-tree)
-- `]` / `[` jump the tree cursor to the next / previous changed file, wrapping at the ends with a notice — `n`/`N` for the tree instead of arrowing past directory rows. Walks the set the tree is filtered by (working-tree status under `d`, else the baseline-aware set behind `c` / `b`) and expands a collapsed directory to reach a changed file inside it. → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
-- Page-wise scrolling: `Space` / `PageDown` move down one screenful and `PageUp` moves up one, paging the content pane when it is focused and the tree cursor otherwise. The step is the focused pane's live height, so it follows a resize and stays a screenful in the narrow single-column layout. `Space` follows the pager convention (`less`, `more`, `man`, and so `bat`); both are remappable as `page_down` / `page_up`. → [keys](docs/keys.md) · [configuration](docs/configuration.md#keybindings)
+- `compact_dirs`: draw a chain of single-child directories as one row (`src/main/java/br/com` instead of six indented rows), in both the full tree and the changed-only view. Off by default; worth turning on when your paths are deeper than your pane is wide. Thanks @Jprnp (#132) → [configuration](docs/configuration.md) · [usage](docs/usage.md#the-tree)
+- `]` / `[` jump the tree cursor to the next / previous changed file, wrapping at the ends with a notice — `n`/`N` for the tree instead of arrowing past directory rows. Walks the set the tree is filtered by (working-tree status under `d`, else the baseline-aware set behind `c` / `b`) and expands a collapsed directory to reach a changed file inside it. Thanks @Jprnp (#131) → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
+- Page-wise scrolling: `Space` / `PageDown` move down one screenful and `PageUp` moves up one, paging the content pane when it is focused and the tree cursor otherwise. The step is the focused pane's live height, so it follows a resize and stays a screenful in the narrow single-column layout. `Space` follows the pager convention (`less`, `more`, `man`, and so `bat`); both are remappable as `page_down` / `page_up`. Thanks @wasuregusa18 (#133) → [keys](docs/keys.md) · [configuration](docs/configuration.md#keybindings)
+
+### Changed
+- The `[keys]` configuration snippet in the docs is clearer. Thanks @petrusck (#120) → [configuration](docs/configuration.md#keybindings)
 
 ### Fixed
-- Windows: `config.toml` is read again. The Windows launchers spawn the viewer by absolute path (they cannot use the manifest's relative pane command), so the pane never received `HERDR_PLUGIN_CONFIG_DIR`; the viewer then fell back to `$XDG_CONFIG_HOME` / `$HOME`, which Windows does not set, resolved a relative path, and correctly refused to read it. Every key — `editor`, `tree_width`, `tree_max_cols`, the lot — was silently ignored. The launchers now pass the directory through, and a standalone run falls back to `%USERPROFILE%\.config\herdr-file-viewer\config.toml`. → [configuration](docs/configuration.md#file-location)
-
-- Tree rows now indent by depth alone. A file row reserved no space for the expand arrow, so a file sat two columns left of a directory at the same depth — putting every file in the exact column of its parent directory's name, and every top-level file two columns left of the directory beside it. Files now reserve the arrow's width, so siblings line up and a child always reads one level in from its parent. → [usage](docs/usage.md#the-tree)
-
-- **Windows only:** AltGr characters now trigger their bound actions; only `Ctrl+Alt` plus optional `Shift` on character keys is inferred as AltGr. → [keys](docs/keys.md)
+- Windows: `config.toml` is read again. The Windows launchers spawn the viewer by absolute path (they cannot use the manifest's relative pane command), so the pane never received `HERDR_PLUGIN_CONFIG_DIR`; the viewer then fell back to `$XDG_CONFIG_HOME` / `$HOME`, which Windows does not set, resolved a relative path, and correctly refused to read it. Every key — `editor`, `tree_width`, `tree_max_cols`, the lot — was silently ignored. The launchers now pass the directory through, and a standalone run falls back to `%USERPROFILE%\.config\herdr-file-viewer\config.toml`. Thanks @Jprnp (#129) → [configuration](docs/configuration.md#file-location)
+- Tree rows now indent by depth alone. A file row reserved no space for the expand arrow, so a file sat two columns left of a directory at the same depth — putting every file in the exact column of its parent directory's name, and every top-level file two columns left of the directory beside it. Files now reserve the arrow's width, so siblings line up and a child always reads one level in from its parent. Thanks @Jprnp (#130) → [usage](docs/usage.md#the-tree)
+- **Windows only:** AltGr characters now trigger their bound actions; only `Ctrl+Alt` plus optional `Shift` on character keys is inferred as AltGr. Thanks @Jprnp (#128) → [keys](docs/keys.md)
 
 ## [1.14.0] - 2026-07-20
 
