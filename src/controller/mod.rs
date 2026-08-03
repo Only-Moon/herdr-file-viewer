@@ -2315,20 +2315,30 @@ impl Controller {
     }
 
     fn scroll_pinned(&mut self, delta: isize) {
-        let (lines, wrap) = match self.pinned_document() {
-            Some(document) => (
-                document.content().lines.clone(),
-                document.presentation().wrap(),
-            ),
-            None => return,
-        };
+        let max = self.max_pinned_scroll();
         let Some(interaction) = self.pinned_interaction_mut() else {
             return;
         };
-        let max =
-            rendered_rows(interaction, &lines, wrap, 0).saturating_sub(interaction.viewport_height);
         interaction.vertical_scroll =
             (interaction.vertical_scroll as isize + delta).clamp(0, max as isize) as u16;
+    }
+
+    /// The frozen preview's largest valid vertical offset, computed only from its own immutable
+    /// document and independently measured viewport.
+    fn max_pinned_scroll(&self) -> u16 {
+        let Some(document) = self.pinned_document() else {
+            return 0;
+        };
+        let Some(interaction) = self.pinned_interaction() else {
+            return 0;
+        };
+        rendered_rows(
+            interaction,
+            &document.content().lines,
+            document.presentation().wrap(),
+            0,
+        )
+        .saturating_sub(interaction.viewport_height)
     }
 
     fn scroll_pinned_to_line(&mut self, line_1based: usize) {
@@ -2466,6 +2476,26 @@ impl Controller {
             .clamp(0, clamped.horizontal_scroll as i32)
             as u16;
         Effects::redraw()
+    }
+
+    /// The frozen preview's largest valid horizontal offset. Wrapping and viewport width belong
+    /// solely to the snapshot interaction state, so this cannot affect active horizontal scroll.
+    fn max_pinned_hscroll(&self) -> u16 {
+        let Some(document) = self.pinned_document() else {
+            return 0;
+        };
+        let Some(interaction) = self.pinned_interaction() else {
+            return 0;
+        };
+        let mut clamped = interaction.clone();
+        clamped.horizontal_scroll = u16::MAX;
+        clamp_offsets(
+            &mut clamped,
+            &document.content().lines,
+            document.presentation().wrap(),
+            0,
+        );
+        clamped.horizontal_scroll
     }
 
     /// The largest valid horizontal offset: the widest content line minus the viewport width.
@@ -3669,13 +3699,23 @@ pub(super) enum ClickOrigin {
 enum MouseRegion {
     TreeRow(usize),
     Content,
+    /// The frozen reference preview's text interior. Input here must never mutate the active
+    /// preview's interaction state.
+    Pinned,
     /// The content column's top-border title (filename). Double-click toggles zoom (#106).
     ContentTitle,
+    /// The pinned preview identity title. Unlike `ContentTitle`, it only focuses the reference
+    /// preview; active-only double-click behavior is unavailable from a pin.
+    PinnedTitle,
     Divider,
+    /// The divider between pinned and active previews (separate from the existing tree divider).
+    PreviewDivider,
     /// The content pane's vertical scrollbar — drag up/down to scroll.
     ContentVBar,
     /// The content pane's horizontal scrollbar — drag left/right to scroll.
     ContentHBar,
+    PinnedVBar,
+    PinnedHBar,
     /// The tree's vertical scrollbar — drag up/down to scrub the selection through the list.
     TreeVBar,
     /// The tree's horizontal scrollbar — drag left/right to scroll the tree sideways.
@@ -3689,8 +3729,11 @@ enum MouseRegion {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Drag {
     Divider,
+    PreviewDivider,
     ContentV,
     ContentH,
+    PinnedV,
+    PinnedH,
     TreeV,
     TreeH,
     /// Dragging the finder overlay's vertical scrollbar (handled in `handle_finder_mouse`).

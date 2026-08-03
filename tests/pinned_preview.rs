@@ -762,6 +762,176 @@ fn preview_resize_intents_are_inert_without_a_pin() {
 }
 
 #[test]
+fn mouse_routes_pinned_scroll_and_preview_divider_drag_without_touching_active() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.set_pane_geometry(PaneGeometry {
+        // This is the measured wide split layout: the tree ends before the preview area, and
+        // the pinned/active divider is inside that area. Mouse routing must use these live
+        // measurements rather than infer either boundary from the configured percentages.
+        preview_area_x: 40,
+        preview_area_width: 50,
+        preview_divider_x: Some(65),
+        pinned_inner: Some(Rect::new(40, 1, 8, 4)),
+        content_inner: Some(Rect::new(65, 1, 8, 4)),
+        ..PaneGeometry::default()
+    });
+
+    let active_before = ctrl.active_interaction().clone();
+    let pinned_before = ctrl.view_state().pinned.expect("pin is present");
+    let tree_split_before = ctrl.split_pct();
+
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 42,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollRight,
+        column: 42,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    let pinned_after_scroll = ctrl.view_state().pinned.expect("pin remains present");
+    assert!(pinned_after_scroll.scroll > pinned_before.scroll);
+    assert!(pinned_after_scroll.hscroll > pinned_before.hscroll);
+    assert_eq!(ctrl.active_interaction(), &active_before);
+
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 65,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 41,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 41,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_eq!(
+        ctrl.view_state().preview_split_pct,
+        20,
+        "dragging inside the measured preview area clamps its pinned share"
+    );
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 65,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 89,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 89,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(ctrl.view_state().preview_split_pct, 80);
+    assert_eq!(ctrl.split_pct(), tree_split_before);
+    assert_eq!(ctrl.active_interaction(), &active_before);
+}
+
+#[test]
+fn pinned_scrollbar_press_and_drag_preserve_the_active_selection() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.set_pane_geometry(PaneGeometry {
+        content_inner: Some(Rect::new(60, 1, 8, 4)),
+        ..PaneGeometry::default()
+    });
+
+    // Establish a standing active selection first. A pinned snapshot has no selection/copy path,
+    // so input directed at its scrollbars must not dismiss this active-pane selection.
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 61,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 65,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    ctrl.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 65,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    let selection_before = ctrl
+        .active_interaction()
+        .selection
+        .expect("the active drag establishes a standing selection");
+
+    ctrl.set_pane_geometry(PaneGeometry {
+        pinned_vbar: Some(Rect::new(40, 1, 1, 4)),
+        pinned_hbar: Some(Rect::new(41, 5, 8, 1)),
+        ..PaneGeometry::default()
+    });
+
+    for event in [
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 40,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 40,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 48,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 41,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 41,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    ] {
+        ctrl.handle_mouse(event);
+    }
+
+    assert_eq!(
+        ctrl.active_interaction().selection.as_ref(),
+        Some(&selection_before)
+    );
+}
+
+#[test]
 fn pinning_a_different_file_replaces_one_frozen_snapshot_without_rendering() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();

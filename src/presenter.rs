@@ -1346,7 +1346,23 @@ pub struct PaneGeometry {
     /// The content pane's in-pane scrollbar tracks (1-cell rects), present only when drawn.
     pub content_vbar: Option<Rect>,
     pub content_hbar: Option<Rect>,
+    /// The frozen pinned preview's text interior. Kept distinct from `content_inner`, which is
+    /// the active preview's established compatibility field.
+    pub pinned_inner: Option<Rect>,
+    /// Hit rect for the pinned preview's top-border identity title.
+    pub pinned_title_rect: Option<Rect>,
+    /// The pinned preview's in-pane scrollbar tracks, present only when that preview is drawn
+    /// and its displayed text overflows.
+    pub pinned_vbar: Option<Rect>,
+    pub pinned_hbar: Option<Rect>,
     pub divider_x: Option<u16>,
+    /// The entire adjacent pinned/active preview area. These measured bounds let the controller
+    /// map a preview-divider drag to a ratio without moving the tree/content divider.
+    pub preview_area_x: u16,
+    pub preview_area_width: u16,
+    /// The divider between the pinned (left) and active (right) preview rectangles. This is
+    /// distinct from `divider_x`, which remains the existing tree/content divider.
+    pub preview_divider_x: Option<u16>,
     /// The screen rect where finder result rows are drawn, `None` when the finder is closed or
     /// has no rows (empty query or zero matches). Used by the controller to map a mouse click to
     /// a result row index: `row - finder_rows.y + finder_scroll` gives the match list index.
@@ -1458,6 +1474,39 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
             None => (None, None, None),
         };
 
+    // A pinned preview uses the exact same block, notices, and scrollbar policy as the active
+    // preview, but its geometry must stay separate so mouse input cannot mutate active state.
+    let pinned_title_rect = layout.pinned.map(|rect| Rect {
+        x: rect.x.saturating_add(1),
+        y: rect.y,
+        width: rect.width.saturating_sub(2),
+        height: 1,
+    });
+    let (pinned_inner, pinned_vbar, pinned_hbar) = match (layout.pinned, state.pinned.as_ref()) {
+        (Some(rect), Some(pinned)) => {
+            let inner = content_block(pinned).inner(rect);
+            let (_notices, content_area) = content_notice_split(inner, notice_strip_len(pinned));
+            let (text, v, h) = content_bars(
+                content_area,
+                pinned.rows as usize,
+                content_max_line_width(&pinned.content),
+                pinned.wrap,
+            );
+            (Some(text), v, h)
+        }
+        _ => (None, None, None),
+    };
+    let (preview_area_x, preview_area_width) = match (layout.pinned, layout.active) {
+        (Some(pinned), Some(active)) => (
+            pinned.x,
+            active
+                .x
+                .saturating_add(active.width)
+                .saturating_sub(pinned.x),
+        ),
+        _ => (0, 0),
+    };
+
     // Finder: if the finder overlay is open, compute its layout with the same helper
     // `draw_finder_overlay` uses (same `area` = `frame.area()` = the full terminal rect),
     // so the hit-test geometry agrees with what is drawn.
@@ -1506,7 +1555,14 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         content_title_rect,
         content_vbar,
         content_hbar,
+        pinned_inner,
+        pinned_title_rect,
+        pinned_vbar,
+        pinned_hbar,
         divider_x,
+        preview_area_x,
+        preview_area_width,
+        preview_divider_x: layout.preview_divider.map(|divider| divider.x),
         finder_rows,
         finder_scroll,
         finder_max_hscroll,
