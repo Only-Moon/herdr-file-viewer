@@ -104,6 +104,9 @@ impl Controller {
         let Some(pin) = self.pinned_snapshot.as_mut() else {
             return;
         };
+        if width == pin.interaction.viewport_width && height == pin.interaction.viewport_height {
+            return; // unchanged — avoid re-walking the frozen document on every idle draw
+        }
         pin.interaction.viewport_width = width;
         pin.interaction.viewport_height = height;
         clamp_offsets(

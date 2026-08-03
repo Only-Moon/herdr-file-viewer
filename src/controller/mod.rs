@@ -2355,24 +2355,20 @@ impl Controller {
     }
 
     fn scroll_pinned_to_line(&mut self, line_1based: usize) {
-        let (lines, wrap) = match self.pinned_document() {
-            Some(document) => (
-                document.content().lines.clone(),
-                document.presentation().wrap(),
-            ),
-            None => return,
-        };
-        let Some(interaction) = self.pinned_interaction_mut() else {
+        let Some(pin) = self.pinned_snapshot.as_mut() else {
             return;
         };
+        let lines = &pin.document.content().lines;
+        let wrap = pin.document.presentation().wrap();
+        let interaction = &mut pin.interaction;
         let line = line_1based.max(1).min(lines.len().max(1));
         let offset = if wrap {
-            wrapped_rows_before(interaction, &lines, line - 1, 0)
+            wrapped_rows_before(interaction, lines, line - 1, 0)
         } else {
             line - 1
         };
         let max =
-            rendered_rows(interaction, &lines, wrap, 0).saturating_sub(interaction.viewport_height);
+            rendered_rows(interaction, lines, wrap, 0).saturating_sub(interaction.viewport_height);
         interaction.vertical_scroll = (offset.min(u16::MAX as usize) as u16).min(max);
     }
 
@@ -2472,22 +2468,15 @@ impl Controller {
     }
 
     fn scroll_pinned_h(&mut self, delta: i32) -> Effects {
-        let (lines, wrap) = match self.pinned_document() {
-            Some(document) => (
-                document.content().lines.clone(),
-                document.presentation().wrap(),
-            ),
-            None => return Effects::noop(),
-        };
+        if self.pinned_snapshot.is_none() {
+            return Effects::noop();
+        }
+        let max = self.max_pinned_hscroll() as i32;
         let Some(interaction) = self.pinned_interaction_mut() else {
             return Effects::noop();
         };
-        let mut clamped = interaction.clone();
-        clamped.horizontal_scroll = u16::MAX;
-        clamp_offsets(&mut clamped, &lines, wrap, 0);
-        interaction.horizontal_scroll = (interaction.horizontal_scroll as i32 + delta)
-            .clamp(0, clamped.horizontal_scroll as i32)
-            as u16;
+        interaction.horizontal_scroll =
+            (interaction.horizontal_scroll as i32 + delta).clamp(0, max) as u16;
         Effects::redraw()
     }
 
