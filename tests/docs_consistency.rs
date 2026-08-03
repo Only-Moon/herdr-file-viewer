@@ -20,6 +20,64 @@ const CONFIG_EXAMPLE: &str = include_str!("../config.example.toml");
 const USAGE_DOC: &str = include_str!("../docs/usage.md");
 const INSTALL_DOC: &str = include_str!("../docs/install.md");
 const SECURITY: &str = include_str!("../SECURITY.md");
+const AGENT_SKILL: &str = include_str!("../skills/herdr-file-viewer/SKILL.md");
+const OPEN_PANE_SCRIPT: &str = include_str!("../scripts/open-file-viewer.sh");
+const OPEN_TAB_SCRIPT: &str = include_str!("../scripts/open-file-viewer-tab.sh");
+
+/// The `--cwd` drift guard (#139).
+///
+/// `[[panes]].command` is relative, and herdr resolves it against `--cwd` — so a documented
+/// `plugin pane open ... --cwd ...` fails to spawn the viewer (or, inside a built plugin checkout,
+/// silently runs THAT checkout's binary). The shipped launchers never passed `--cwd`, so the docs
+/// and the working argv had diverged unnoticed until a user hit it. Every doc that teaches the
+/// launch is checked against the same rule the launchers follow, so this specific divergence fails
+/// the build instead of reaching an agent.
+#[test]
+fn no_documented_launch_passes_cwd_to_plugin_pane_open() {
+    // A launch block is any run of lines joined by trailing `\` continuations that mentions the
+    // plugin-pane-open verb; `--cwd` must not appear inside one.
+    fn launch_blocks(doc: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut current = String::new();
+        for line in doc.lines() {
+            let trimmed = line.trim_end();
+            current.push(' ');
+            current.push_str(trimmed.trim_end_matches('\\').trim());
+            if !trimmed.ends_with('\\') {
+                if current.contains("plugin pane open") {
+                    blocks.push(current.clone());
+                }
+                current.clear();
+            }
+        }
+        if current.contains("plugin pane open") {
+            blocks.push(current);
+        }
+        blocks
+    }
+
+    for (name, doc) in [
+        ("skills/herdr-file-viewer/SKILL.md", AGENT_SKILL),
+        ("docs/usage.md", USAGE_DOC),
+        ("scripts/open-file-viewer.sh", OPEN_PANE_SCRIPT),
+        ("scripts/open-file-viewer-tab.sh", OPEN_TAB_SCRIPT),
+    ] {
+        for block in launch_blocks(doc) {
+            assert!(
+                !block.contains("--cwd"),
+                "#139: {name} pairs `plugin pane open` with `--cwd`, which cannot spawn the \
+                 relative pane command. Set the root by launching from a focused pane whose cwd is \
+                 the target repository instead. Offending block: {block}"
+            );
+        }
+    }
+
+    // The guard is only meaningful while these docs actually teach the launch.
+    assert!(
+        AGENT_SKILL.contains("plugin pane open") && USAGE_DOC.contains("plugin pane open"),
+        "the agent skill and usage doc must still document the launch command"
+    );
+}
 
 /// Whether `example` has a commented-out TOML assignment for `key` (a line that, after its leading
 /// `#`, reads `key = ...`). Stronger than a bare substring: the key must appear as an actual
