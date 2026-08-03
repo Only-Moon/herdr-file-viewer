@@ -44,7 +44,9 @@ pub struct FlashLine {
 /// previews deliberately use the same value so their notices, scroll offsets, wrapping, search,
 /// and scrollbars cannot drift into separate drawing implementations.
 pub struct PreviewProjection {
-    pub content: Text<'static>,
+    /// Shared handle to the applied document's styled lines — a per-frame pointer bump, never a
+    /// deep copy of the content.
+    pub content: std::sync::Arc<Text<'static>>,
     pub notices: Vec<String>,
     pub flash: Option<FlashLine>,
     pub title: Option<String>,
@@ -65,7 +67,7 @@ impl PreviewProjection {
     pub fn new(title: impl Into<String>, content: Text<'static>) -> Self {
         let rows = content.lines.len().min(u16::MAX as usize) as u16;
         Self {
-            content,
+            content: std::sync::Arc::new(content),
             notices: Vec::new(),
             flash: None,
             title: Some(title.into()),
@@ -1203,8 +1205,9 @@ fn draw_content(
     } else if let Some(annotated) = annotated {
         ratatui::text::Text::from(annotated)
     } else {
-        // No ranges and no overlay: exactly main's pre-annotation path.
-        preview.content.clone()
+        // No ranges and no overlay: exactly main's pre-annotation path. `Paragraph` needs an
+        // owned `Text`, so this one draw-side copy remains; the projection handle stays shared.
+        (*preview.content).clone()
     };
     let mut content = Paragraph::new(content_text).scroll((preview.scroll, preview.hscroll));
     if preview.wrap {

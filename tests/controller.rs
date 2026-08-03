@@ -1521,7 +1521,10 @@ fn wrap_is_on_for_markdown_and_off_for_code() {
     std::fs::write(rs.path().join("a.rs"), "fn main() {}\n").unwrap();
     let (ctrl_rs, _, _) = controller(rs.path(), false, StubGit::default(), false);
     assert_eq!(ctrl_rs.selected_view_mode(), Some(ViewMode::SyntaxContent));
-    assert!(!ctrl_rs.view_state().active.wrap, "code content does not wrap");
+    assert!(
+        !ctrl_rs.view_state().active.wrap,
+        "code content does not wrap"
+    );
 }
 
 #[test]
@@ -1602,7 +1605,10 @@ fn wrap_toggle_forces_wrapping_on_for_code_then_back_to_the_mode_default() {
     std::fs::write(rs.path().join("a.rs"), "fn main() {}\n").unwrap();
     let (mut ctrl, _, _) = controller(rs.path(), false, StubGit::default(), false);
 
-    assert!(!ctrl.view_state().active.wrap, "code does not wrap by default");
+    assert!(
+        !ctrl.view_state().active.wrap,
+        "code does not wrap by default"
+    );
     let fx = ctrl.handle(Intent::ToggleWrap);
     assert!(fx.redraw);
     assert!(ctrl.view_state().active.wrap, "`w` forces wrap on for code");
@@ -1621,7 +1627,10 @@ fn w_toggles_markdown_between_the_fit_and_the_wide_unwrapped_view() {
     let md = TempDir::new();
     std::fs::write(md.path().join("a.md"), "# hi\n").unwrap();
     let (mut ctrl, _, _) = controller(md.path(), false, StubGit::default(), false);
-    assert!(ctrl.view_state().active.wrap, "markdown fits (wraps) by default");
+    assert!(
+        ctrl.view_state().active.wrap,
+        "markdown fits (wraps) by default"
+    );
 
     ctrl.handle(Intent::ToggleWrap);
     assert!(

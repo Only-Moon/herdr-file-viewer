@@ -69,7 +69,7 @@ impl Controller {
         let pin = self.pinned_snapshot.as_ref()?;
         let presentation = pin.document.presentation();
         Some(PreviewProjection {
-            content: pin.document.content().clone(),
+            content: pin.document.shared_content(),
             notices: pin.document.notices().to_vec(),
             flash: None,
             title: None,

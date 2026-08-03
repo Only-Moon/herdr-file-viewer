@@ -4,6 +4,7 @@ use crate::infile::SearchState;
 use crate::view_policy::ViewMode;
 use ratatui::text::Text;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The branch state captured with a preview origin.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -148,8 +149,9 @@ impl PreviewPresentation {
 /// document is safe to freeze as a pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewDocument {
-    /// Bounded, sanitized display content, including its renderer-provided styling.
-    content: Text<'static>,
+    /// Bounded, sanitized display content, including its renderer-provided styling. Shared, not
+    /// owned: projections and pins clone the handle, never the styled lines.
+    content: Arc<Text<'static>>,
     /// Notices specific to this rendered content, such as truncation or a renderer fallback.
     notices: Vec<String>,
     /// Source lines retained for source-mapped views; absent for transformed views.
@@ -170,7 +172,7 @@ impl PreviewDocument {
         origin: PreviewOrigin,
     ) -> Self {
         Self {
-            content,
+            content: Arc::new(content),
             notices,
             source,
             presentation,
@@ -181,6 +183,23 @@ impl PreviewDocument {
     /// Return the bounded, sanitized display content.
     pub fn content(&self) -> &Text<'static> {
         &self.content
+    }
+
+    /// Return a cheap shared handle to the display content, for per-frame projections.
+    pub fn shared_content(&self) -> Arc<Text<'static>> {
+        Arc::clone(&self.content)
+    }
+
+    /// A copy of this document under a different projection presentation, sharing the same
+    /// content. The document stays immutable; a presentation change never re-copies the lines.
+    pub fn with_presentation(&self, presentation: PreviewPresentation) -> Self {
+        Self {
+            content: Arc::clone(&self.content),
+            notices: self.notices.clone(),
+            source: self.source.clone(),
+            presentation,
+            origin: self.origin.clone(),
+        }
     }
 
     /// Return notices specific to this rendered content.
@@ -326,6 +345,7 @@ mod tests {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span, Text};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn origin(root: &str) -> PreviewOrigin {
         PreviewOrigin {
@@ -338,10 +358,10 @@ mod tests {
 
     fn document() -> PreviewDocument {
         PreviewDocument {
-            content: Text::from(Line::from(Span::styled(
+            content: Arc::new(Text::from(Line::from(Span::styled(
                 "pub fn run() {}",
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ))),
+            )))),
             notices: vec!["renderer fallback: plain text".into()],
             source: Some(vec!["pub fn run() {}".into()]),
             presentation: PreviewPresentation {
@@ -361,10 +381,10 @@ mod tests {
         assert_ne!(
             document,
             PreviewDocument {
-                content: Text::from(Line::from(Span::styled(
+                content: Arc::new(Text::from(Line::from(Span::styled(
                     "pub fn run() {}",
                     Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-                ))),
+                )))),
                 ..document.clone()
             },
             "styled display content is part of a frozen document"

@@ -972,7 +972,10 @@ fn drag_populates_char_selection_in_the_view() {
     ctrl.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 45, 2));
 
     let vs = ctrl.view_state();
-    let ls = vs.active.line_select.expect("line-select overlay is present");
+    let ls = vs
+        .active
+        .line_select
+        .expect("line-select overlay is present");
     let cs = ls
         .char_sel
         .expect("a mouse drag populates the character selection for the overlay");
@@ -1306,7 +1309,8 @@ fn ambient_drag_populates_content_selection_overlay() {
         "the L-mode overlay is not used for an ambient drag"
     );
     let cs = vs
-        .active.selection
+        .active
+        .selection
         .expect("the ambient selection overlay is populated");
     assert_eq!(
         (cs.start_line, cs.start_col, cs.end_line, cs.end_col),

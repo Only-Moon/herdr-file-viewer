@@ -369,17 +369,17 @@ enum EmptyReason {
 /// the later pin lifecycle to mistake guidance or an in-flight placeholder for a pinnable file.
 enum ActiveDisplay {
     Loading {
-        content: Text<'static>,
+        content: Arc<Text<'static>>,
         previous_title: Option<String>,
         previous_presentation: Option<PreviewPresentation>,
         previous_origin: Option<PreviewOrigin>,
     },
     Directory {
-        content: Text<'static>,
+        content: Arc<Text<'static>>,
         notices: Vec<String>,
         presentation: PreviewPresentation,
     },
-    EmptyTree(Text<'static>),
+    EmptyTree(Arc<Text<'static>>),
     Document(PreviewDocument),
 }
 
@@ -389,6 +389,15 @@ impl ActiveDisplay {
             Self::Loading { content, .. } | Self::EmptyTree(content) => content,
             Self::Directory { content, .. } => content,
             Self::Document(document) => document.content(),
+        }
+    }
+
+    /// A shared handle to the displayed content — what every per-frame projection clones.
+    fn shared_content(&self) -> Arc<Text<'static>> {
+        match self {
+            Self::Loading { content, .. } | Self::EmptyTree(content) => Arc::clone(content),
+            Self::Directory { content, .. } => Arc::clone(content),
+            Self::Document(document) => document.shared_content(),
         }
     }
 
@@ -433,13 +442,7 @@ impl ActiveDisplay {
         let Self::Document(document) = self else {
             return;
         };
-        *document = PreviewDocument::new(
-            document.content().clone(),
-            document.notices().to_vec(),
-            document.source().map(<[String]>::to_vec),
-            presentation,
-            document.origin().clone(),
-        );
+        *document = document.with_presentation(presentation);
     }
 
     fn displayed_origin(&self) -> Option<&PreviewOrigin> {
@@ -1050,7 +1053,7 @@ impl Controller {
             host_zoomed: false,
             changed: BTreeMap::new(),
             overrides: HashMap::new(),
-            active_display: ActiveDisplay::EmptyTree(Text::raw("")),
+            active_display: ActiveDisplay::EmptyTree(Arc::new(Text::raw(""))),
             action_notice: None,
             flash: None,
             annotations: AnnotationStore::new(),
@@ -1257,7 +1260,7 @@ impl Controller {
         self.overrides.clear();
         // The old root's rendered content is invalid under the new root. The dispatch below
         // installs a typed loading state until the new root's first document lands.
-        self.active_display = ActiveDisplay::EmptyTree(Text::raw(""));
+        self.active_display = ActiveDisplay::EmptyTree(Arc::new(Text::raw("")));
         let cleared_annotations = self.annotations.clear();
         self.action_notice = (cleared_annotations > 0).then(|| {
             format!(
@@ -1928,7 +1931,7 @@ impl Controller {
             nodes,
             selected,
             active: PreviewProjection {
-                content: self.content().clone(),
+                content: self.active_display.shared_content(),
                 notices: self.notices(),
                 flash: self.flash.as_ref().map(|f| crate::presenter::FlashLine {
                     text: f.text.clone(),
@@ -3479,7 +3482,7 @@ impl Controller {
             let previous_presentation = self.active_display.presentation().copied();
             let previous_origin = self.active_display.displayed_origin().cloned();
             self.active_display = ActiveDisplay::Loading {
-                content: Text::raw("Rendering\u{2026}"),
+                content: Arc::new(Text::raw("Rendering\u{2026}")),
                 previous_title,
                 previous_presentation,
                 previous_origin,
@@ -3494,11 +3497,11 @@ impl Controller {
     fn clear_content(&mut self, reason: EmptyReason) {
         self.active_display = match reason {
             EmptyReason::Directory => ActiveDisplay::Directory {
-                content: Text::raw(reason.label()),
+                content: Arc::new(Text::raw(reason.label())),
                 notices: Vec::new(),
                 presentation: PreviewPresentation::new(ViewMode::SyntaxContent, false, false),
             },
-            EmptyReason::NoFiles => ActiveDisplay::EmptyTree(Text::raw(reason.label())),
+            EmptyReason::NoFiles => ActiveDisplay::EmptyTree(Arc::new(Text::raw(reason.label()))),
         };
     }
 
@@ -3519,7 +3522,7 @@ impl Controller {
                 self.reflow_seq = None;
                 let display = if job.directory_diff {
                     ActiveDisplay::Directory {
-                        content: result.content,
+                        content: Arc::new(result.content),
                         notices: result.notices,
                         presentation: job.presentation,
                     }

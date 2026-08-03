@@ -1158,7 +1158,7 @@ fn pin_lifecycle_clones_the_settled_preview_and_toggles_the_same_identity() {
     assert!(ctrl.pin_active_preview().redraw);
     let pin = ctrl.view_state().pinned.expect("settled file is pinned");
     assert_eq!(
-        pin.content, active_content,
+        *pin.content, active_content,
         "styled displayed lines are frozen"
     );
     assert_eq!(

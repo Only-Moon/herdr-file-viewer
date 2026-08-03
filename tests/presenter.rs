@@ -477,7 +477,7 @@ fn content_pane_applies_the_vertical_scroll_offset() {
     // lines above it are scrolled off the top.
     let mut state = sample_state();
     state.active.notices = vec![]; // no notice strip, so content starts at the inner top row
-    state.active.content = to_text("c0\nc1\nc2\nc3\nc4\nc5\nc6\nc7\n");
+    state.active.content = std::sync::Arc::new(to_text("c0\nc1\nc2\nc3\nc4\nc5\nc6\nc7\n"));
     state.active.wrap = false;
     state.active.scroll = 3;
     let out = render(&state, 100, 12);
@@ -791,12 +791,12 @@ fn content_pane_shows_a_vertical_scrollbar_when_content_overflows() {
     // The tree (7 nodes) does NOT overflow a 12-row frame, so the only ▐ is the content scrollbar.
     let mut state = sample_state();
     state.active.notices = vec![];
-    state.active.content = to_text(
+    state.active.content = std::sync::Arc::new(to_text(
         &(0..60)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n"),
-    );
+    ));
     state.active.rows = 60; // the controller's rendered-row count drives the vertical bar
     let out = render(&state, 100, 12);
     assert!(
@@ -805,7 +805,7 @@ fn content_pane_shows_a_vertical_scrollbar_when_content_overflows() {
     );
 
     // A short file shows none.
-    state.active.content = to_text("only\ntwo\n");
+    state.active.content = std::sync::Arc::new(to_text("only\ntwo\n"));
     state.active.rows = 2;
     let short = render(&state, 100, 12);
     assert!(
@@ -822,7 +822,7 @@ fn content_vertical_scrollbar_is_driven_by_rendered_rows_not_raw_lines() {
     // raw line with a large content_rows shows a bar, and a small content_rows shows none.
     let mut state = sample_state();
     state.active.notices = vec![];
-    state.active.content = to_text(&"word ".repeat(400)); // ONE raw line
+    state.active.content = std::sync::Arc::new(to_text(&"word ".repeat(400))); // ONE raw line
     state.active.wrap = true;
 
     state.active.rows = 60; // wraps to ~60 rows >> the ~22-row viewport
@@ -903,12 +903,12 @@ fn content_vertical_scrollbar_thumb_reaches_the_bottom_at_max_scroll() {
     let mut state = sample_state();
     state.active.notices = vec![];
     // 60 lines into a 16-row text area → max scroll 44.
-    state.active.content = to_text(
+    state.active.content = std::sync::Arc::new(to_text(
         &(0..60)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n"),
-    );
+    ));
     state.active.wrap = false;
     state.active.rows = 60; // the rendered-row count drives the vertical bar
     let track = geometry(area, &state)
@@ -947,7 +947,7 @@ fn content_pane_shows_a_horizontal_scrollbar_for_a_too_wide_unwrapped_line() {
     // overflow, so no horizontal scrollbar is drawn.
     let mut state = sample_state();
     state.active.notices = vec![];
-    state.active.content = to_text(&"x".repeat(300)); // far wider than the ~58-col content pane
+    state.active.content = std::sync::Arc::new(to_text(&"x".repeat(300))); // far wider than the ~58-col content pane
 
     state.active.wrap = false;
     let unwrapped = render(&state, 100, 24);
@@ -1026,7 +1026,7 @@ fn wrapping_shows_more_of_a_long_line_than_truncating() {
     let long = "W ".repeat(80); // ~160 cols, far wider than the ~58-col content pane
     let mut state = sample_state();
     state.active.notices = vec![];
-    state.active.content = to_text(&long);
+    state.active.content = std::sync::Arc::new(to_text(&long));
 
     state.active.wrap = true;
     let wrapped = render(&state, 100, 12);
@@ -1162,7 +1162,7 @@ fn content_pane_applies_the_horizontal_scroll_offset() {
     // long line shows from column N onward.
     let mut state = sample_state();
     state.active.notices = vec![];
-    state.active.content = to_text("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    state.active.content = std::sync::Arc::new(to_text("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"));
     state.active.wrap = false;
     state.active.hscroll = 5;
     let out = render(&state, 100, 12);
@@ -2982,7 +2982,7 @@ fn search_state() -> ViewState {
     // Content: exactly three lines whose text is predictable byte-by-byte.
     // "fn main() {\n    println!(\"hello\");\n}\n"  (from sample_state, but override)
     // We use simple ASCII-only content so byte offsets are trivial.
-    st.active.content = to_text("fn main() {\n    println!;\n}\n");
+    st.active.content = std::sync::Arc::new(to_text("fn main() {\n    println!;\n}\n"));
     st.active.rows = 3;
     // match 0 = "main" on line 0, bytes 3..7
     // match 1 = "}" on line 2, bytes 0..1  → current (current = 1)
@@ -3141,7 +3141,9 @@ fn line_select_state(marker: usize, start: usize, end: usize) -> ViewState {
     let mut st = sample_state();
     st.active.notices = vec![];
     st.focus = Focus::Content;
-    st.active.content = to_text("line one\nline two\nline three\nline four\nline five\nline six\n");
+    st.active.content = std::sync::Arc::new(to_text(
+        "line one\nline two\nline three\nline four\nline five\nline six\n",
+    ));
     st.active.rows = 6;
     st.active.line_select = Some(LineSelectView {
         marker,
@@ -3180,7 +3182,9 @@ fn passive_range_highlight_has_no_caret_gutter() {
     let mut st = sample_state();
     st.active.notices = vec![];
     st.focus = Focus::Content;
-    st.active.content = to_text("line one\nline two\nline three\nline four\nline five\nline six\n");
+    st.active.content = std::sync::Arc::new(to_text(
+        "line one\nline two\nline three\nline four\nline five\nline six\n",
+    ));
     st.active.rows = 6;
     st.active.line_select = Some(LineSelectView {
         marker: 2,
@@ -3291,7 +3295,7 @@ fn ambient_selection_highlights_only_selected_chars_without_shifting_content() {
     let mut st = sample_state();
     st.active.notices = vec![];
     st.focus = Focus::Content;
-    st.active.content = to_text("line one\nline two\nline three\n");
+    st.active.content = std::sync::Arc::new(to_text("line one\nline two\nline three\n"));
     st.active.rows = 3;
     st.active.selection = Some(CharSelView {
         start_line: 1,
@@ -3725,7 +3729,7 @@ fn selecting_a_directory_shows_empty_state_guidance_not_a_blank_pane() {
     let mut state = sample_state();
     // Select the directory row (index 0 = /r/src).
     state.selected = 0;
-    state.active.content = to_text("Directory: select a file to view");
+    state.active.content = std::sync::Arc::new(to_text("Directory: select a file to view"));
     state.active.notices.clear();
     // a directory selection has no displayed file content, so the title falls back to
     // the selected node's name (the directory). Mirrors the controller's `clear_content`.
@@ -3745,7 +3749,7 @@ fn an_empty_tree_shows_empty_state_guidance_not_a_blank_pane() {
     let mut state = sample_state();
     state.nodes = vec![]; // empty tree
     state.selected = 0;
-    state.active.content = to_text("No files");
+    state.active.content = std::sync::Arc::new(to_text("No files"));
     state.active.notices.clear();
     // no file content displayed → title falls back to "Content" (no selected node).
     state.active.title = None;
@@ -3762,7 +3766,7 @@ fn empty_state_directory_snapshot() {
     // Snapshot the directory-selected empty state so the layout + the guidance are locked.
     let mut state = sample_state();
     state.selected = 0; // the /r/src directory
-    state.active.content = to_text("Directory: select a file to view");
+    state.active.content = std::sync::Arc::new(to_text("Directory: select a file to view"));
     state.active.notices.clear();
     // directory selected → no file content → title falls back to the directory's name.
     state.active.title = None;
@@ -3776,7 +3780,7 @@ fn empty_state_no_files_snapshot() {
     let mut state = sample_state();
     state.nodes = vec![];
     state.selected = 0;
-    state.active.content = to_text("No files");
+    state.active.content = std::sync::Arc::new(to_text("No files"));
     state.active.notices.clear();
     // no file content displayed → title falls back to "Content" (no selected node).
     state.active.title = None;
@@ -3796,7 +3800,7 @@ fn loading_state_snapshot_while_a_render_is_in_flight() {
     // The cursor has moved to README.md (index 4) but its render hasn't landed — the body is the
     // placeholder and `content_title` is `None` (no content has landed at all yet, e.g. launch).
     state.selected = 4; // README.md
-    state.active.content = to_text("Rendering\u{2026}");
+    state.active.content = std::sync::Arc::new(to_text("Rendering\u{2026}"));
     state.active.notices.clear();
     state.active.title = None;
     state.active.rendering = true;
@@ -3814,7 +3818,7 @@ fn annotation_content_state(
     state.zoomed = true;
     state.focus = Focus::Content;
     state.active.rows = lines.len().min(u16::MAX as usize) as u16;
-    state.active.content = ratatui::text::Text::from(lines);
+    state.active.content = std::sync::Arc::new(ratatui::text::Text::from(lines));
     state.annotation_indicators.displayed_file_annotated = true;
     state.annotation_indicators.displayed_line_ranges = ranges;
     state
