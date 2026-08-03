@@ -1949,29 +1949,18 @@ impl Controller {
                         matches: s.matches.clone(),
                         current: s.current,
                     }),
-                line_select: line_select.clone(),
-                selection: selection.clone(),
+                line_select,
+                selection,
                 origin: None,
             },
             pinned: self.pinned_projection(),
-            content: self.content().clone(),
-            notices: self.notices(),
-            flash: self.flash.as_ref().map(|f| crate::presenter::FlashLine {
-                text: f.text.clone(),
-                dim: f.dim,
-            }),
             focus: self.focus,
             width: self.width,
-            content_scroll: self.active_interaction.vertical_scroll,
-            content_hscroll: self.active_interaction.horizontal_scroll,
             // Last frame's tree offset, so the Presenter scrolls minimally from it (#45): selecting
             // a row already in view — e.g. a mouse click — never jumps the viewport.
             tree_scroll: self.geom.tree_scroll,
             tree_hscroll: self.tree_hscroll,
             preview_split_pct: self.preview_split_pct,
-            content_rows,
-            wrap,
-            content_pad_left,
             split_pct: self.split_pct,
             tree_position: self.tree_position,
             tree_max_cols: self.tree_max_cols,
@@ -1995,18 +1984,6 @@ impl Controller {
                 .unwrap_or_default(),
             branch: self.current_branch.clone(),
             prompt: self.bottom_line(),
-            content_title: self.active_display.title(),
-            content_rendering: self.active_display.is_loading(),
-            search: self
-                .active_interaction
-                .search
-                .as_ref()
-                .map(|s| ContentSearch {
-                    matches: s.matches.clone(),
-                    current: s.current,
-                }),
-            line_select,
-            content_selection: selection,
             help: self.help_view(),
         }
     }

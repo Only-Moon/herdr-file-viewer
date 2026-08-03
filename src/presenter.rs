@@ -103,20 +103,12 @@ pub struct ViewState {
     pub active: PreviewProjection,
     /// A frozen preview when a pin exists. `None` keeps the no-pin layout byte-for-byte unchanged.
     pub pinned: Option<PreviewProjection>,
-    /// Compatibility aliases for active-preview consumers outside this task. The Presenter draws
-    /// only [`active`](Self::active); controller construction keeps these synchronized until those
-    /// callers migrate to the projection.
-    pub content: Text<'static>,
-    pub notices: Vec<String>,
-    pub flash: Option<FlashLine>,
     /// Which column has focus.
     pub focus: Focus,
     /// The pane width the controller last observed (session state — e.g. for tracking the
     /// narrow-split flag). The Presenter lays out from the live frame width, not this, so
     /// the two can never disagree; it is carried for the controller's own use.
     pub width: u16,
-    pub content_scroll: u16,
-    pub content_hscroll: u16,
     /// The tree's vertical scroll offset from the LAST drawn frame (first visible node index),
     /// carried back via [`PaneGeometry::tree_scroll`]. The Presenter scrolls *minimally* from it
     /// so selecting a row already in view (e.g. a mouse click) never jumps the viewport (#45). `0`
@@ -130,9 +122,6 @@ pub struct ViewState {
     pub tree_hscroll: u16,
     /// The pinned preview's share of the preview area (20–80). Ignored while no pin exists.
     pub preview_split_pct: u16,
-    pub content_rows: u16,
-    pub wrap: bool,
-    pub content_pad_left: bool,
     /// The tree column's share of the width, as a percentage (the content pane takes the
     /// rest). Adjustable from the keyboard; used only in the wide two-column layout.
     pub split_pct: u16,
@@ -184,11 +173,6 @@ pub struct ViewState {
     /// border. `None` outside a git repo or on a detached HEAD — in which case the bottom title is
     /// omitted entirely rather than showing a blank/placeholder branch (degrade gracefully).
     pub branch: Option<String>,
-    pub content_title: Option<String>,
-    pub content_rendering: bool,
-    pub search: Option<ContentSearch>,
-    pub line_select: Option<LineSelectView>,
-    pub content_selection: Option<CharSelView>,
     /// When `Some`, the in-app help overlay is drawn on top of everything else (AC-1, AC-5).
     /// `None` ⇒ no overlay. Drawn last in [`draw`] so it sits above the picker and finder.
     pub help: Option<HelpView>,

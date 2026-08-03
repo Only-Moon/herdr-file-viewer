@@ -76,19 +76,11 @@ fn sample_state() -> ViewState {
         selected: 1, // main.rs
         active,
         pinned: None,
-        content: to_text(""),
-        notices: Vec::new(),
-        flash: None,
         focus: Focus::Tree,
         width: 100,
-        content_scroll: 0,
-        content_hscroll: 0,
         tree_scroll: 0,
         tree_hscroll: 0,
         preview_split_pct: 50,
-        content_rows: 0,
-        wrap: false,
-        content_pad_left: false,
         split_pct: 40,
         tree_position: herdr_file_viewer::config::TreePosition::Left,
         // A high cap so the percentage governs in these fixtures (the cap only bites on very wide
@@ -107,11 +99,6 @@ fn sample_state() -> ViewState {
         root_name: "r".to_string(), // the fixture tree is rooted at /r
         branch: None,
         prompt: None,
-        content_title: None,
-        content_rendering: false,
-        search: None,
-        line_select: None,
-        content_selection: None,
         help: None,
     }
 }

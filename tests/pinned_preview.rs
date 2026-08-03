@@ -673,7 +673,7 @@ fn pinned_unavailable_actions_are_consumed_with_a_notice() {
         );
         assert_eq!(
             ctrl.active_interaction().vertical_scroll,
-            before.content_scroll
+            before.active.scroll
         );
         assert_eq!(editor_calls.load(Ordering::SeqCst), 0, "{intent:?}");
         assert_eq!(opener_calls.load(Ordering::SeqCst), 0, "{intent:?}");
@@ -976,7 +976,7 @@ fn unpinned_navigation_projects_the_existing_active_interaction() {
     });
 
     assert_eq!(ctrl.active_interaction().vertical_scroll, 0);
-    assert_eq!(ctrl.view_state().content_scroll, 0);
+    assert_eq!(ctrl.view_state().active.scroll, 0);
     assert_eq!(ctrl.active_interaction().horizontal_scroll, 0);
     assert_eq!(
         ctrl.search().map(|search| search.query.as_str()),
@@ -984,13 +984,14 @@ fn unpinned_navigation_projects_the_existing_active_interaction() {
     );
     assert_eq!(
         ctrl.view_state()
+            .active
             .search
             .as_ref()
             .map(|search| search.matches.len()),
         Some(20)
     );
     assert!(ctrl.active_interaction().selection.is_some());
-    assert!(ctrl.view_state().content_selection.is_some());
+    assert!(ctrl.view_state().active.selection.is_some());
 }
 
 #[test]
@@ -1011,8 +1012,8 @@ fn layout_only_wrap_toggle_keeps_the_active_document_presentation_in_sync() {
         settled,
         PreviewPresentation::new(
             settled.view_mode(),
-            projected.wrap,
-            projected.content_pad_left,
+            projected.active.wrap,
+            projected.active.pad_left,
         )
     );
 }

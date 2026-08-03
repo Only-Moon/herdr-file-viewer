@@ -544,7 +544,7 @@ fn a_slow_render_shows_a_loading_placeholder_and_switches_title_with_body() {
     }
     // Precondition: a.rs is the displayed file — its name is the content title.
     assert_eq!(
-        ctrl.view_state().content_title.as_deref(),
+        ctrl.view_state().active.title.as_deref(),
         Some("a.rs"),
         "precondition: a.rs content landed, title is a.rs"
     );
@@ -573,7 +573,7 @@ fn a_slow_render_shows_a_loading_placeholder_and_switches_title_with_body() {
     // (b) The title has NOT jumped to b.rs ahead of its body — it still names the displayed
     //     content's file (a.rs).
     assert_eq!(
-        ctrl.view_state().content_title.as_deref(),
+        ctrl.view_state().active.title.as_deref(),
         Some("a.rs"),
         "the content title does not update ahead of the body — it stays on the displayed file \
          (a.rs) until b.rs's render lands"
@@ -597,7 +597,7 @@ fn a_slow_render_shows_a_loading_placeholder_and_switches_title_with_body() {
         "the selected file's rendered content arrived"
     );
     assert_eq!(
-        ctrl.view_state().content_title.as_deref(),
+        ctrl.view_state().active.title.as_deref(),
         Some("b.rs"),
         "the title switched to b.rs together with its body"
     );
@@ -643,7 +643,7 @@ fn the_left_gap_follows_the_displayed_file_not_the_selection_during_a_slow_rende
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
-        !ctrl.view_state().content_pad_left,
+        !ctrl.view_state().active.pad_left,
         "precondition: the displayed code file has no gap"
     );
 
@@ -656,7 +656,7 @@ fn the_left_gap_follows_the_displayed_file_not_the_selection_during_a_slow_rende
         "precondition: b.md's render is in flight"
     );
     assert!(
-        !ctrl.view_state().content_pad_left,
+        !ctrl.view_state().active.pad_left,
         "the gap does not flip on ahead of the body — it tracks the displayed a.rs, not selected b.md"
     );
 
@@ -671,7 +671,7 @@ fn the_left_gap_follows_the_displayed_file_not_the_selection_during_a_slow_rende
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
-        ctrl.view_state().content_pad_left,
+        ctrl.view_state().active.pad_left,
         "once the markdown body lands, the gap is on"
     );
 }

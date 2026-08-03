@@ -39,19 +39,11 @@ fn state(width: u16, focus: Focus) -> ViewState {
         selected: 1,
         active,
         pinned: None,
-        content: to_text(""),
-        notices: Vec::new(),
-        flash: None,
         focus,
         width,
-        content_scroll: 0,
-        content_hscroll: 0,
         tree_scroll: 0,
         tree_hscroll: 0,
         preview_split_pct: 50,
-        content_rows: 0,
-        wrap: false,
-        content_pad_left: false,
         split_pct: 40,
         tree_position: herdr_file_viewer::config::TreePosition::Left,
         tree_max_cols: 1000, // high cap: percentage governs (narrow-layout tests ignore it anyway)
@@ -68,11 +60,6 @@ fn state(width: u16, focus: Focus) -> ViewState {
         root_name: "r".to_string(), // the fixture tree is rooted at /r
         branch: None,
         prompt: None,
-        content_title: None,
-        content_rendering: false,
-        search: None,
-        line_select: None,
-        content_selection: None,
         help: None,
     }
 }
