@@ -20,6 +20,7 @@ const CONFIG_EXAMPLE: &str = include_str!("../config.example.toml");
 const USAGE_DOC: &str = include_str!("../docs/usage.md");
 const INSTALL_DOC: &str = include_str!("../docs/install.md");
 const SECURITY: &str = include_str!("../SECURITY.md");
+const ARCHITECTURE: &str = include_str!("../ARCHITECTURE.md");
 
 /// Whether `example` has a commented-out TOML assignment for `key` (a line that, after its leading
 /// `#`, reads `key = ...`). Stronger than a bare substring: the key must appear as an actual
@@ -389,5 +390,64 @@ fn changelog_documents_line_reference_release() {
         section.to_lowercase().contains("line reference")
             || section.to_lowercase().contains("line-select"),
         "the `## [1.9.0]` `### Added` block must document the copy-line-reference feature"
+    );
+}
+
+#[test]
+fn pinned_preview_docs_cover_the_frozen_reference_contract() {
+    // AC-40: pinning is deliberately more than a `p` row. Its session lifetime, captured origin,
+    // focus routing, independent interaction state, narrow-layout floor, and read-only boundary
+    // must stay discoverable across the feature guide, key/config reference, architecture map, and
+    // Unreleased changelog entry.
+    for phrase in [
+        "## Pinned previews",
+        "frozen in-memory snapshot",
+        "captured origin",
+        "survives a worktree switch",
+        "tree → pinned preview → active preview → tree",
+        "scroll positions and searches are independent",
+        "unavailable from the pinned preview",
+        "captured repo-relative path",
+        "captured absolute path",
+        "40-column floor",
+        "preview divider",
+        "{` / `}`",
+        "drag the preview divider",
+    ] {
+        assert!(
+            USAGE_DOC.contains(phrase),
+            "docs/usage.md must document pinned-preview contract detail: {phrase:?}"
+        );
+    }
+
+    for phrase in ["`p`", "`{` / `}`", "Shift", "AltGr", "preview divider"] {
+        assert!(
+            KEYS_DOC.contains(phrase),
+            "docs/keys.md must document pinned-preview key detail: {phrase:?}"
+        );
+    }
+    for phrase in [
+        "pin_preview",
+        "shrink_preview",
+        "grow_preview",
+        "Shift",
+        "AltGr",
+    ] {
+        assert!(
+            CONFIG_DOC.contains(phrase),
+            "docs/configuration.md must document pinned-preview remapping detail: {phrase:?}"
+        );
+    }
+    for module in ["`preview`", "`preview_layout`", "`focus_policy`"] {
+        assert!(
+            ARCHITECTURE.contains(module),
+            "ARCHITECTURE.md must map the pinned-preview module: {module}"
+        );
+    }
+
+    let unreleased = section(CHANGELOG, "## [Unreleased]", "\n## [");
+    assert!(
+        unreleased.contains("Pinned preview"),
+        "CHANGELOG.md must include the pinned-preview feature in Unreleased"
     );
 }

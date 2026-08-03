@@ -246,6 +246,12 @@ rebound away, so you can never strand yourself (you may still move the `q` Close
 action). Only the global keys are remappable; keys handled inside a modal (including line-select
 and the annotation editor/overview) keep their fixed keys.
 
+Shifted characters are distinct bindings, so `p`, `{`, and `}` are valid values for `pin_preview`,
+`shrink_preview`, and `grow_preview` respectively; the latter two resize the pinned preview's share
+at the preview divider. On Windows, AltGr typing continues to reach whichever character binding you
+configure (including a shifted character), rather than being treated as a `Ctrl`/`Alt` shortcut; see
+the [AltGr note](keys.md#keys) for the platform-specific input details.
+
 See your bindings in effect any time in the `?` help overlay's **Keybindings** section. It groups
 the actions into sections and shows, for each, its config-var name (the `[keys]` id you type to
 remap it), its effective key(s), and its description, marking the ones you have customized. The full
