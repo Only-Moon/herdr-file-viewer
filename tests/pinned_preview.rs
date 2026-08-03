@@ -489,6 +489,96 @@ fn pinned_search_cancel_restores_its_saved_scroll_and_clears_the_search() {
 }
 
 #[test]
+fn close_from_pinned_focus_dismisses_the_visible_active_search_before_quitting() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "place".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(
+        ctrl.view_state().active.search.is_some(),
+        "precondition: a committed active search is highlighted"
+    );
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+
+    let fx = ctrl.handle(Intent::Close);
+    assert!(
+        !fx.quit,
+        "the first close dismisses the still-visible active search instead of quitting"
+    );
+    assert!(
+        ctrl.view_state().active.search.is_none(),
+        "the visible active search was dismissed from pinned focus"
+    );
+    assert_eq!(ctrl.focus(), Focus::Pinned, "dismissal does not move focus");
+    assert!(
+        ctrl.view_state().pinned.is_some(),
+        "dismissal does not unpin"
+    );
+
+    let fx = ctrl.handle(Intent::Close);
+    assert!(fx.quit, "with no search left, close quits");
+}
+
+#[test]
+fn close_from_pinned_focus_quits_past_a_hidden_active_search() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "place".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    // The narrow fallback draws only the focused pinned region; the hidden active pane reports
+    // a zero viewport. Its highlights are off screen, so close must not burn a keypress on them.
+    ctrl.set_preview_viewports(PreviewViewports {
+        active: (0, 0),
+        pinned: Some((8, 4)),
+    });
+
+    let fx = ctrl.handle(Intent::Close);
+    assert!(fx.quit, "no visible search stands between close and quit");
+    assert!(
+        ctrl.active_interaction().search.is_some(),
+        "the hidden active search was not consumed on the way out"
+    );
+}
+
+#[test]
+fn close_from_active_focus_dismisses_the_visible_pinned_search_before_quitting() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "place".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+
+    let fx = ctrl.handle(Intent::Close);
+    assert!(
+        !fx.quit,
+        "the first close dismisses the still-visible pinned search instead of quitting"
+    );
+    assert!(
+        ctrl.view_state()
+            .pinned
+            .expect("pin remains present")
+            .search
+            .is_none(),
+        "the visible pinned search was dismissed from active focus"
+    );
+
+    let fx = ctrl.handle(Intent::Close);
+    assert!(fx.quit, "with no search left, close quits");
+}
+
+#[test]
 fn pinned_scroll_search_and_paging_do_not_touch_active_interaction() {
     let (_dir, mut ctrl) = pin_ready_controller();
     ctrl.handle(Intent::ToggleFocus);

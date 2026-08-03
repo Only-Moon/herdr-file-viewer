@@ -2950,7 +2950,7 @@ impl Controller {
         }
         // A committed search (prompt closed, highlights persisting) is dismissed first — Esc/q
         // "come out of the search" before they unzoom or close (layered like unzoom). (owner UX)
-        if !self.prompt_open() && self.clear_focused_search() {
+        if !self.prompt_open() && self.clear_visible_search() {
             return Effects::redraw();
         }
         if self.zoomed {
@@ -2983,6 +2983,29 @@ impl Controller {
                 .pinned_interaction_mut()
                 .and_then(|interaction| interaction.search.take())
                 .is_some(),
+        }
+    }
+
+    /// The close layer's search dismissal: the focused preview's search first, then the *other*
+    /// preview's — but only while that pane is on screen. Esc/q must never quit past highlights
+    /// the user can still see, while a hidden pane's stale search must not demand an extra
+    /// keypress that visibly changes nothing. "On screen" is the zero-viewport hidden-pane
+    /// convention both previews maintain.
+    fn clear_visible_search(&mut self) -> bool {
+        if self.clear_focused_search() {
+            return true;
+        }
+        match self.focus_preview_target() {
+            PreviewTarget::Active => self
+                .pinned_snapshot
+                .as_mut()
+                .filter(|pin| pin.interaction.viewport_width > 0)
+                .and_then(|pin| pin.interaction.search.take())
+                .is_some(),
+            PreviewTarget::Pinned => {
+                self.active_interaction.viewport_width > 0
+                    && self.active_interaction.search.take().is_some()
+            }
         }
     }
 
