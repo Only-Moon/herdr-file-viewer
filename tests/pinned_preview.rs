@@ -316,7 +316,6 @@ fn pinned_unavailable_actions_are_consumed_with_a_notice() {
         Intent::Activate,
         Intent::OpenFullscreen,
         Intent::OpenGoToLine,
-        Intent::TreeScrollRight,
         Intent::OpenInEditor,
         Intent::OpenWithApp,
         Intent::RevealInFileManager,
@@ -347,6 +346,27 @@ fn pinned_unavailable_actions_are_consumed_with_a_notice() {
         assert_eq!(opener_calls.load(Ordering::SeqCst), 0, "{intent:?}");
         assert!(copied.lock().unwrap().is_empty(), "{intent:?}");
     }
+}
+
+#[test]
+fn tree_scroll_right_is_inert_from_pinned_focus() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+
+    let before = ctrl.view_state().pinned.expect("pin stays projected");
+    assert_eq!(ctrl.action_notice(), None);
+    let effects = ctrl.handle(Intent::TreeScrollRight);
+
+    assert!(
+        !effects.redraw && !effects.quit && !effects.clear,
+        "pinned L is inert rather than a rejected action"
+    );
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    assert_eq!(ctrl.action_notice(), None);
+    let after = ctrl.view_state().pinned.expect("pin stays projected");
+    assert_eq!(after.scroll, before.scroll);
+    assert_eq!(after.hscroll, before.hscroll);
 }
 
 #[test]

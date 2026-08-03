@@ -2198,7 +2198,9 @@ impl Controller {
                         Effects::redraw()
                     }
                 }
-                Focus::Pinned => unreachable!("pinned focus is rejected by focus policy"),
+                // Keep this inert if the focus policy changes. The pin has neither a tree row
+                // nor a line-select action, so this key must never abort the viewer.
+                Focus::Pinned => Effects::noop(),
             },
             Intent::ShowHelp => self.open_help(),
             Intent::Close => self.close_or_unzoom(),
