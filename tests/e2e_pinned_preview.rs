@@ -152,9 +152,10 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
         .expect("main active preview returned to the pin's original file");
     session.send("p").expect("unpin the same active file");
     // With the pin gone, focus must cycle Content -> Tree -> active (not Content -> Tree ->
-    // retained pinned preview). Use the keyboard finder to select a distinct file, then search
-    // it: `(1/1)` is possible only when the second Tab targets the active preview, because the
-    // former pin lacks this marker.
+    // retained pinned preview). The narrow PTY may have no active-content column, so use the
+    // finder to make the newly selected target visible. "UNPIN" uniquely selects
+    // UNPIN_TARGET.txt in the current main worktree. `(1/1)` below is possible only when the
+    // second Tab targets the active preview, because the former pin lacks this marker.
     session.send("\t").expect("focus tree after unpinning");
     session
         .send("f")
@@ -176,11 +177,6 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
     session
         .expect("UNPIN_ACTIVE_SEARCH_MARKER")
         .expect("the tree selection updated the active preview after unpinning");
-    // In the narrow test PTY the finder may temporarily zoom this newly revealed preview. Leave
-    // that temporary zoom so the next Tab observes the ordinary unpinned focus cycle.
-    session
-        .send("z")
-        .expect("leave any finder-opened zoom before checking the unpinned focus cycle");
     session
         .send("\t")
         .expect("focus the sole active preview after unpinning");
@@ -202,28 +198,18 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
     session
         .expect("Esc clear")
         .expect("the post-unpin search committed before dismissal and close");
-    // Esc is the unambiguous search-dismiss key. Use the help overlay as a redraw barrier before
-    // closing it and sending the actual quit key, rather than relying on a fixed sleep between two
-    // overloaded `q` presses. This also proves the prompt has released ownership of the next key.
     session
         .send("\x1b")
         .expect("dismiss post-unpin active search");
-    // A bare ESC must be separated from the next byte or crossterm may decode the pair as Alt+?.
-    // This is an input framing gap, not a viewer-settling wait: the help marker below remains the
-    // deterministic barrier for the resulting redraw.
+    // A bare ESC must be separated from the next byte or crossterm may decode the pair as Alt+q.
+    // This is input framing, not a viewer-settling wait.
     std::thread::sleep(Duration::from_millis(150));
+    // Send both close keys in one write. In the ordinary unzoomed journey the first quits and the
+    // queued second byte is discarded; if a zoom-state perturbation is added above, the first
+    // peels zoom and the second quits. Neither case relies on an unreliable runtime state probe.
     session
-        .send("?")
-        .expect("open a redraw barrier after search dismissal");
-    session
-        .expect("What's New")
-        .expect("search dismissal completed before the help overlay opened");
-    session.send("\t").expect("switch help sections");
-    session
-        .expect("Keybindings")
-        .expect("the help overlay redraw completed after search dismissal");
-    session.send("q").expect("dismiss the help overlay");
-    session.send("q").expect("close the viewer");
+        .send("qq")
+        .expect("close the viewer regardless of the zoom layer");
     session.expect(Eof).expect("the journey exits cleanly");
     match session.get_process().wait().expect("reap journey viewer") {
         WaitStatus::Exited(_, 0) => {}
