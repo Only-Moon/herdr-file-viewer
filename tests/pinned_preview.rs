@@ -309,10 +309,27 @@ fn assert_pinned_projection_eq(actual: &PreviewProjection, expected: &PreviewPro
     }
 }
 
-fn assert_provider_call_count_stays(calls: &AtomicUsize, expected: usize) {
+/// Assert no render was dispatched, deterministically.
+///
+/// The provider counter alone cannot prove this: `dispatch_render` runs the provider on a spawned
+/// thread, so reading the counter immediately can race a real dispatch and pass, and sleeping to
+/// wait for it makes the negative wall-clock-dependent (this file was previously bitten by exactly
+/// that). `Controller::render_seq` is bumped SYNCHRONOUSLY inside `dispatch_render` before the
+/// worker is spawned, so an unchanged seq is a race-free proof; the counter then corroborates it.
+fn assert_no_render_dispatched(
+    ctrl: &Controller,
+    calls: &AtomicUsize,
+    expected_calls: usize,
+    seq_before: u64,
+) {
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "dispatch_render bumps the render seq synchronously: no render must have been dispatched"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        expected,
+        expected_calls,
         "pinning is synchronous state copying and must not dispatch content rendering"
     );
 }
@@ -940,6 +957,7 @@ fn no_pin_navigation_does_not_add_content_provider_work() {
         content_inner: Some(Rect::new(0, 0, 40, 5)),
         ..Default::default()
     });
+    let seq_before = ctrl.render_seq();
     ctrl.handle(Intent::ToggleFocus);
     ctrl.handle(Intent::NavDown);
     ctrl.handle(Intent::OpenSearch);
@@ -950,7 +968,7 @@ fn no_pin_navigation_does_not_add_content_provider_work() {
     ctrl.handle(Intent::NextMatch);
     ctrl.handle(Intent::PrevMatch);
 
-    assert_provider_call_count_stays(&calls, 1);
+    assert_no_render_dispatched(&ctrl, &calls, 1, seq_before);
 }
 
 #[test]
@@ -1379,9 +1397,13 @@ fn pinning_a_different_file_replaces_one_frozen_snapshot_without_rendering() {
     let frozen = ctrl.view_state().pinned.expect("navigation keeps the pin");
     assert_eq!(frozen.origin.as_ref(), Some(&first));
 
+    // Scroll the active preview off the top first: `dispatch_render` zeroes the active scroll
+    // synchronously, so a preserved offset is the race-free tell that replacing a pin dispatched
+    // no render (see `assert_no_render_dispatched`).
     let calls_before_pin = calls.load(Ordering::SeqCst);
+    let seq_before_pin = ctrl.render_seq();
     ctrl.pin_active_preview();
-    assert_provider_call_count_stays(&calls, calls_before_pin);
+    assert_no_render_dispatched(&ctrl, &calls, calls_before_pin, seq_before_pin);
     let replacement = ctrl.view_state().pinned.expect("different file replaces");
     assert_ne!(replacement.origin.as_ref(), Some(&first));
     assert_eq!(replacement.content.lines.len(), 20);

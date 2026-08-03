@@ -1820,6 +1820,17 @@ impl Controller {
         self.active_interaction.vertical_scroll
     }
 
+    /// The most recently dispatched render's sequence number.
+    ///
+    /// A read-only observability seam: [`dispatch_render`](Self::dispatch_render) bumps this
+    /// SYNCHRONOUSLY before it spawns the worker, so an unchanged value proves no render was
+    /// dispatched. Counting a stub provider's calls instead races that worker thread — reading the
+    /// count immediately can pass before a real dispatch increments it, and sleeping to wait for it
+    /// makes the negative wall-clock-dependent.
+    pub fn render_seq(&self) -> u64 {
+        self.latest_seq
+    }
+
     /// The active preview's complete mutable interaction state.
     pub fn active_interaction(&self) -> &PreviewInteractionState {
         &self.active_interaction
