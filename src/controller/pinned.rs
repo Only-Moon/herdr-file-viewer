@@ -13,6 +13,20 @@ pub(super) struct PinnedSnapshot {
 }
 
 impl Controller {
+    pub(super) fn pinned_interaction(&self) -> Option<&PreviewInteractionState> {
+        self.pinned_snapshot.as_ref().map(|pin| &pin.interaction)
+    }
+
+    pub(super) fn pinned_interaction_mut(&mut self) -> Option<&mut PreviewInteractionState> {
+        self.pinned_snapshot
+            .as_mut()
+            .map(|pin| &mut pin.interaction)
+    }
+
+    pub(super) fn pinned_document(&self) -> Option<&PreviewDocument> {
+        self.pinned_snapshot.as_ref().map(|pin| &pin.document)
+    }
+
     /// Create, replace, remove, or reject the one in-memory pinned snapshot.
     ///
     /// This is intentionally a controller seam rather than an input action: T-13 owns key
@@ -38,6 +52,9 @@ impl Controller {
             .is_some_and(|pin| pin.document.origin().identity() == document.origin().identity())
         {
             self.pinned_snapshot = None;
+            if self.focus == Focus::Pinned {
+                self.focus = Focus::Content;
+            }
         } else {
             self.pinned_snapshot = Some(PinnedSnapshot {
                 document,

@@ -33,6 +33,7 @@ mod pinned;
 
 use crate::annotation::AnnotationStore;
 use crate::finder::FinderState;
+use crate::focus_policy::{ActionTarget, PreviewTarget, next_focus, target_for};
 use crate::git::{Baseline, Status};
 use crate::help::{HelpSection, HelpSectionState, HelpState};
 use crate::herdr::HerdrCli;
@@ -768,6 +769,9 @@ pub struct Controller {
     /// the cursor it is navigation state: reset on a re-root (AC-13), not carried.
     tree_hscroll: u16,
     focus: Focus,
+    /// The interaction state an open in-file prompt was created for. It is deliberately not
+    /// inferred from later focus changes, so incremental search cannot leak across previews.
+    prompt_target: PreviewTarget,
     /// The pane width the run loop last observed (session state for the narrow-split flag,
     /// AC-21); the Presenter still lays out from the live frame, never this.
     width: u16,
@@ -1026,6 +1030,7 @@ impl Controller {
             status_mode: false,
             git_status: BTreeMap::new(),
             focus: Focus::Tree,
+            prompt_target: PreviewTarget::Active,
             width: 0,
             active_interaction: PreviewInteractionState::default(),
             pinned_snapshot: None,
@@ -2006,7 +2011,7 @@ impl Controller {
                 }
                 crate::infile::PromptMode::Search => {
                     let q = p.input.query();
-                    let count = self.search_count_fragment(q);
+                    let count = self.search_count_fragment(q, self.prompt_target);
                     Some(format!("Search: {q}{count}"))
                 }
             }
@@ -2020,11 +2025,11 @@ impl Controller {
     /// - Empty query → empty string (nothing appended; label reads `Search: `).
     /// - Non-empty, 0 matches → ` (no matches)`.
     /// - Non-empty, ≥1 match → ` ({current+1}/{total})`.
-    fn search_count_fragment(&self, query: &str) -> String {
+    fn search_count_fragment(&self, query: &str, target: PreviewTarget) -> String {
         if query.is_empty() {
             return String::new();
         }
-        match &self.active_interaction.search {
+        match self.target_search(target) {
             None => String::new(),
             Some(s) if s.matches.is_empty() => " (no matches)".to_owned(),
             Some(s) => format!(" ({}/{})", s.current + 1, s.matches.len()),
@@ -2038,7 +2043,7 @@ impl Controller {
     /// - ≥1 match: `Search: {query} ({current+1}/{total}) · n next · N prev · Esc clear`
     /// - 0 matches: `Search: {query} (no matches) · Esc clear`
     fn search_status_line(&self) -> Option<String> {
-        let s = self.active_interaction.search.as_ref()?;
+        let s = self.target_search(self.focus_preview_target())?;
         let q = &s.query;
         let line = if s.matches.is_empty() {
             format!("Search: {q} (no matches) · Esc clear")
@@ -2120,6 +2125,10 @@ impl Controller {
         {
             return Effects::noop();
         }
+        if target_for(self.focus, intent) == ActionTarget::Rejected {
+            self.action_notice = Some("Unavailable from pinned preview".into());
+            return Effects::redraw();
+        }
         match intent {
             Intent::NavUp => self.navigate(-1),
             Intent::NavDown => self.navigate(1),
@@ -2182,6 +2191,7 @@ impl Controller {
                         Effects::redraw()
                     }
                 }
+                Focus::Pinned => unreachable!("pinned focus is rejected by focus policy"),
             },
             Intent::ShowHelp => self.open_help(),
             Intent::Close => self.close_or_unzoom(),
@@ -2197,6 +2207,7 @@ impl Controller {
     fn page_step(&self) -> isize {
         let rows = match self.focus {
             Focus::Content => self.active_interaction.viewport_height,
+            Focus::Pinned => self.pinned_viewport_height(),
             Focus::Tree => self.geom.tree_inner.map_or(0, |inner| inner.height),
         };
         (rows as isize).max(1)
@@ -2210,6 +2221,10 @@ impl Controller {
         match self.focus {
             Focus::Content => {
                 self.scroll_content(delta);
+                Effects::redraw()
+            }
+            Focus::Pinned => {
+                self.scroll_pinned(delta);
                 Effects::redraw()
             }
             Focus::Tree => {
@@ -2285,6 +2300,50 @@ impl Controller {
         let max = self.max_content_scroll() as isize;
         let next = (self.active_interaction.vertical_scroll as isize + delta).clamp(0, max);
         self.active_interaction.vertical_scroll = next as u16;
+    }
+
+    fn pinned_viewport_height(&self) -> u16 {
+        self.pinned_interaction()
+            .map_or(0, |state| state.viewport_height)
+    }
+
+    fn scroll_pinned(&mut self, delta: isize) {
+        let (lines, wrap) = match self.pinned_document() {
+            Some(document) => (
+                document.content().lines.clone(),
+                document.presentation().wrap(),
+            ),
+            None => return,
+        };
+        let Some(interaction) = self.pinned_interaction_mut() else {
+            return;
+        };
+        let max =
+            rendered_rows(interaction, &lines, wrap, 0).saturating_sub(interaction.viewport_height);
+        interaction.vertical_scroll =
+            (interaction.vertical_scroll as isize + delta).clamp(0, max as isize) as u16;
+    }
+
+    fn scroll_pinned_to_line(&mut self, line_1based: usize) {
+        let (lines, wrap) = match self.pinned_document() {
+            Some(document) => (
+                document.content().lines.clone(),
+                document.presentation().wrap(),
+            ),
+            None => return,
+        };
+        let Some(interaction) = self.pinned_interaction_mut() else {
+            return;
+        };
+        let line = line_1based.max(1).min(lines.len().max(1));
+        let offset = if wrap {
+            wrapped_rows_before(interaction, &lines, line - 1, 0)
+        } else {
+            line - 1
+        };
+        let max =
+            rendered_rows(interaction, &lines, wrap, 0).saturating_sub(interaction.viewport_height);
+        interaction.vertical_scroll = (offset.min(u16::MAX as usize) as u16).min(max);
     }
 
     /// The largest valid scroll offset: total rendered lines minus the viewport height.
@@ -2382,6 +2441,26 @@ impl Controller {
         Effects::redraw()
     }
 
+    fn scroll_pinned_h(&mut self, delta: i32) -> Effects {
+        let (lines, wrap) = match self.pinned_document() {
+            Some(document) => (
+                document.content().lines.clone(),
+                document.presentation().wrap(),
+            ),
+            None => return Effects::noop(),
+        };
+        let Some(interaction) = self.pinned_interaction_mut() else {
+            return Effects::noop();
+        };
+        let mut clamped = interaction.clone();
+        clamped.horizontal_scroll = u16::MAX;
+        clamp_offsets(&mut clamped, &lines, wrap, 0);
+        interaction.horizontal_scroll = (interaction.horizontal_scroll as i32 + delta)
+            .clamp(0, clamped.horizontal_scroll as i32)
+            as u16;
+        Effects::redraw()
+    }
+
     /// The largest valid horizontal offset: the widest content line minus the viewport width.
     /// Zero while wrapping (no line overflows the pane, so there is nothing to scroll past).
     fn max_content_hscroll(&self) -> u16 {
@@ -2402,6 +2481,9 @@ impl Controller {
         if self.focus == Focus::Content {
             return self.scroll_content_h(HSCROLL_STEP as i32);
         }
+        if self.focus == Focus::Pinned {
+            return self.scroll_pinned_h(HSCROLL_STEP as i32);
+        }
         if let Some(node) = self.tree.selected()
             && node.kind == NodeKind::Dir
         {
@@ -2416,6 +2498,9 @@ impl Controller {
     fn collapse(&mut self) -> Effects {
         if self.focus == Focus::Content {
             return self.scroll_content_h(-(HSCROLL_STEP as i32));
+        }
+        if self.focus == Focus::Pinned {
+            return self.scroll_pinned_h(-(HSCROLL_STEP as i32));
         }
         if let Some(node) = self.tree.selected()
             && node.kind == NodeKind::Dir
@@ -2761,13 +2846,10 @@ impl Controller {
         // pinned to the content pane (entering zoom set it there). Without this guard, Tab would
         // move focus to the invisible tree and route j/k to its cursor — silently re-rendering a
         // different file behind the full-screen content.
-        if self.zoomed {
+        if self.zoomed && self.pinned_snapshot.is_none() {
             return Effects::noop();
         }
-        self.focus = match self.focus {
-            Focus::Tree => Focus::Content,
-            Focus::Content => Focus::Tree,
-        };
+        self.focus = next_focus(self.focus, self.pinned_snapshot.is_some(), self.zoomed);
         Effects::redraw()
     }
 
@@ -2778,7 +2860,11 @@ impl Controller {
     fn toggle_zoom(&mut self) -> Effects {
         self.zoomed = !self.zoomed;
         if self.zoomed {
-            self.focus = Focus::Content;
+            self.focus = if self.focus == Focus::Pinned && self.pinned_snapshot.is_some() {
+                Focus::Pinned
+            } else {
+                Focus::Content
+            };
         } else {
             self.focus = Focus::Tree;
             // `z` fully exits full-screen: if the viewer had host-zoomed the pane (via `Z`), release
@@ -2803,8 +2889,7 @@ impl Controller {
         }
         // A committed search (prompt closed, highlights persisting) is dismissed first — Esc/q
         // "come out of the search" before they unzoom or close (layered like unzoom). (owner UX)
-        if self.active_interaction.search.is_some() && !self.prompt_open() {
-            self.active_interaction.search = None;
+        if !self.prompt_open() && self.clear_focused_search() {
             return Effects::redraw();
         }
         if self.zoomed {
@@ -2827,6 +2912,16 @@ impl Controller {
         Effects {
             quit: true,
             ..Default::default()
+        }
+    }
+
+    fn clear_focused_search(&mut self) -> bool {
+        match self.focus_preview_target() {
+            PreviewTarget::Active => self.active_interaction.search.take().is_some(),
+            PreviewTarget::Pinned => self
+                .pinned_interaction_mut()
+                .and_then(|interaction| interaction.search.take())
+                .is_some(),
         }
     }
 

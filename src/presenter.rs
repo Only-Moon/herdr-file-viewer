@@ -25,6 +25,8 @@ use ratatui::widgets::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Tree,
+    /// The frozen snapshot preview, when one is pinned.
+    Pinned,
     Content,
 }
 
@@ -1149,7 +1151,9 @@ fn draw_content(
             Style::new().fg(Color::Reset),
         ));
     }
-    let block = block.border_style(border_style(active && state.focus == Focus::Content));
+    let focused =
+        (active && state.focus == Focus::Content) || (!active && state.focus == Focus::Pinned);
+    let block = block.border_style(border_style(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1299,6 +1303,7 @@ fn structural_layout(area: Rect, state: &ViewState) -> PreviewLayout {
         has_pin: state.pinned.is_some(),
         focus: match state.focus {
             Focus::Tree => PreviewFocus::Tree,
+            Focus::Pinned => PreviewFocus::Pinned,
             Focus::Content => PreviewFocus::Active,
         },
         tree_hidden: state.zoomed,

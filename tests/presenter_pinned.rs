@@ -163,6 +163,44 @@ fn tree_hidden_keeps_both_preview_projections() {
 }
 
 #[test]
+fn narrow_pinned_focus_shows_only_the_pinned_projection() {
+    let mut pinned = projection("pinned.rs", "PINNED NARROW\n");
+    pinned.origin = Some(origin(
+        "/worktrees/review",
+        BranchState::Named("review".into()),
+        "pinned.rs",
+    ));
+    let mut state = state(pinned);
+    state.focus = Focus::Pinned;
+    let (output, viewports) = render(&state, 60, 12);
+
+    assert!(output.contains("PINNED NARROW"), "{output}");
+    assert!(!output.contains("ACTIVE needle"), "{output}");
+    assert!(viewports.pinned.is_some());
+    assert_eq!(viewports.active, (0, 0));
+}
+
+#[test]
+fn narrow_pin_focus_snapshots() {
+    for (name, focus) in [
+        ("narrow_tree", Focus::Tree),
+        ("narrow_pinned", Focus::Pinned),
+        ("narrow_active", Focus::Content),
+    ] {
+        let mut pinned = projection("pinned.rs", "PINNED\n");
+        pinned.origin = Some(origin(
+            "/worktrees/review",
+            BranchState::Named("review".into()),
+            "pinned.rs",
+        ));
+        let mut state = state(pinned);
+        state.focus = focus;
+        let (output, _) = render(&state, 60, 12);
+        insta::assert_snapshot!(name, output);
+    }
+}
+
+#[test]
 fn pinned_origin_identity_is_visible_and_neutralized() {
     let cases = [
         (

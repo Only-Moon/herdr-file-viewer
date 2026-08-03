@@ -11,6 +11,7 @@ use herdr_file_viewer::controller::{
 use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::infile::SearchState;
 use herdr_file_viewer::intent::Intent;
+use herdr_file_viewer::opener::{Opener, OpenerOutcome};
 use herdr_file_viewer::presenter::{Focus, PaneGeometry};
 use herdr_file_viewer::preview::PreviewPresentation;
 use herdr_file_viewer::search::Match;
@@ -95,6 +96,29 @@ impl EditorHandoff for NoopEditor {
     }
 }
 
+struct CountingEditor(Arc<AtomicUsize>);
+
+impl EditorHandoff for CountingEditor {
+    fn open(&mut self, _file: &Path) -> EditorOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        EditorOutcome::NoTakeover
+    }
+}
+
+struct CountingOpener(Arc<AtomicUsize>);
+
+impl Opener for CountingOpener {
+    fn open(&mut self, _path: &Path) -> OpenerOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        OpenerOutcome::Launched
+    }
+
+    fn reveal(&mut self, _path: &Path) -> OpenerOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        OpenerOutcome::Launched
+    }
+}
+
 fn controller(root: &Path) -> Controller {
     let components = Components {
         providers: Box::new(|_resolved| RootProviders {
@@ -162,6 +186,175 @@ fn assert_provider_call_count_stays(calls: &AtomicUsize, expected: usize) {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(calls.load(Ordering::SeqCst), expected);
+}
+
+fn pin_ready_controller() -> (TempDir, Controller) {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut ctrl = controller(dir.path());
+    await_content(&mut ctrl);
+    ctrl.set_preview_viewports(herdr_file_viewer::presenter::PreviewViewports {
+        active: (8, 4),
+        pinned: None,
+    });
+    ctrl.handle(Intent::PinPreview);
+    ctrl.set_preview_viewports(herdr_file_viewer::presenter::PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
+    (dir, ctrl)
+}
+
+#[test]
+fn pin_focus_cycles_and_removal_returns_focus_to_active() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+
+    assert_eq!(ctrl.focus(), Focus::Tree);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Tree);
+
+    ctrl.handle(Intent::ToggleFocus);
+    ctrl.handle(Intent::PinPreview);
+    assert!(ctrl.view_state().pinned.is_none());
+    assert_eq!(ctrl.focus(), Focus::Content);
+}
+
+#[test]
+fn pinned_scroll_search_and_paging_do_not_touch_active_interaction() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+
+    ctrl.handle(Intent::NavDown);
+    assert_eq!(ctrl.active_interaction().vertical_scroll, 0);
+    assert_eq!(ctrl.view_state().pinned.as_ref().unwrap().scroll, 1);
+    ctrl.handle(Intent::PageDown);
+    assert_eq!(ctrl.view_state().pinned.as_ref().unwrap().scroll, 5);
+    ctrl.handle(Intent::Expand);
+    assert_eq!(ctrl.active_interaction().horizontal_scroll, 0);
+    assert!(ctrl.view_state().pinned.as_ref().unwrap().hscroll > 0);
+
+    ctrl.handle(Intent::OpenSearch);
+    for ch in "needle".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert!(ctrl.active_interaction().search.is_none());
+    assert_eq!(
+        ctrl.view_state()
+            .pinned
+            .as_ref()
+            .and_then(|p| p.search.as_ref())
+            .map(|s| s.matches.len()),
+        Some(20)
+    );
+}
+
+#[test]
+fn pinned_unavailable_actions_are_consumed_with_a_notice() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let editor_calls = Arc::new(AtomicUsize::new(0));
+    let opener_calls = Arc::new(AtomicUsize::new(0));
+    let clipboard = common::RecordingClipboard::default();
+    let copied = Arc::clone(&clipboard.copied);
+    let editor_counter = Arc::clone(&editor_calls);
+    let components = Components {
+        providers: Box::new(|_resolved| RootProviders {
+            git: Arc::new(StubGit),
+            content: Box::new(Lines),
+        }),
+        editor: Box::new(CountingEditor(editor_counter)),
+        clipboard: Box::new(clipboard),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_content(&mut ctrl);
+    ctrl.set_preview_viewports(herdr_file_viewer::presenter::PreviewViewports {
+        active: (8, 4),
+        pinned: None,
+    });
+    ctrl.handle(Intent::PinPreview);
+    ctrl.set_preview_viewports(herdr_file_viewer::presenter::PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
+    ctrl.set_opener(Box::new(CountingOpener(Arc::clone(&opener_calls))));
+    ctrl.handle(Intent::ToggleFocus);
+    let unavailable = [
+        Intent::Activate,
+        Intent::OpenFullscreen,
+        Intent::OpenGoToLine,
+        Intent::TreeScrollRight,
+        Intent::OpenInEditor,
+        Intent::OpenWithApp,
+        Intent::RevealInFileManager,
+        Intent::AddAnnotation,
+        Intent::ShowAnnotations,
+        Intent::CycleDiffRender,
+        Intent::CycleView,
+        Intent::ToggleWrap,
+    ];
+    for intent in unavailable {
+        let before = ctrl.view_state();
+        let fx = ctrl.handle(intent);
+        assert!(fx.redraw, "{intent:?} reports rejection");
+        assert_eq!(ctrl.focus(), Focus::Pinned, "{intent:?} keeps pinned focus");
+        assert!(
+            ctrl.action_notice().is_some(),
+            "{intent:?} explains rejection"
+        );
+        assert_eq!(
+            ctrl.view_state().pinned.as_ref().unwrap().scroll,
+            before.pinned.as_ref().unwrap().scroll
+        );
+        assert_eq!(
+            ctrl.active_interaction().vertical_scroll,
+            before.content_scroll
+        );
+        assert_eq!(editor_calls.load(Ordering::SeqCst), 0, "{intent:?}");
+        assert_eq!(opener_calls.load(Ordering::SeqCst), 0, "{intent:?}");
+        assert!(copied.lock().unwrap().is_empty(), "{intent:?}");
+    }
+}
+
+#[test]
+fn active_zoom_keeps_pin_while_pinned_fullscreen_is_rejected() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::OpenFullscreen);
+    assert!(!ctrl.zoomed());
+    assert!(ctrl.view_state().pinned.is_some());
+    assert!(ctrl.action_notice().is_some());
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::OpenFullscreen);
+    assert!(ctrl.zoomed());
+    assert!(ctrl.view_state().pinned.is_some());
+}
+
+#[test]
+fn tree_hidden_focus_cycles_between_pinned_and_active() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::ToggleZoom);
+    assert!(ctrl.zoomed());
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
 }
 
 #[test]

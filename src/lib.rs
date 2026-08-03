@@ -10,6 +10,7 @@ pub mod context;
 pub mod controller;
 pub mod editor;
 pub mod finder;
+pub mod focus_policy;
 pub mod fuzzy;
 pub mod git;
 pub mod help;

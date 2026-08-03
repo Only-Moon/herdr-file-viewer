@@ -99,6 +99,7 @@ impl Controller {
     /// nothing / a directory selected there is no file to address, so emit a one-line notice and open
     /// nothing. Snapshots the current content scroll into the prompt state.
     pub(super) fn open_go_to_line(&mut self) -> Effects {
+        self.prompt_target = PreviewTarget::Active;
         if self.selected_view_mode().is_some() {
             self.modal = Modal::Prompt(PromptState {
                 mode: PromptMode::GoToLine,
@@ -123,25 +124,48 @@ impl Controller {
         if self.modal.picker().is_some() || self.modal.finder().is_some() {
             return Effects::noop();
         }
-        // File-gate: search requires a file to be selected (not a directory / nothing).
+        let target = if self.focus == Focus::Pinned {
+            if self.pinned_snapshot.is_none() {
+                self.action_notice = Some("Search: no pinned preview".into());
+                return Effects::redraw();
+            }
+            PreviewTarget::Pinned
+        } else {
+            PreviewTarget::Active
+        };
+        self.prompt_target = target;
+        // File-gate applies only to the active tree-selected preview. A pin retains its applied
+        // document independently of subsequent tree selection or re-rooting.
         // selected_view_mode() returns Some(mode) iff a file node is currently selected.
-        if self.selected_view_mode().is_none() {
+        if target == PreviewTarget::Active && self.selected_view_mode().is_none() {
             self.action_notice = Some("Search: select a file first".into());
             return Effects::redraw();
         }
         // Zoom-on-open (7b): if the content pane isn't visible (narrow tree-only layout), zoom the
         // file so the user sees the content they're about to search. Mirrors the go-to-file finder.
-        if self.active_interaction.viewport_width == 0 {
+        if target == PreviewTarget::Active && self.active_interaction.viewport_width == 0 {
             self.zoomed = true;
             self.focus = Focus::Content;
         }
         // AC-20: opening a new search clears any prior committed SearchState so highlights from
         // the old query are gone before the new prompt opens. Clear first, then snapshot scroll.
-        self.active_interaction.search = None;
+        match target {
+            PreviewTarget::Active => self.active_interaction.search = None,
+            PreviewTarget::Pinned => {
+                if let Some(interaction) = self.pinned_interaction_mut() {
+                    interaction.search = None;
+                }
+            }
+        }
         self.modal = Modal::Prompt(PromptState {
             mode: PromptMode::Search,
             input: crate::prompt::PromptInput::new(),
-            saved_scroll: self.active_interaction.vertical_scroll,
+            saved_scroll: match target {
+                PreviewTarget::Active => self.active_interaction.vertical_scroll,
+                PreviewTarget::Pinned => self
+                    .pinned_interaction()
+                    .map_or(0, |interaction| interaction.vertical_scroll),
+            },
         });
         Effects::redraw()
     }
@@ -255,13 +279,21 @@ impl Controller {
             // Exception: an empty query commits nothing — clear search so no phantom
             // "Search: (no matches)" state persists after the prompt closes.
             KeyCode::Enter => {
+                let target = self.prompt_target();
                 let empty = self
                     .modal
                     .prompt()
                     .map(|p| p.input.query().is_empty())
                     .unwrap_or(true);
                 if empty {
-                    self.active_interaction.search = None;
+                    match target {
+                        PreviewTarget::Active => self.active_interaction.search = None,
+                        PreviewTarget::Pinned => {
+                            if let Some(interaction) = self.pinned_interaction_mut() {
+                                interaction.search = None;
+                            }
+                        }
+                    }
                 }
                 self.modal = Modal::None;
                 Effects::redraw()
@@ -269,9 +301,20 @@ impl Controller {
             // AC-17: Esc cancels the search — restore the pre-open scroll snapshot and clear
             // the in-progress SearchState (no highlights remain after cancel).
             KeyCode::Esc => {
+                let target = self.prompt_target();
                 let saved_scroll = self.modal.prompt().map(|p| p.saved_scroll).unwrap_or(0);
-                self.active_interaction.vertical_scroll = saved_scroll;
-                self.active_interaction.search = None;
+                match target {
+                    PreviewTarget::Active => {
+                        self.active_interaction.vertical_scroll = saved_scroll;
+                        self.active_interaction.search = None;
+                    }
+                    PreviewTarget::Pinned => {
+                        if let Some(interaction) = self.pinned_interaction_mut() {
+                            interaction.vertical_scroll = saved_scroll;
+                            interaction.search = None;
+                        }
+                    }
+                }
                 self.modal = Modal::None;
                 Effects::redraw()
             }
@@ -287,13 +330,14 @@ impl Controller {
         if self.prompt_open() {
             return Effects::noop();
         }
-        let Some((next_line, wrapped)) = navigate_search(&mut self.active_interaction, true) else {
+        let target = self.focus_preview_target();
+        let Some((next_line, wrapped)) = self.navigate_target_search(target, true) else {
             return Effects::noop();
         };
         if wrapped {
             self.action_notice = Some("Search: wrapped to first match".into());
         }
-        self.scroll_to_line(next_line + 1);
+        self.scroll_target_to_line(target, next_line + 1);
         Effects::redraw()
     }
 
@@ -304,14 +348,14 @@ impl Controller {
         if self.prompt_open() {
             return Effects::noop();
         }
-        let Some((prev_line, wrapped)) = navigate_search(&mut self.active_interaction, false)
-        else {
+        let target = self.focus_preview_target();
+        let Some((prev_line, wrapped)) = self.navigate_target_search(target, false) else {
             return Effects::noop();
         };
         if wrapped {
             self.action_notice = Some("Search: wrapped to last match".into());
         }
-        self.scroll_to_line(prev_line + 1);
+        self.scroll_target_to_line(target, prev_line + 1);
         Effects::redraw()
     }
 
@@ -324,10 +368,25 @@ impl Controller {
             .prompt()
             .map(|p| p.input.query().to_string())
             .unwrap_or_default();
-        let lines = &self.active_display.content().lines;
-        if let Some(first_line) = refresh_search(&mut self.active_interaction, lines, q) {
+        let target = self.prompt_target();
+        let first_line = match target {
+            PreviewTarget::Active => refresh_search(
+                &mut self.active_interaction,
+                &self.active_display.content().lines,
+                q,
+            ),
+            PreviewTarget::Pinned => {
+                let lines = self
+                    .pinned_document()
+                    .map(|document| document.content().lines.clone())
+                    .unwrap_or_default();
+                self.pinned_interaction_mut()
+                    .and_then(|interaction| refresh_search(interaction, &lines, q))
+            }
+        };
+        if let Some(first_line) = first_line {
             // `first_line` is 0-based; scroll_to_line takes 1-based.
-            self.scroll_to_line(first_line + 1);
+            self.scroll_target_to_line(target, first_line + 1);
         }
     }
 
@@ -344,5 +403,44 @@ impl Controller {
     pub(super) fn recompute_committed_search(&mut self) {
         let lines = &self.active_display.content().lines;
         recompute_search(&mut self.active_interaction, lines);
+    }
+
+    pub(super) fn focus_preview_target(&self) -> PreviewTarget {
+        if self.focus == Focus::Pinned {
+            PreviewTarget::Pinned
+        } else {
+            PreviewTarget::Active
+        }
+    }
+
+    pub(super) fn prompt_target(&self) -> PreviewTarget {
+        self.prompt_target
+    }
+
+    fn navigate_target_search(
+        &mut self,
+        target: PreviewTarget,
+        forward: bool,
+    ) -> Option<(usize, bool)> {
+        match target {
+            PreviewTarget::Active => navigate_search(&mut self.active_interaction, forward),
+            PreviewTarget::Pinned => self
+                .pinned_interaction_mut()
+                .and_then(|interaction| navigate_search(interaction, forward)),
+        }
+    }
+
+    fn scroll_target_to_line(&mut self, target: PreviewTarget, line: usize) {
+        match target {
+            PreviewTarget::Active => self.scroll_to_line(line),
+            PreviewTarget::Pinned => self.scroll_pinned_to_line(line),
+        }
+    }
+
+    pub(super) fn target_search(&self, target: PreviewTarget) -> Option<&SearchState> {
+        match target {
+            PreviewTarget::Active => self.active_interaction.search.as_ref(),
+            PreviewTarget::Pinned => self.pinned_interaction().and_then(|p| p.search.as_ref()),
+        }
     }
 }
