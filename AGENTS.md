@@ -86,7 +86,7 @@ These shape every decision; violating one is a design error, not a style nit:
 
 ### Stack specifics
 
-- **Rust 1.96 (edition 2024)** + **ratatui 0.30.1** (uses `ratatui-core` 0.1.x) + **crossterm 0.29.0**
+- **Rust 1.96 (edition 2024)** + **ratatui 0.30.2** (uses `ratatui-core` 0.1.x) + **crossterm 0.29.0**
 - **`ansi-to-tui` 8.0.1** ingests the external renderers' ANSI output into ratatui spans, and
   doubles as the **AC-27 escape-neutralizer** (maps styling, drops cursor/screen-control). All file
   content flows through it.
@@ -166,7 +166,7 @@ never wire them in two places or let the docs drift.
 
 **A new keybinding / action.** `REGISTRY` in `src/input.rs` is the source of truth: the dispatcher,
 the `?` overlay's Keybindings section, and `[keys]` remapping all derive from it.
-1. Add the variant to the `Intent` enum in `src/intent.rs` (it lives in `Intent::ALL`, 39 today).
+1. Add the variant to the `Intent` enum in `src/intent.rs` (it lives in `Intent::ALL`, 42 today).
 2. Add a `Binding { intent, name, default_keys, description, category }` row to `REGISTRY`
    (`category` must be one of `CATEGORY_ORDER`).
 3. Handle the intent in the session controller (`src/controller/`).

@@ -1153,8 +1153,9 @@ impl Controller {
     /// factory (ADR-0004), and respawn the render worker — overwriting `job_tx`/`result_rx` drops
     /// the old sender, so the previous worker (which owns the old providers) exits. A fresh
     /// [`TreeModel`] and reset navigation/view state follow (AC-13), while the user's *preferences*
-    /// — `show_ignored`, `hide_hidden`, `changed_only`, `split_pct`, `wrap_override`, `baseline` —
-    /// are carried across unchanged (AC-12). The structural re-root (resolve + fresh tree + worker respawn +
+    /// — `show_ignored`, `hide_hidden`, `changed_only`, `split_pct`, `wrap_override`, `baseline`,
+    /// and the frozen pinned preview plus its ratio — are carried across unchanged (AC-12). The
+    /// structural re-root (resolve + fresh tree + worker respawn +
     /// carried prefs + nav reset) is **synchronous**, so the tree is immediately navigable; the
     /// heavier git status + changed-set fills in **asynchronously**, applied by [`poll`] (AC-17),
     /// so input is never blocked. Finally the first frame is rendered. A missing or
@@ -1268,7 +1269,10 @@ impl Controller {
         self.last_click = None;
 
         // PREFERENCES ARE CARRIED (AC-12) — deliberately NOT reset: show_ignored, hide_hidden,
-        // changed_only, status_mode, split_pct, tree_position, tree_max_cols, split_manual, wrap_override, baseline keep their current values. The fresh
+        // changed_only, status_mode, split_pct, tree_position, tree_max_cols, split_manual,
+        // wrap_override, baseline, pinned_snapshot, and preview_split_pct keep their current
+        // values. The frozen pin is a root-independent reference; active/root-bound content above
+        // is reset. The fresh
         // TreeModel starts with default filter flags. `show_ignored` and `hide_hidden` are
         // git-independent, so apply them now. The changed-only *filter* is NOT applied here: it
         // must be applied against the REAL changed-set, which `dispatch_status_refresh` computes
@@ -2146,6 +2150,7 @@ impl Controller {
             Intent::GrowTree => self.resize_split(SPLIT_STEP as i16),
             Intent::ToggleWrap => self.toggle_wrap(),
             Intent::ToggleZoom => self.toggle_zoom(),
+            Intent::PinPreview => self.pin_active_preview(),
             Intent::Refresh => self.refresh(),
             Intent::DismissUpdate => self.dismiss_update(),
             Intent::SwitchWorktree => self.open_worktree_picker(),

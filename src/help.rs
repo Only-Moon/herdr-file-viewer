@@ -1268,6 +1268,19 @@ mod tests {
     }
 
     #[test]
+    fn keybindings_text_reports_the_effective_pin_preview_binding() {
+        // T-13: the generated Help model reads the resolved bindings, not the registry default.
+        let (bindings, outcome) = resolve_one("pin_preview", "P");
+        let text = keybindings_text(input::registry(), &bindings, &outcome);
+        let row = text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some("pin_preview"))
+            .expect("Help must contain the pin_preview action");
+        assert!(row.split_whitespace().any(|word| word == "P"));
+        assert!(row.contains("(custom)"));
+    }
+
+    #[test]
     fn keybindings_text_groups_actions_under_their_category_header() {
         // AC-19 (grouping): each action renders under its category header, and the headers appear in
         // CATEGORY_ORDER (like herdr's grouped keybinds list).

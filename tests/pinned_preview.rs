@@ -398,6 +398,22 @@ fn pin_lifecycle_clones_the_settled_preview_and_toggles_the_same_identity() {
 }
 
 #[test]
+fn pin_preview_intent_invokes_the_existing_snapshot_lifecycle() {
+    // T-13 only wires the registry/dispatcher to T-6's already-tested lifecycle; it must not
+    // create a second pin implementation.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    let mut ctrl = controller(dir.path());
+    await_content(&mut ctrl);
+
+    assert!(ctrl.handle(Intent::PinPreview).redraw);
+    assert!(
+        ctrl.view_state().pinned.is_some(),
+        "dispatch must create T-6's snapshot"
+    );
+}
+
+#[test]
 fn pinning_a_different_file_replaces_one_frozen_snapshot_without_rendering() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();

@@ -187,6 +187,7 @@ customized).
 | | `grow_tree` | `>` | Widen the tree column |
 | | `toggle_wrap` | `w` | Force content-line wrapping on or off |
 | | `toggle_zoom` | `z` | Hide the tree so content fills the frame, or restore the split |
+| | `pin_preview` | `p` | Pin or unpin the settled preview as a reference |
 | | `tree_scroll_left` | `H` | Scroll the tree pane left |
 | | `tree_scroll_right` | `L` | Scroll the tree pane right |
 | **Git & filters** | `toggle_ignore` | `i` | Reveal or hide gitignored files |

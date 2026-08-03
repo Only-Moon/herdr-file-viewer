@@ -188,7 +188,8 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
     ctrl.handle(Intent::GrowTree); // tree-resize → split_pct changes off its default
     ctrl.handle(Intent::ToggleWrap); // `w` → wrap_override true
     ctrl.handle(Intent::ToggleChangedOnly); // changed-only on (git repo → takes effect)
-    ctrl.handle(Intent::ToggleIgnore); // show-ignored on
+    ctrl.apply_show_ignored(true); // config/startup preference carried through a re-root
+    ctrl.apply_compact_dirs(true); // likewise: fresh trees keep their compact shape
     ctrl.handle(Intent::ToggleHidden); // hide-hidden on (#46)
     ctrl.handle(Intent::ToggleBaseline); // baseline Head → Base
 
@@ -226,6 +227,17 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
         ctrl.tree().cursor() > 0,
         "cursor moved off the root row before re_root"
     );
+    // A settled snapshot is root-independent reference state: T-13 keeps it, with its ratio,
+    // while all active/root-bound state below resets.
+    poll_until(&mut ctrl, Duration::from_secs(5), |c| {
+        c.active_document().is_some()
+    });
+    assert!(ctrl.handle(Intent::PinPreview).redraw);
+    assert!(
+        ctrl.view_state().pinned.is_some(),
+        "precondition: preview is pinned"
+    );
+    assert_eq!(ctrl.view_state().preview_split_pct, 50);
     ctrl.handle(Intent::ToggleChangedOnly); // changed-only back on (the carried pref state)
     ctrl.handle(Intent::ToggleZoom); // zoom on, focus → content
     assert!(ctrl.zoomed());
@@ -235,8 +247,8 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
     // be flipped off below to inspect the real filesystem tree). ---
     let b = TempDir::new();
     common::init_repo_with_commit(b.path());
-    std::fs::create_dir_all(b.path().join("bsub")).unwrap();
-    std::fs::write(b.path().join("bsub/inner.txt"), "inner\n").unwrap();
+    std::fs::create_dir_all(b.path().join("bsub/inner")).unwrap();
+    std::fs::write(b.path().join("bsub/inner/deep.txt"), "inner\n").unwrap();
     std::fs::write(b.path().join("b.txt"), "b\n").unwrap();
     ctrl.re_root(b.path());
 
@@ -251,8 +263,18 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
     assert!(ctrl.wrap_override(), "wrap_override carried");
     assert!(ctrl.changed_only(), "changed_only carried");
     assert!(ctrl.show_ignored(), "show_ignored carried");
+    assert!(
+        ctrl.tree().show_ignored(),
+        "fresh tree kept show-ignored preference"
+    );
     assert!(ctrl.hide_hidden(), "hide_hidden carried (#46)");
     assert_eq!(ctrl.baseline(), Baseline::Base, "baseline carried");
+    assert!(ctrl.view_state().pinned.is_some(), "pin survives re_root");
+    assert_eq!(
+        ctrl.view_state().preview_split_pct,
+        50,
+        "pin ratio survives re_root"
+    );
 
     // Navigation/view state is RESET (AC-13).
     assert_eq!(ctrl.tree().cursor(), 0, "cursor back at the root row");
@@ -284,6 +306,11 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
     assert!(
         !nodes.iter().any(|n| n.expanded),
         "no expansions carried into the new tree"
+    );
+    assert_eq!(
+        root_child.label.as_deref(),
+        Some("bsub/inner"),
+        "the re-rooted tree retained compact_dirs"
     );
 }
 

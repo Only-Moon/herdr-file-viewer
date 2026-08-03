@@ -406,6 +406,13 @@ pub(crate) const REGISTRY: &[Binding] = &[
         category: "View & layout",
     },
     Binding {
+        intent: Intent::PinPreview,
+        name: "pin_preview",
+        default_keys: &[KeyCode::Char('p')],
+        description: "Pin or unpin the settled preview as a reference.",
+        category: "View & layout",
+    },
+    Binding {
         intent: Intent::Refresh,
         name: "refresh",
         default_keys: &[KeyCode::Char('r')],
@@ -834,6 +841,7 @@ mod tests {
         (KeyCode::Char('>'), Intent::GrowTree),
         (KeyCode::Char('w'), Intent::ToggleWrap),
         (KeyCode::Char('z'), Intent::ToggleZoom),
+        (KeyCode::Char('p'), Intent::PinPreview),
         (KeyCode::Char('r'), Intent::Refresh),
         (KeyCode::Char('u'), Intent::DismissUpdate),
         (KeyCode::Char('?'), Intent::ShowHelp),
@@ -1238,6 +1246,21 @@ mod tests {
             None
         );
         assert_eq!(map_key(k(KeyCode::Char('w'))), Some(Intent::ToggleWrap));
+    }
+
+    #[test]
+    fn pin_preview_default_and_custom_bindings_decode() {
+        // T-13: `p` reaches the pin lifecycle by default, and a valid `[keys]` replacement
+        // reaches that same intent while dropping the default key (replace semantics).
+        assert_eq!(map_key(k(KeyCode::Char('p'))), Some(Intent::PinPreview));
+
+        let (bindings, outcome) = resolve_with(&[("pin_preview", one("P"))]);
+        assert!(
+            outcome.is_empty(),
+            "a valid pin binding must not be rejected"
+        );
+        assert_eq!(dec(&bindings, KeyCode::Char('P')), Some(Intent::PinPreview));
+        assert_eq!(dec(&bindings, KeyCode::Char('p')), None);
     }
 
     #[test]
