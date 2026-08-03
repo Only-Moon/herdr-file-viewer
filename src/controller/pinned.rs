@@ -95,10 +95,12 @@ impl Controller {
     }
 
     /// Record the pinned preview's independently measured viewport without triggering work.
+    ///
+    /// `None` means the structural layout did not draw the pinned region, so mirror the active
+    /// preview's hidden-pane convention with a zero-sized viewport instead of retaining stale
+    /// wide-layout dimensions.
     pub(super) fn set_pinned_viewport(&mut self, viewport: Option<(u16, u16)>) {
-        let Some((width, height)) = viewport else {
-            return;
-        };
+        let (width, height) = viewport.unwrap_or_default();
         let Some(pin) = self.pinned_snapshot.as_mut() else {
             return;
         };

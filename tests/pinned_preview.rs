@@ -12,12 +12,13 @@ use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::infile::SearchState;
 use herdr_file_viewer::intent::Intent;
 use herdr_file_viewer::opener::{Opener, OpenerOutcome};
-use herdr_file_viewer::presenter::{Focus, PaneGeometry};
+use herdr_file_viewer::presenter::{Focus, PaneGeometry, PreviewViewports, draw};
 use herdr_file_viewer::preview::PreviewPresentation;
 use herdr_file_viewer::search::Match;
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::layout::Rect;
 use ratatui::text::Text;
+use ratatui::{Terminal, backend::TestBackend};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{
@@ -209,6 +210,16 @@ fn assert_provider_call_count_stays(calls: &AtomicUsize, expected: usize) {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(calls.load(Ordering::SeqCst), expected);
+}
+
+fn draw_viewports(ctrl: &Controller, width: u16, height: u16) -> PreviewViewports {
+    let state = ctrl.view_state();
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    let mut viewports = PreviewViewports::default();
+    terminal
+        .draw(|frame| viewports = draw(frame, &state))
+        .expect("draw test frame");
+    viewports
 }
 
 fn pin_ready_controller() -> (TempDir, Controller) {
@@ -441,6 +452,45 @@ fn pinned_incremental_search_borrows_its_document_and_preserves_matches() {
     assert!(
         !include_str!("../src/controller/infile.rs").contains("document.content().lines.clone()"),
         "incremental pinned search must borrow the frozen document lines rather than clone them"
+    );
+}
+
+#[test]
+fn hiding_a_pin_resets_its_viewport_before_pinned_paging() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    let wide = draw_viewports(&ctrl, 150, 12);
+    assert!(
+        wide.pinned.is_some(),
+        "wide layout draws the pinned preview"
+    );
+    ctrl.set_preview_viewports(wide);
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    for _ in 0..100 {
+        ctrl.handle(Intent::NavDown);
+    }
+    let scroll_at_wide_bottom = ctrl.view_state().pinned.expect("pin stays present").scroll;
+    assert!(
+        scroll_at_wide_bottom > 0,
+        "wide viewport clamps before the end"
+    );
+
+    ctrl.handle(Intent::ToggleFocus);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Tree);
+    let narrow = draw_viewports(&ctrl, 60, 12);
+    assert_eq!(narrow.pinned, None, "tree fallback hides the pin");
+    assert_eq!(narrow.active, (0, 0), "tree fallback also hides active");
+    ctrl.set_preview_viewports(narrow);
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::PageDown);
+    assert_eq!(
+        ctrl.view_state().pinned.expect("pin stays present").scroll,
+        scroll_at_wide_bottom + 1,
+        "the hidden pin has a zero-height viewport, so paging advances only the one-row floor"
     );
 }
 
