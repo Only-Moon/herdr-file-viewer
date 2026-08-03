@@ -370,6 +370,81 @@ fn tree_scroll_right_is_inert_from_pinned_focus() {
 }
 
 #[test]
+fn pinned_incremental_search_borrows_its_document_and_preserves_matches() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+    ctrl.handle(Intent::OpenSearch);
+
+    for (typed, matches, first) in [
+        (
+            'n',
+            40,
+            Match {
+                line: 0,
+                start: 2,
+                end: 3,
+            },
+        ),
+        (
+            'e',
+            40,
+            Match {
+                line: 0,
+                start: 2,
+                end: 4,
+            },
+        ),
+        (
+            'e',
+            20,
+            Match {
+                line: 0,
+                start: 7,
+                end: 10,
+            },
+        ),
+        (
+            'd',
+            20,
+            Match {
+                line: 0,
+                start: 7,
+                end: 11,
+            },
+        ),
+    ] {
+        ctrl.handle_prompt_key(key(KeyCode::Char(typed)));
+        let search = ctrl
+            .view_state()
+            .pinned
+            .and_then(|pin| pin.search)
+            .expect("each incremental query keeps pinned search state");
+        assert_eq!(
+            search.current, 0,
+            "a changed query starts at its first match"
+        );
+        assert_eq!(search.matches.len(), matches);
+        assert_eq!(search.matches[0], first);
+    }
+
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    ctrl.handle(Intent::NextMatch);
+    let committed = ctrl
+        .view_state()
+        .pinned
+        .and_then(|pin| pin.search)
+        .expect("the committed pinned search remains available");
+    assert_eq!(committed.current, 1);
+    assert_eq!(committed.matches[1].line, 1);
+
+    assert!(
+        !include_str!("../src/controller/infile.rs").contains("document.content().lines.clone()"),
+        "incremental pinned search must borrow the frozen document lines rather than clone them"
+    );
+}
+
+#[test]
 fn pinned_y_copies_the_captured_root_relative_path_after_re_root() {
     let original_root = TempDir::new();
     let original_file = original_root.path().join("pinned.rs");

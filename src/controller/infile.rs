@@ -375,14 +375,10 @@ impl Controller {
                 &self.active_display.content().lines,
                 q,
             ),
-            PreviewTarget::Pinned => {
-                let lines = self
-                    .pinned_document()
-                    .map(|document| document.content().lines.clone())
-                    .unwrap_or_default();
-                self.pinned_interaction_mut()
-                    .and_then(|interaction| refresh_search(interaction, &lines, q))
-            }
+            PreviewTarget::Pinned => self.pinned_snapshot.as_mut().and_then(|pin| {
+                let (document, interaction) = (&pin.document, &mut pin.interaction);
+                refresh_search(interaction, &document.content().lines, q)
+            }),
         };
         if let Some(first_line) = first_line {
             // `first_line` is 0-based; scroll_to_line takes 1-based.

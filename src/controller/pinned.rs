@@ -8,8 +8,8 @@ use super::*;
 /// preview and subsequently receives only pinned-viewport measurements. Neither side shares
 /// mutable state with the active preview.
 pub(super) struct PinnedSnapshot {
-    document: PreviewDocument,
-    interaction: PreviewInteractionState,
+    pub(super) document: PreviewDocument,
+    pub(super) interaction: PreviewInteractionState,
 }
 
 impl Controller {
