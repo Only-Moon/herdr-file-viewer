@@ -202,11 +202,14 @@ prose, not build-failing checks — hold yourself to them.
     backlog, so a newer result landing means every earlier job already finished or was collapsed.
     That ordering is what lets a test assert with no wait at all; assuming thread-per-render instead
     leads to inventing sleeps that prove nothing.
-  - **Say so when a test cannot prove its negative.** The superseded-render tests in
-    `tests/controller_async.rs` only catch a stale result that lands AFTER the newest, and the
-    polling loop drains earlier results first — so removing `poll`'s `seq == latest_seq` guard does
-    NOT fail them. Their comment says exactly that, and names the unit test that would prove it. A
-    test whose limits are written down is worth more than one silently trusted past them.
+  - **Force the race instead of hoping for it; document a limit only when you truly cannot.** The
+    end-to-end superseded-render tests in `tests/controller_async.rs` look like they prove `poll`'s
+    `seq == latest_seq` guard and do not: their polling loop drains the earlier result first, so
+    removing the guard leaves them green. A gated renderer (`GatedContent`) makes the ordering
+    happen on demand — hold one render open, dispatch a newer one behind it, release the first so
+    its result arrives stale — and that test DOES fail when the guard is removed. Reach for the gate
+    first. Where a race genuinely cannot be forced from outside, write the limit into the test's own
+    comment and name what would prove it, so nobody trusts it past its scope.
 - **Never send a key that assumes state the test has not observed.** In a pty journey `q`/Esc peels
   ONE state layer per press (`src/controller/mod.rs`: selection → flash → committed search → zoom →
   discard confirm → quit), and toggles like `z` flip whatever is actually there. A journey that
