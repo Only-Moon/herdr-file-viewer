@@ -64,7 +64,8 @@ and the spec chain):
 - **Presenter**: draw the two-column layout (ratatui)
 - **Input Dispatcher**: map key events → intents (crossterm)
 - **Session Controller**: orchestrate intents → state changes; holds in-memory session state
-- **Editor Launcher**: hand a file off to an external editor / new herdr pane
+- **Editor Launcher**: hand a file off to an external editor in-process, suspending and resuming the
+  TUI around it (NOT a herdr pane — see the herdr integration section)
 
 State is **in-memory and ephemeral only** except for the safe-to-delete, advisory
 `update-check.json` cache, which never changes the viewed root or git repo.
@@ -151,7 +152,9 @@ cargo audit
   **owning stage** and **re-run the readiness check**, don't ad-hoc-edit downstream specs.
 - **Never weaken a spec-backed assertion to make a change pass.** A test that names an acceptance
   criterion, and a policy list an AC enumerates (e.g. `focus_policy::unavailable_from_pinned`, which
-  AC-31/AC-32 define and a test asserts row by row), are the contract in executable form: deleting an
+  AC-31/AC-32 define and which `focus_policy::tests::pinned_rejection_set_is_exact` plus
+  `pinned_preview::pinned_unavailable_actions_are_consumed_with_a_notice` assert row by row), are the
+  contract in executable form: deleting an
   entry to accommodate new code silently changes behaviour the spec mandates — in the case that
   prompted this rule, a required user-visible notice became a silent no-op. If a criterion genuinely
   should change, change it at the owning stage first (above) and say so in the PR. If a spec-backed
@@ -172,16 +175,27 @@ This suite runs on macOS, Linux and Windows CI runners whose timing and layout d
 machine. Three rules, each learned from a real failure here. Unlike the drift guards below, these are
 prose, not build-failing checks — hold yourself to them.
 
-- **Don't assert a tight time budget, and don't prove a negative by sleeping.** Asserting a *generous*
-  timeout fired is fine (`src/proc.rs`, `src/update/gateway.rs` do it deliberately); asserting a
-  ~200ms operation finished inside 300ms is a coin flip on a loaded runner, and a "nothing happened"
-  poll passes vacuously when the thing happens after the window closes. Prefer a synchronous,
-  observable tell: `Controller::render_seq` is bumped inside `dispatch_render` BEFORE the worker
-  spawns, so an unchanged seq proves no render was dispatched, where counting a stub provider's calls
-  only races it. Where a wait is the point, separate the two claims: pin the budget's arithmetic in a
-  clock-free unit test (`tests/whats_new_composer.rs` asserts every document gets the one
-  `opened_at + WHATS_NEW_COMPOSE_TIMEOUT` instant) and let the behavioural test assert only that the
-  code did not wait, with a bound orders of magnitude below the stall it is distinguishing from.
+- **Don't assert a tight time budget, and don't prove a negative by sleeping.** Slack that is a small
+  multiple of the thing being measured is a coin flip on a loaded runner (a ~200ms budget asserted
+  under 300ms failed twice in one day), and a "nothing happened" poll passes vacuously when the thing
+  lands after the window closes. Prefer a synchronous, observable tell: `Controller::render_seq` is
+  bumped inside `dispatch_render` BEFORE the worker spawns, so an unchanged seq proves no render was
+  dispatched where counting a stub provider's calls only races it.
+  - **Where a wait is the point, split the claim in two.** Pin the budget's VALUE clock-free
+    (`tests/whats_new_composer.rs` asserts `WHATS_NEW_COMPOSE_TIMEOUT == 200ms` and that every
+    document receives exactly `opened_at + WHATS_NEW_COMPOSE_TIMEOUT`), and let the behavioural test
+    bound only the wait, ~10x the budget and orders of magnitude below the stall it distinguishes
+    from (`HELP_STALLED_RENDERER_MAX_WAIT`). Neither half alone is enough: a widened budget escapes
+    the loose bound, and a blocking call escapes the clock-free test.
+  - **The honest exception is a criterion that IS a latency budget.** AC-22/AC-23 mandate 300ms, so
+    `help_open_switch_scroll_each_within_300ms` (`tests/controller.rs`) must hold a stopwatch — that
+    is the spec, not a testing choice. Keep such tests, give them the widest slack the criterion
+    permits, and don't add new ones without a criterion behind them.
+  - **Known offenders — fix, don't copy.** `src/proc.rs` and `src/render.rs` assert a 100ms timeout
+    completes within 250ms (tight, not generous); `tests/controller_async.rs` sleeps 50ms to "give
+    any (wrong) render time to land" in three places, which is exactly the vacuous negative
+    `render_seq` exists to replace. `src/update/gateway.rs` and `tests/render_delegate.rs` are the
+    shape to copy: multi-second or order-of-magnitude separation.
 - **Never send a key that assumes state the test has not observed.** In a pty journey `q`/Esc peels
   ONE state layer per press (`src/controller/mod.rs`: selection → flash → committed search → zoom →
   discard confirm → quit), and toggles like `z` flip whatever is actually there. A journey that
