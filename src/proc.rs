@@ -106,9 +106,14 @@ mod tests {
         let started = Instant::now();
 
         assert_eq!(wait_bounded(&mut child, Duration::from_millis(100)), None);
+        // Bounded vs unbounded: the fixture child stalls for 60s, so this proves termination and
+        // reaping returned rather than waiting on it. Not `timeout + small slack` (100ms asserted
+        // under 250ms), which is a coin flip on a loaded runner — see AGENTS.md, "Tests prove
+        // things deterministically".
         assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "termination and reaping stay inside the renderer grace period"
+            started.elapsed() < Duration::from_secs(5),
+            "termination and reaping must return rather than wait out the stalled child: {:?}",
+            started.elapsed()
         );
         assert!(
             child.try_wait().unwrap().is_some(),

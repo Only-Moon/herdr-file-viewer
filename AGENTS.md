@@ -191,11 +191,11 @@ prose, not build-failing checks — hold yourself to them.
     `help_open_switch_scroll_each_within_300ms` (`tests/controller.rs`) must hold a stopwatch — that
     is the spec, not a testing choice. Keep such tests, give them the widest slack the criterion
     permits, and don't add new ones without a criterion behind them.
-  - **Known offenders — fix, don't copy.** `src/proc.rs` and `src/render.rs` assert a 100ms timeout
-    completes within 250ms (tight, not generous); `tests/controller_async.rs` sleeps 50ms to "give
-    any (wrong) render time to land" in three places, which is exactly the vacuous negative
-    `render_seq` exists to replace. `src/update/gateway.rs` and `tests/render_delegate.rs` are the
-    shape to copy: multi-second or order-of-magnitude separation.
+  - **Known offender — fix, don't copy.** `tests/controller_async.rs` sleeps 50ms to "give any
+    (wrong) render time to land" in three places, which is exactly the vacuous negative `render_seq`
+    exists to replace. `src/update/gateway.rs`, `src/proc.rs`, `src/render.rs` and
+    `tests/render_delegate.rs` are the shape to copy: they bound a stalled 60s fixture at seconds,
+    proving BOUNDED vs UNBOUNDED rather than re-measuring the timeout they passed in.
 - **Never send a key that assumes state the test has not observed.** In a pty journey `q`/Esc peels
   ONE state layer per press (`src/controller/mod.rs`: selection → flash → committed search → zoom →
   discard confirm → quit), and toggles like `z` flip whatever is actually there. A journey that
