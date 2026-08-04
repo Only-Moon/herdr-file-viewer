@@ -9340,6 +9340,19 @@ fn slow_markdown_renderers(marker: &std::path::Path) -> Renderers {
     }
 }
 
+/// How long the stalled-renderer fixture holds once it has written its handshake.
+const STALLED_RENDERER_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest Help may take with a stalled renderer before this test calls it a regression.
+///
+/// Deliberately its own constant rather than a fraction of [`STALLED_RENDERER_WAIT`]: those two
+/// numbers answer different questions, and deriving one from the other silently changed the
+/// tolerated latency whenever the fixture's lifetime moved. 2 s is ~10x Help's own 200 ms budget
+/// (loaded-runner slack) and 30x below the stall, so it separates "fell back on the deadline" from
+/// "waited for the renderer" without measuring the runner's mood. It bounds only the WAIT; the
+/// budget's exact value is pinned clock-free in `tests/whats_new_composer.rs`.
+const HELP_STALLED_RENDERER_MAX_WAIT: Duration = Duration::from_secs(2);
+
 #[test]
 fn help_stalled_markdown_renderer_fixture() {
     if let Some(marker) = std::env::args().find_map(|argument| {
@@ -9348,14 +9361,26 @@ fn help_stalled_markdown_renderer_fixture() {
             .map(std::path::PathBuf::from)
     }) {
         std::fs::write(marker, "started").expect("fixture writes stall handshake");
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(STALLED_RENDERER_WAIT);
     }
 }
 
 #[test]
-fn open_help_uses_the_composers_single_200ms_budget() {
+fn open_help_falls_back_instead_of_waiting_for_a_stalled_renderer() {
     // T-29: a current-exe fixture writes its handshake before stalling. The handshake rules out a
     // missing/malformed renderer false positive before this test accepts Help's deadline fallback.
+    //
+    // This test owns ONE claim: opening Help does not wait on the renderer. A tight budget assertion
+    // does not belong here — `elapsed < 300ms` for a 200ms budget is a coin flip on a loaded CI
+    // runner, and it failed twice in one day on unrelated PRs before this was widened.
+    //
+    // The budget's VALUE is pinned clock-free in `tests/whats_new_composer.rs`:
+    // `one_absolute_deadline_is_shared_and_observed_remaining_decreases` asserts
+    // `WHATS_NEW_COMPOSE_TIMEOUT == 200ms` AND that every document receives exactly
+    // `opened_at + WHATS_NEW_COMPOSE_TIMEOUT` rather than a fresh timeout each, and
+    // `already_expired_open_uses_precomputed_fallbacks_without_delegation` asserts an expired
+    // deadline skips delegation entirely. Keep the budget's arithmetic there and the wait here:
+    // together they catch a widened budget (there) and a Help that blocks anyway (here).
     let dir = TempDir::new();
     let marker = std::env::temp_dir().join(format!(
         "hfv-help-stall-{}-{}",
@@ -9376,8 +9401,10 @@ fn open_help_uses_the_composers_single_200ms_budget() {
         "the current-exe renderer fixture must start and stall before Help falls back"
     );
     assert!(
-        elapsed < Duration::from_millis(300),
-        "T-29: Help must stay within its 200 ms budget plus bounded scheduling/reap slack: {elapsed:?}"
+        elapsed < HELP_STALLED_RENDERER_MAX_WAIT,
+        "T-29: Help must fall back on its own deadline, not wait for the stalled renderer \
+         (fixture holds {STALLED_RENDERER_WAIT:?}; this test tolerates \
+         {HELP_STALLED_RENDERER_MAX_WAIT:?}): {elapsed:?}"
     );
     assert!(
         ctrl.help_open(),

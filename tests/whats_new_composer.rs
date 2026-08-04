@@ -363,11 +363,14 @@ fn one_absolute_deadline_is_shared_and_observed_remaining_decreases() {
         ..RecordingRenderer::default()
     };
 
+    // Captured so the deadline can be checked against its ORIGIN, not just against itself: without
+    // this, a composer that handed out one shared but differently-sized budget still passed.
+    let opened_at = Instant::now();
     let _ = compose_whats_new(
         &snapshot(true, true, true),
         EMBEDDED,
         &install_guidance(),
-        Instant::now(),
+        opened_at,
         71,
         &mut renderer,
     );
@@ -381,6 +384,19 @@ fn one_absolute_deadline_is_shared_and_observed_remaining_decreases() {
     assert!(
         renderer.calls.iter().all(|call| call.deadline == deadline),
         "every document receives the one Help-open absolute deadline, never a fresh timeout"
+    );
+    // The VALUE of the budget, not merely its sharing. `tests/controller.rs`'s stalled-renderer test
+    // deliberately allows generous slack, so this is the only place the 200 ms figure is pinned:
+    // without it a budget silently widened to seconds would pass the whole suite.
+    assert_eq!(
+        WHATS_NEW_COMPOSE_TIMEOUT,
+        Duration::from_millis(200),
+        "the Help-open composition budget is 200 ms (T-29); widening it is a spec change"
+    );
+    assert_eq!(
+        deadline,
+        opened_at + WHATS_NEW_COMPOSE_TIMEOUT,
+        "the shared deadline is exactly one budget after the Help-open instant"
     );
     assert!(
         renderer.calls.iter().all(|call| {

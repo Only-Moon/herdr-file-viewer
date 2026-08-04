@@ -1024,9 +1024,16 @@ mod tests {
         );
 
         assert!(matches!(result, Err(RendererError::Timeout)));
+        // The claim is BOUNDED vs UNBOUNDED, and the fixture stalls for 60s. 2s is 20x the
+        // requested timeout — ample for a loaded runner (the flakes this replaced were 314-340ms)
+        // while still rejecting a multi-second reap tail, which a 5s bound let through. It is
+        // deliberately NOT `timeout + small slack`: that shape (100ms asserted under 250ms) flaked
+        // on a loaded macOS runner and blocked an unrelated PR. The timeout's exact value is the
+        // caller's argument above, not a stopwatch's job. See AGENTS.md.
         assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "the full capture window plus bounded reap tail must not become an unbounded wait"
+            started.elapsed() < Duration::from_secs(2),
+            "the full capture window plus bounded reap tail must not become an unbounded wait: {:?}",
+            started.elapsed()
         );
     }
 
