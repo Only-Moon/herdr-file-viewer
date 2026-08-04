@@ -64,7 +64,8 @@ and the spec chain):
 - **Presenter**: draw the two-column layout (ratatui)
 - **Input Dispatcher**: map key events → intents (crossterm)
 - **Session Controller**: orchestrate intents → state changes; holds in-memory session state
-- **Editor Launcher**: hand a file off to an external editor / new herdr pane
+- **Editor Launcher**: hand a file off to an external editor in-process, suspending and resuming the
+  TUI around it (NOT a herdr pane — see the herdr integration section)
 
 State is **in-memory and ephemeral only** except for the safe-to-delete, advisory
 `update-check.json` cache, which never changes the viewed root or git repo.
@@ -86,7 +87,7 @@ These shape every decision; violating one is a design error, not a style nit:
 
 ### Stack specifics
 
-- **Rust 1.96 (edition 2024)** + **ratatui 0.30.1** (uses `ratatui-core` 0.1.x) + **crossterm 0.29.0**
+- **Rust 1.96 (edition 2024)** + **ratatui 0.30.x** (uses `ratatui-core` 0.1.x) + **crossterm 0.29.0**
 - **`ansi-to-tui` 8.0.1** ingests the external renderers' ANSI output into ratatui spans, and
   doubles as the **AC-27 escape-neutralizer** (maps styling, drops cursor/screen-control). All file
   content flows through it.
@@ -149,6 +150,14 @@ cargo audit
 
 - **The spec is the contract.** To change scope/criteria/design/stack, edit the artifact at the
   **owning stage** and **re-run the readiness check**, don't ad-hoc-edit downstream specs.
+- **Never weaken a spec-backed assertion to make a change pass.** A test that names an acceptance
+  criterion, and a policy list an AC enumerates (e.g. the exhaustive read-only matrix in
+  `src/intent.rs::intent_effects_never_mutate_files_or_git_and_classify_annotation_edits`, which
+  AC-N3 defines row by row), are the contract in executable form: deleting an
+  entry to accommodate new code silently changes behaviour the spec mandates — in the case that
+  prompted this rule, a required user-visible notice became a silent no-op. If a criterion genuinely
+  should change, change it at the owning stage first (above) and say so in the PR. If a spec-backed
+  test looks wrong, STOP and ask rather than editing it away.
 - **Definition of done for a user-facing feature:** the feature isn't done until the docs match it,
   IN the same PR: `CHANGELOG.md` entry, the relevant `docs/` page (`docs/keys.md` for a key + the
   Shift-keys note for a capital-letter key, `docs/usage.md` for the feature, `docs/configuration.md`
@@ -159,6 +168,59 @@ cargo audit
   not `main`; always `git log main..HEAD` before committing/opening a PR, or strays get swept in.
 - Keep the deterministic tier green (fmt/clippy/`cargo audit`) and tests hermetic.
 
+### Tests prove things deterministically, or they don't count
+
+This suite runs on macOS, Linux and Windows CI runners whose timing and layout differ from any dev
+machine. Three rules, each learned from a real failure here. Unlike the drift guards below, these are
+prose, not build-failing checks — hold yourself to them.
+
+- **Don't assert a tight time budget, and don't prove a negative by sleeping.** Slack that is a small
+  multiple of the thing being measured is a coin flip on a loaded runner (a ~200ms budget asserted
+  under 300ms failed twice in one day), and a "nothing happened" poll passes vacuously when the thing
+  lands after the window closes. Prefer a synchronous, observable tell: `Controller::render_seq` is
+  bumped inside `dispatch_render` BEFORE the worker spawns, so an unchanged seq proves no render was
+  dispatched where counting a stub provider's calls only races it.
+  - **Where a wait is the point, split the claim in two.** Pin the budget's VALUE clock-free
+    (`tests/whats_new_composer.rs` asserts `WHATS_NEW_COMPOSE_TIMEOUT == 200ms` and that every
+    document receives exactly `opened_at + WHATS_NEW_COMPOSE_TIMEOUT`), and let the behavioural test
+    bound only the wait, ~10x the budget and orders of magnitude below the stall it distinguishes
+    from (`HELP_STALLED_RENDERER_MAX_WAIT`). Neither half alone is enough: a widened budget escapes
+    the loose bound, and a blocking call escapes the clock-free test.
+  - **The honest exception is a criterion that IS a latency budget.** AC-22/AC-23 mandate 300ms, so
+    `help_open_switch_scroll_each_within_300ms` (`tests/controller.rs`) must hold a stopwatch — that
+    is the spec, not a testing choice. Keep such tests, give them the widest slack the criterion
+    permits, and don't add new ones without a criterion behind them.
+  - **Two shapes to copy.** For "no work was dispatched", assert `Controller::render_seq` is
+    unchanged (`tests/controller_async.rs`) — it is bumped synchronously inside dispatch, before the
+    job reaches the render worker. For "bounded, not unbounded", bound a long-stalling fixture (60s
+    in `src/proc.rs` / `src/render.rs` / `src/update/gateway.rs`, 30s and an endless loop in
+    `tests/render_delegate.rs`) at a couple of seconds, rather than re-measuring the timeout you
+    passed in — generous enough for a loaded runner, tight enough to still reject a multi-second
+    tail.
+  - **Know the render worker's shape before reasoning about ordering.** There is ONE long-lived
+    worker (`Controller::spawn_worker`) that takes jobs over a channel in order and collapses a
+    backlog, so a newer result landing means every earlier job already finished or was collapsed.
+    That ordering is what lets a test assert with no wait at all; assuming thread-per-render instead
+    leads to inventing sleeps that prove nothing.
+  - **Force the race instead of hoping for it; document a limit only when you truly cannot.** The
+    end-to-end superseded-render tests in `tests/controller_async.rs` look like they prove `poll`'s
+    `seq == latest_seq` guard and do not: their polling loop drains the earlier result first, so
+    removing the guard leaves them green. A gated renderer (`GatedContent`) makes the ordering
+    happen on demand — hold one render open, dispatch a newer one behind it, release the first so
+    its result arrives stale — and that test DOES fail when the guard is removed. Reach for the gate
+    first. Where a race genuinely cannot be forced from outside, write the limit into the test's own
+    comment and name what would prove it, so nobody trusts it past its scope.
+- **Never send a key that assumes state the test has not observed.** In a pty journey `q`/Esc peels
+  ONE state layer per press (`src/controller/mod.rs`: selection → flash → committed search → zoom →
+  discard confirm → quit), and toggles like `z` flip whatever is actually there. A journey that
+  presses a toggle "to undo" a state it never asserted will break on the runner whose layout decided
+  otherwise — which is exactly how a pinned-preview e2e went red 4/4 on ubuntu while green everywhere
+  else. Drive the state you depend on, or make the tail independent of it, and say which in a comment.
+- **A negative that cannot be reproduced locally is not verified.** macOS-only green means nothing for
+  a Linux-only failure: reproduce in a Linux container (`rust:1.96-trixie`, mount the worktree
+  read-only, cache `CARGO_TARGET_DIR` in a volume) before claiming a fix, and say plainly when you
+  could not.
+
 ### Adding a keybinding or a config key (touchpoints + drift guards)
 
 Both surfaces are single-source-of-truth in code, with a build-failing test guarding the docs, so you
@@ -166,7 +228,9 @@ never wire them in two places or let the docs drift.
 
 **A new keybinding / action.** `REGISTRY` in `src/input.rs` is the source of truth: the dispatcher,
 the `?` overlay's Keybindings section, and `[keys]` remapping all derive from it.
-1. Add the variant to the `Intent` enum in `src/intent.rs` (it lives in `Intent::ALL`, 39 today).
+1. Add the variant to the `Intent` enum in `src/intent.rs`, and to its `Intent::ALL` array (whose
+   length constant must be bumped with it — read the current count from the source, don't trust a
+   number written here).
 2. Add a `Binding { intent, name, default_keys, description, category }` row to `REGISTRY`
    (`category` must be one of `CATEGORY_ORDER`).
 3. Handle the intent in the session controller (`src/controller/`).
@@ -176,6 +240,17 @@ the `?` overlay's Keybindings section, and `[keys]` remapping all derive from it
    fail the build if you skip a doc: `keys_doc_table_documents_every_registry_action_ac21` (every
    registry key is in `docs/keys.md`) and `configuration_doc_lists_every_remappable_intent` (every
    registry name is in `docs/configuration.md`).
+
+**A change to how an agent or a launcher invokes the viewer.** The bundled skill
+(`skills/herdr-file-viewer/SKILL.md`), the paste-in block in `docs/usage.md`, and the launcher scripts
+(`scripts/open-file-viewer*.sh`) all teach the same launch, and they have drifted apart before: the
+skill told agents to pass `--cwd` to `herdr plugin pane open`, which cannot spawn the manifest's
+RELATIVE pane command (and inside a built plugin checkout silently runs *that* checkout's binary),
+while the shipped launcher never passed it (#139). Change all of them together, and keep
+`no_documented_launch_passes_cwd_to_plugin_pane_open` (`tests/docs_consistency.rs`) honest — it holds
+the docs and the scripts to one rule so this divergence fails the build instead of reaching a user.
+The viewed root comes from the FOCUSED herdr pane's cwd (resolved to its worktree top level), never
+from a flag.
 
 **A new config key.** `src/config.rs` owns it: add the field to `Config`, resolve it in `resolve`
 into `EffectiveSettings`, and apply it at wiring time. **Docs (same PR):** document it in

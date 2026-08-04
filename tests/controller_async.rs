@@ -17,6 +17,7 @@ use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::text::Text;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,118 @@ impl ContentProvider for SlowContent {
             notices: Vec::new(),
             source: None,
         }
+    }
+}
+
+/// A renderer whose every render blocks until the test releases it, and which reports when each
+/// render has actually STARTED.
+///
+/// This is what makes the superseded-result race forceable instead of hoped for: the test can hold
+/// a render open, dispatch a newer one behind it, then release the first so its result reaches
+/// `poll` while a newer seq is current — the exact ordering `poll`'s `seq == latest_seq` guard
+/// exists to reject, which no amount of sleeping can reliably produce.
+struct GatedContent {
+    started_tx: mpsc::Sender<String>,
+    release_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+impl ContentProvider for GatedContent {
+    fn render(&self, path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        self.started_tx
+            .send(name.clone())
+            .expect("test observes render start");
+        self.release_rx
+            .lock()
+            .expect("release gate")
+            .recv()
+            .expect("test releases the render");
+        RenderResult {
+            content: Text::raw(format!("rendered:{name}")),
+            notices: Vec::new(),
+            source: None,
+        }
+    }
+}
+
+/// AC-23 / the `seq == latest_seq` guard in `poll`: a render result that is SUPERSEDED before it
+/// lands must be dropped, never applied.
+///
+/// The two end-to-end superseded-render tests below cannot prove this — their polling loop drains
+/// the earlier result while waiting for the newest, so removing the guard does not fail them. This
+/// one forces the ordering directly: `a.rs` is held mid-render while `b.rs` is dispatched behind
+/// it, so when `a.rs` is released its result arrives carrying a stale seq. Verified to fail when
+/// the guard is removed.
+#[test]
+fn a_result_superseded_before_it_lands_is_dropped_by_poll() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "1\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "2\n").unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel::<String>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(NoGit),
+            content: Box::new(GatedContent {
+                started_tx: started_tx.clone(),
+                release_rx: Arc::clone(&release_rx),
+            }),
+        }),
+        editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+
+    // a.rs's render is now RUNNING and blocked inside the provider (observed, not assumed).
+    assert_eq!(
+        started_rx.recv().expect("a.rs render starts"),
+        "a.rs",
+        "the initial selection renders first"
+    );
+
+    // Dispatch b.rs behind it: `latest_seq` moves on while a.rs's result does not yet exist.
+    ctrl.handle(Intent::NavDown);
+    assert_eq!(
+        flatten(ctrl.content()),
+        LOADING_PLACEHOLDER,
+        "precondition: b.rs is selected and still rendering"
+    );
+
+    // Release a.rs: its result is produced and sent NOW, carrying the superseded seq.
+    release_tx.send(()).expect("release a.rs");
+    // b.rs's render starting is proof the worker has finished sending a.rs's result — the ordered
+    // worker takes the next job only after the previous one is sent. So the stale result is
+    // already sitting in the channel, waiting for `poll`, with no sleeping involved.
+    assert_eq!(
+        started_rx.recv().expect("b.rs render starts"),
+        "b.rs",
+        "the worker moved on to b.rs, so a.rs's stale result has been sent"
+    );
+
+    ctrl.poll();
+    assert_eq!(
+        flatten(ctrl.content()),
+        LOADING_PLACEHOLDER,
+        "a superseded result must be DROPPED by poll, not applied to the newer selection"
+    );
+
+    // And the newest result still lands normally, so the guard drops stale work without breaking
+    // the live path.
+    release_tx.send(()).expect("release b.rs");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        ctrl.poll();
+        if flatten(ctrl.content()) == "rendered:b.rs" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "b.rs never landed");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -327,8 +440,9 @@ fn a_superseded_render_does_not_overwrite_a_newer_selection() {
         assert!(Instant::now() < deadline, "final selection never rendered");
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Give any stale (a.rs/b.rs) results a chance to wrongly land, then re-check.
-    std::thread::sleep(Duration::from_millis(50));
+    // No sleep, and none needed: renders run on ONE worker thread (`Controller::spawn_worker`) that
+    // takes jobs in order and collapses a backlog, so c.rs's result having landed means every
+    // earlier job already completed or was collapsed away. Nothing can arrive afterwards.
     ctrl.poll();
     assert_eq!(
         flatten(ctrl.content()),
@@ -630,7 +744,14 @@ fn a_superseded_render_does_not_overwrite_the_loading_placeholder_nor_the_pane()
         assert!(Instant::now() < deadline, "c.rs render never landed");
         std::thread::sleep(Duration::from_millis(5));
     }
-    std::thread::sleep(Duration::from_millis(50));
+    // No sleep: the single ordered worker means c.rs landing implies b.rs's job already completed
+    // or was collapsed, so no stale result can arrive after this point.
+    //
+    // Scope, so this is not over-trusted: it does NOT prove `poll`'s `seq == latest_seq` guard.
+    // Removing that guard does not fail it, because the polling loop above drains b.rs's earlier
+    // result while waiting for c.rs. The guard is proved separately, by forcing the ordering with a
+    // gated renderer, in `a_result_superseded_before_it_lands_is_dropped_by_poll`. This stays an
+    // end-to-end sanity check of the happy path.
     ctrl.poll();
     assert_eq!(
         flatten(ctrl.content()),
@@ -745,9 +866,17 @@ fn a_width_change_reflows_markdown_at_the_new_width_but_a_height_change_does_not
     );
 
     // A height-only change (same width) must NOT reflow — no further render is dispatched.
+    // `render_seq` is bumped synchronously inside dispatch, BEFORE the worker spawns, so an
+    // unchanged seq proves the absence outright; the delegate count is corroboration, not the
+    // oracle (it lags the dispatch by a thread hop, so on its own it would pass vacuously).
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.set_content_viewport(50, 14);
-    std::thread::sleep(Duration::from_millis(50)); // give any (wrong) reflow time to land
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "a height-only change must not dispatch a re-render"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
@@ -825,8 +954,15 @@ fn a_width_change_does_not_reflow_non_markdown() {
     await_contains(&mut ctrl, "w=None:a.rs");
 
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.set_content_viewport(50, 10); // width change, but the selection is code, not markdown
-    std::thread::sleep(Duration::from_millis(50));
+    // Synchronous proof of absence; see the height-only case above for why the count alone is not
+    // the oracle.
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "a resize must not dispatch a re-render for a width-independent view"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
@@ -879,13 +1015,19 @@ fn toggle_wrap_on_a_code_file_dispatches_no_render() {
     await_contains(&mut ctrl, "w=None:a.rs");
     ctrl.set_content_viewport(50, 10); // code view is width-independent → no reflow
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.handle(Intent::ToggleWrap); // toggle wrap on a code file
-    std::thread::sleep(Duration::from_millis(50)); // give any (wrong) dispatch time to land
+    // Synchronous proof of absence: the seq is bumped inside dispatch before the worker spawns.
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "toggling wrap on a code file must not dispatch a render"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
         before,
-        "toggling wrap on a code file must not dispatch a render"
+        "and no delegate call may land afterwards"
     );
 }
 
