@@ -86,7 +86,7 @@ These shape every decision; violating one is a design error, not a style nit:
 
 ### Stack specifics
 
-- **Rust 1.96 (edition 2024)** + **ratatui 0.30.1** (uses `ratatui-core` 0.1.x) + **crossterm 0.29.0**
+- **Rust 1.96 (edition 2024)** + **ratatui 0.30.x** (uses `ratatui-core` 0.1.x) + **crossterm 0.29.0**
 - **`ansi-to-tui` 8.0.1** ingests the external renderers' ANSI output into ratatui spans, and
   doubles as the **AC-27 escape-neutralizer** (maps styling, drops cursor/screen-control). All file
   content flows through it.
@@ -149,6 +149,13 @@ cargo audit
 
 - **The spec is the contract.** To change scope/criteria/design/stack, edit the artifact at the
   **owning stage** and **re-run the readiness check**, don't ad-hoc-edit downstream specs.
+- **Never weaken a spec-backed assertion to make a change pass.** A test that names an acceptance
+  criterion, and a policy list an AC enumerates (e.g. `focus_policy::unavailable_from_pinned`, which
+  AC-31/AC-32 define and a test asserts row by row), are the contract in executable form: deleting an
+  entry to accommodate new code silently changes behaviour the spec mandates — in the case that
+  prompted this rule, a required user-visible notice became a silent no-op. If a criterion genuinely
+  should change, change it at the owning stage first (above) and say so in the PR. If a spec-backed
+  test looks wrong, STOP and ask rather than editing it away.
 - **Definition of done for a user-facing feature:** the feature isn't done until the docs match it,
   IN the same PR: `CHANGELOG.md` entry, the relevant `docs/` page (`docs/keys.md` for a key + the
   Shift-keys note for a capital-letter key, `docs/usage.md` for the feature, `docs/configuration.md`
@@ -193,7 +200,9 @@ never wire them in two places or let the docs drift.
 
 **A new keybinding / action.** `REGISTRY` in `src/input.rs` is the source of truth: the dispatcher,
 the `?` overlay's Keybindings section, and `[keys]` remapping all derive from it.
-1. Add the variant to the `Intent` enum in `src/intent.rs` (it lives in `Intent::ALL`, 39 today).
+1. Add the variant to the `Intent` enum in `src/intent.rs`, and to its `Intent::ALL` array (whose
+   length constant must be bumped with it — read the current count from the source, don't trust a
+   number written here).
 2. Add a `Binding { intent, name, default_keys, description, category }` row to `REGISTRY`
    (`category` must be one of `CATEGORY_ORDER`).
 3. Handle the intent in the session controller (`src/controller/`).
