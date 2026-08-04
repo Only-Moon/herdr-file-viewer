@@ -159,6 +159,33 @@ cargo audit
   not `main`; always `git log main..HEAD` before committing/opening a PR, or strays get swept in.
 - Keep the deterministic tier green (fmt/clippy/`cargo audit`) and tests hermetic.
 
+### Tests prove things deterministically, or they don't count
+
+This suite runs on macOS, Linux and Windows CI runners whose timing and layout differ from any dev
+machine. Three rules, each learned from a real failure here. Unlike the drift guards below, these are
+prose, not build-failing checks — hold yourself to them.
+
+- **Don't assert a tight time budget, and don't prove a negative by sleeping.** Asserting a *generous*
+  timeout fired is fine (`src/proc.rs`, `src/update/gateway.rs` do it deliberately); asserting a
+  ~200ms operation finished inside 300ms is a coin flip on a loaded runner, and a "nothing happened"
+  poll passes vacuously when the thing happens after the window closes. Prefer a synchronous,
+  observable tell: `Controller::render_seq` is bumped inside `dispatch_render` BEFORE the worker
+  spawns, so an unchanged seq proves no render was dispatched, where counting a stub provider's calls
+  only races it. Where a wait is the point, separate the two claims: pin the budget's arithmetic in a
+  clock-free unit test (`tests/whats_new_composer.rs` asserts every document gets the one
+  `opened_at + WHATS_NEW_COMPOSE_TIMEOUT` instant) and let the behavioural test assert only that the
+  code did not wait, with a bound orders of magnitude below the stall it is distinguishing from.
+- **Never send a key that assumes state the test has not observed.** In a pty journey `q`/Esc peels
+  ONE state layer per press (`src/controller/mod.rs`: selection → flash → committed search → zoom →
+  discard confirm → quit), and toggles like `z` flip whatever is actually there. A journey that
+  presses a toggle "to undo" a state it never asserted will break on the runner whose layout decided
+  otherwise — which is exactly how a pinned-preview e2e went red 4/4 on ubuntu while green everywhere
+  else. Drive the state you depend on, or make the tail independent of it, and say which in a comment.
+- **A negative that cannot be reproduced locally is not verified.** macOS-only green means nothing for
+  a Linux-only failure: reproduce in a Linux container (`rust:1.96-trixie`, mount the worktree
+  read-only, cache `CARGO_TARGET_DIR` in a volume) before claiming a fix, and say plainly when you
+  could not.
+
 ### Adding a keybinding or a config key (touchpoints + drift guards)
 
 Both surfaces are single-source-of-truth in code, with a build-failing test guarding the docs, so you
@@ -176,6 +203,17 @@ the `?` overlay's Keybindings section, and `[keys]` remapping all derive from it
    fail the build if you skip a doc: `keys_doc_table_documents_every_registry_action_ac21` (every
    registry key is in `docs/keys.md`) and `configuration_doc_lists_every_remappable_intent` (every
    registry name is in `docs/configuration.md`).
+
+**A change to how an agent or a launcher invokes the viewer.** The bundled skill
+(`skills/herdr-file-viewer/SKILL.md`), the paste-in block in `docs/usage.md`, and the launcher scripts
+(`scripts/open-file-viewer*.sh`) all teach the same launch, and they have drifted apart before: the
+skill told agents to pass `--cwd` to `herdr plugin pane open`, which cannot spawn the manifest's
+RELATIVE pane command (and inside a built plugin checkout silently runs *that* checkout's binary),
+while the shipped launcher never passed it (#139). Change all of them together, and keep
+`no_documented_launch_passes_cwd_to_plugin_pane_open` (`tests/docs_consistency.rs`) honest — it holds
+the docs and the scripts to one rule so this divergence fails the build instead of reaching a user.
+The viewed root comes from the FOCUSED herdr pane's cwd (resolved to its worktree top level), never
+from a flag.
 
 **A new config key.** `src/config.rs` owns it: add the field to `Config`, resolve it in `resolve`
 into `EffectiveSettings`, and apply it at wiring time. **Docs (same PR):** document it in

@@ -9324,6 +9324,13 @@ fn slow_markdown_renderers(marker: &std::path::Path) -> Renderers {
     }
 }
 
+/// How long the stalled-renderer fixture holds once it has written its handshake.
+///
+/// The gap between this and Help's own 200 ms budget is what makes the wait assertion below
+/// robust: the test only has to separate "fell back on the deadline" from "waited for the
+/// renderer", and those are two orders of magnitude apart.
+const STALLED_RENDERER_WAIT: Duration = Duration::from_secs(60);
+
 #[test]
 fn help_stalled_markdown_renderer_fixture() {
     if let Some(marker) = std::env::args().find_map(|argument| {
@@ -9332,14 +9339,25 @@ fn help_stalled_markdown_renderer_fixture() {
             .map(std::path::PathBuf::from)
     }) {
         std::fs::write(marker, "started").expect("fixture writes stall handshake");
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(STALLED_RENDERER_WAIT);
     }
 }
 
 #[test]
-fn open_help_uses_the_composers_single_200ms_budget() {
+fn open_help_falls_back_instead_of_waiting_for_a_stalled_renderer() {
     // T-29: a current-exe fixture writes its handshake before stalling. The handshake rules out a
     // missing/malformed renderer false positive before this test accepts Help's deadline fallback.
+    //
+    // This test owns ONE claim: opening Help does not wait on the renderer. The fixture stalls for
+    // 60s, so any bound far below that proves the deadline fired — no tight budget assertion is
+    // needed, and none belongs here: `elapsed < 300ms` for a 200ms budget is a coin flip on a loaded
+    // CI runner, and it failed twice in one day on unrelated PRs before this was widened.
+    //
+    // The 200ms budget ITSELF is pinned deterministically, without a clock, by the composer tests in
+    // `tests/whats_new_composer.rs`: `one_absolute_deadline_is_shared_and_observed_remaining_decreases`
+    // asserts every document receives the single `opened_at + WHATS_NEW_COMPOSE_TIMEOUT` instant
+    // rather than a fresh timeout each, and `already_expired_open_uses_precomputed_fallbacks_without_delegation`
+    // asserts an expired deadline skips delegation entirely. Keep the budget's arithmetic there.
     let dir = TempDir::new();
     let marker = std::env::temp_dir().join(format!(
         "hfv-help-stall-{}-{}",
@@ -9360,8 +9378,9 @@ fn open_help_uses_the_composers_single_200ms_budget() {
         "the current-exe renderer fixture must start and stall before Help falls back"
     );
     assert!(
-        elapsed < Duration::from_millis(300),
-        "T-29: Help must stay within its 200 ms budget plus bounded scheduling/reap slack: {elapsed:?}"
+        elapsed < STALLED_RENDERER_WAIT / 6,
+        "T-29: Help must fall back on its own deadline, not wait for the stalled renderer \
+         (which holds for {STALLED_RENDERER_WAIT:?}): {elapsed:?}"
     );
     assert!(
         ctrl.help_open(),
