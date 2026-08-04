@@ -17,6 +17,7 @@ use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::text::Text;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,16 +29,54 @@ const LOADING_PLACEHOLDER: &str = "Rendering\u{2026}";
 /// A renderer that sleeps before producing output — the stand-in for a slow external CLI.
 struct SlowContent {
     delay: Duration,
+    /// Renders currently executing: incremented on entry, decremented on exit. Renders run on a
+    /// thread each, so results can arrive in any order and a superseded one may still be in flight
+    /// when the newest lands. A test that must prove "the stale result never overwrote" waits for
+    /// this to reach zero — once no render is running and no new one has been dispatched, nothing
+    /// can land later. Sleeping instead is a vacuous negative: if the stale result finishes after
+    /// the window, the assertion passes and the bug ships.
+    in_flight: Option<Arc<AtomicUsize>>,
 }
 impl ContentProvider for SlowContent {
     fn render(&self, path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        if let Some(in_flight) = &self.in_flight {
+            in_flight.fetch_add(1, Ordering::SeqCst);
+        }
         std::thread::sleep(self.delay);
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if let Some(in_flight) = &self.in_flight {
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
         RenderResult {
             content: Text::raw(format!("rendered:{name}")),
             notices: Vec::new(),
             source: None,
         }
+    }
+}
+
+/// Block until no render is executing, so any superseded result has already been produced.
+///
+/// Deterministic where a fixed sleep is not: it waits for the observable event (the worker
+/// finishing) rather than guessing how long that takes on this machine. With no dispatch after the
+/// one under test, in-flight reaching zero is permanent — nothing can land afterwards.
+///
+/// HONEST LIMIT, do not over-trust the callers below: this makes the WAIT deterministic, not the
+/// detection. Renders run a thread each, and the caller's polling loop drains earlier results while
+/// waiting for the newest, so a stale result that finishes BEFORE the newest is applied and
+/// superseded harmlessly. Verified: perturbing `poll` to apply stale results (dropping its
+/// `seq == latest_seq` guard) does NOT fail those tests. The seq guard's real proof would be a
+/// direct unit test feeding `poll` a stale-seq result; these two remain end-to-end sanity checks.
+fn await_renders_settled(ctrl: &mut Controller, in_flight: &AtomicUsize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        ctrl.poll();
+        assert!(
+            Instant::now() < deadline,
+            "renders never settled: {} still in flight",
+            in_flight.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -182,7 +221,10 @@ fn a_select_intent_does_not_block_on_a_slow_render_and_content_arrives_later() {
     let components = Components {
         providers: Box::new(move |_resolved| RootProviders {
             git: Arc::new(NoGit),
-            content: Box::new(SlowContent { delay }), // `delay` is Copy → fresh each call
+            content: Box::new(SlowContent {
+                delay,
+                in_flight: None,
+            }), // `delay` is Copy → fresh each call
         }),
         editor: Box::new(NoEditor),
         clipboard: Box::new(common::RecordingClipboard::default()),
@@ -254,6 +296,7 @@ fn full_diff_mode_asks_git_for_whole_file_context() {
             git: Arc::clone(&git),
             content: Box::new(SlowContent {
                 delay: Duration::from_millis(0),
+                in_flight: None,
             }),
         }),
         editor: Box::new(NoEditor),
@@ -297,11 +340,14 @@ fn a_superseded_render_does_not_overwrite_a_newer_selection() {
     std::fs::write(dir.path().join("b.rs"), "2\n").unwrap();
     std::fs::write(dir.path().join("c.rs"), "3\n").unwrap();
 
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let in_flight_probe = Arc::clone(&in_flight);
     let components = Components {
         providers: Box::new(move |_resolved| RootProviders {
             git: Arc::new(NoGit),
             content: Box::new(SlowContent {
                 delay: Duration::from_millis(80),
+                in_flight: Some(Arc::clone(&in_flight_probe)),
             }),
         }),
         editor: Box::new(NoEditor),
@@ -327,8 +373,10 @@ fn a_superseded_render_does_not_overwrite_a_newer_selection() {
         assert!(Instant::now() < deadline, "final selection never rendered");
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Give any stale (a.rs/b.rs) results a chance to wrongly land, then re-check.
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait until no render is still executing, so any stale (a.rs/b.rs) result has been produced
+    // and had its real chance to wrongly land. A fixed sleep would pass vacuously whenever the
+    // stale render finished after the window.
+    await_renders_settled(&mut ctrl, &in_flight);
     ctrl.poll();
     assert_eq!(
         flatten(ctrl.content()),
@@ -407,7 +455,10 @@ fn a_slow_render_shows_a_loading_placeholder_and_switches_title_with_body() {
     let components = Components {
         providers: Box::new(move |_resolved| RootProviders {
             git: Arc::new(NoGit),
-            content: Box::new(SlowContent { delay }),
+            content: Box::new(SlowContent {
+                delay,
+                in_flight: None,
+            }),
         }),
         editor: Box::new(NoEditor),
         clipboard: Box::new(common::RecordingClipboard::default()),
@@ -505,7 +556,10 @@ fn the_left_gap_follows_the_displayed_file_not_the_selection_during_a_slow_rende
     let components = Components {
         providers: Box::new(move |_resolved| RootProviders {
             git: Arc::new(NoGit),
-            content: Box::new(SlowContent { delay }),
+            content: Box::new(SlowContent {
+                delay,
+                in_flight: None,
+            }),
         }),
         editor: Box::new(NoEditor),
         clipboard: Box::new(common::RecordingClipboard::default()),
@@ -574,11 +628,14 @@ fn a_superseded_render_does_not_overwrite_the_loading_placeholder_nor_the_pane()
     std::fs::write(dir.path().join("b.rs"), "2\n").unwrap();
     std::fs::write(dir.path().join("c.rs"), "3\n").unwrap();
 
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let in_flight_probe = Arc::clone(&in_flight);
     let components = Components {
         providers: Box::new(move |_resolved| RootProviders {
             git: Arc::new(NoGit),
             content: Box::new(SlowContent {
                 delay: Duration::from_millis(80),
+                in_flight: Some(Arc::clone(&in_flight_probe)),
             }),
         }),
         editor: Box::new(NoEditor),
@@ -630,7 +687,9 @@ fn a_superseded_render_does_not_overwrite_the_loading_placeholder_nor_the_pane()
         assert!(Instant::now() < deadline, "c.rs render never landed");
         std::thread::sleep(Duration::from_millis(5));
     }
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait until no render is still executing, so b.rs's superseded result has been produced and
+    // had its chance to land, rather than sleeping and hoping it arrived in time.
+    await_renders_settled(&mut ctrl, &in_flight);
     ctrl.poll();
     assert_eq!(
         flatten(ctrl.content()),
@@ -745,9 +804,17 @@ fn a_width_change_reflows_markdown_at_the_new_width_but_a_height_change_does_not
     );
 
     // A height-only change (same width) must NOT reflow — no further render is dispatched.
+    // `render_seq` is bumped synchronously inside dispatch, BEFORE the worker spawns, so an
+    // unchanged seq proves the absence outright; the delegate count is corroboration, not the
+    // oracle (it lags the dispatch by a thread hop, so on its own it would pass vacuously).
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.set_content_viewport(50, 14);
-    std::thread::sleep(Duration::from_millis(50)); // give any (wrong) reflow time to land
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "a height-only change must not dispatch a re-render"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
@@ -825,8 +892,15 @@ fn a_width_change_does_not_reflow_non_markdown() {
     await_contains(&mut ctrl, "w=None:a.rs");
 
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.set_content_viewport(50, 10); // width change, but the selection is code, not markdown
-    std::thread::sleep(Duration::from_millis(50));
+    // Synchronous proof of absence; see the height-only case above for why the count alone is not
+    // the oracle.
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "a resize must not dispatch a re-render for a width-independent view"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
@@ -879,13 +953,19 @@ fn toggle_wrap_on_a_code_file_dispatches_no_render() {
     await_contains(&mut ctrl, "w=None:a.rs");
     ctrl.set_content_viewport(50, 10); // code view is width-independent → no reflow
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.handle(Intent::ToggleWrap); // toggle wrap on a code file
-    std::thread::sleep(Duration::from_millis(50)); // give any (wrong) dispatch time to land
+    // Synchronous proof of absence: the seq is bumped inside dispatch before the worker spawns.
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "toggling wrap on a code file must not dispatch a render"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
         before,
-        "toggling wrap on a code file must not dispatch a render"
+        "and no delegate call may land afterwards"
     );
 }
 
