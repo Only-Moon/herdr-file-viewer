@@ -107,11 +107,13 @@ mod tests {
 
         assert_eq!(wait_bounded(&mut child, Duration::from_millis(100)), None);
         // Bounded vs unbounded: the fixture child stalls for 60s, so this proves termination and
-        // reaping returned rather than waiting on it. Not `timeout + small slack` (100ms asserted
-        // under 250ms), which is a coin flip on a loaded runner — see AGENTS.md, "Tests prove
-        // things deterministically".
+        // reaping returned rather than waiting on it. 2s is 20x the requested timeout — ample for a
+        // loaded runner (the flakes this replaced were 314-340ms) while still rejecting a
+        // multi-second reap tail, which a 5s bound let through. Not `timeout + small slack` (100ms
+        // asserted under 250ms): that is a coin flip. See AGENTS.md, "Tests prove things
+        // deterministically".
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(2),
             "termination and reaping must return rather than wait out the stalled child: {:?}",
             started.elapsed()
         );

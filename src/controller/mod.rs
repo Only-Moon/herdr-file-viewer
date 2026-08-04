@@ -1621,8 +1621,9 @@ impl Controller {
     /// The most recently dispatched render's sequence number.
     ///
     /// A read-only observability seam for tests: both [`dispatch_render`](Self::dispatch_render)
-    /// and [`dispatch_reflow`](Self::dispatch_reflow) bump this SYNCHRONOUSLY before spawning the
-    /// worker, so an unchanged value proves no render was dispatched. That is the deterministic
+    /// and [`dispatch_reflow`](Self::dispatch_reflow) bump this SYNCHRONOUSLY before the job is
+    /// sent to the (already running, single) render worker, so an unchanged value proves no render
+    /// was dispatched. That is the deterministic
     /// way to assert a negative here — sleeping to "give a wrong render time to land" passes
     /// vacuously whenever the render lands after the window (see AGENTS.md, "Tests prove things
     /// deterministically").

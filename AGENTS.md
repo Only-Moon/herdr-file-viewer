@@ -151,10 +151,9 @@ cargo audit
 - **The spec is the contract.** To change scope/criteria/design/stack, edit the artifact at the
   **owning stage** and **re-run the readiness check**, don't ad-hoc-edit downstream specs.
 - **Never weaken a spec-backed assertion to make a change pass.** A test that names an acceptance
-  criterion, and a policy list an AC enumerates (e.g. `focus_policy::unavailable_from_pinned`, which
-  AC-31/AC-32 define and which `focus_policy::tests::pinned_rejection_set_is_exact` plus
-  `pinned_preview::pinned_unavailable_actions_are_consumed_with_a_notice` assert row by row), are the
-  contract in executable form: deleting an
+  criterion, and a policy list an AC enumerates (e.g. the exhaustive read-only matrix in
+  `src/intent.rs::intent_effects_never_mutate_files_or_git_and_classify_annotation_edits`, which
+  AC-N3 defines row by row), are the contract in executable form: deleting an
   entry to accommodate new code silently changes behaviour the spec mandates — in the case that
   prompted this rule, a required user-visible notice became a silent no-op. If a criterion genuinely
   should change, change it at the owning stage first (above) and say so in the PR. If a spec-backed
@@ -193,16 +192,21 @@ prose, not build-failing checks — hold yourself to them.
     permits, and don't add new ones without a criterion behind them.
   - **Two shapes to copy.** For "no work was dispatched", assert `Controller::render_seq` is
     unchanged (`tests/controller_async.rs`) — it is bumped synchronously inside dispatch, before the
-    worker spawns. For "the work finished and nothing is still running", wait on an observable
-    in-flight counter, never a duration (`await_renders_settled`, same file). For "bounded, not
-    unbounded", bound a 60s stall fixture at seconds (`src/proc.rs`, `src/render.rs`,
-    `src/update/gateway.rs`, `tests/render_delegate.rs`) rather than re-measuring the timeout you
-    passed in.
-  - **Say so when a test cannot prove its negative.** Some races cannot be forced from outside: the
-    superseded-render tests in `tests/controller_async.rs` only catch a stale result that lands
-    AFTER the newest, so perturbing `poll`'s `seq == latest_seq` guard does not fail them. Their
-    comment says exactly that, and names the unit test that would prove it. A test whose limits are
-    written down is worth more than one silently trusted past them.
+    job reaches the render worker. For "bounded, not unbounded", bound a long-stalling fixture (60s
+    in `src/proc.rs` / `src/render.rs` / `src/update/gateway.rs`, 30s and an endless loop in
+    `tests/render_delegate.rs`) at a couple of seconds, rather than re-measuring the timeout you
+    passed in — generous enough for a loaded runner, tight enough to still reject a multi-second
+    tail.
+  - **Know the render worker's shape before reasoning about ordering.** There is ONE long-lived
+    worker (`Controller::spawn_worker`) that takes jobs over a channel in order and collapses a
+    backlog, so a newer result landing means every earlier job already finished or was collapsed.
+    That ordering is what lets a test assert with no wait at all; assuming thread-per-render instead
+    leads to inventing sleeps that prove nothing.
+  - **Say so when a test cannot prove its negative.** The superseded-render tests in
+    `tests/controller_async.rs` only catch a stale result that lands AFTER the newest, and the
+    polling loop drains earlier results first — so removing `poll`'s `seq == latest_seq` guard does
+    NOT fail them. Their comment says exactly that, and names the unit test that would prove it. A
+    test whose limits are written down is worth more than one silently trusted past them.
 - **Never send a key that assumes state the test has not observed.** In a pty journey `q`/Esc peels
   ONE state layer per press (`src/controller/mod.rs`: selection → flash → committed search → zoom →
   discard confirm → quit), and toggles like `z` flip whatever is actually there. A journey that
