@@ -24,6 +24,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -187,7 +188,7 @@ fn controller(root: &Path) -> Controller {
         renderers: None,
     };
     Controller::new(
-        common::resolved(root.to_path_buf(), false),
+        common::resolved(root.to_path_buf(), root.join(".git").is_dir()),
         Baseline::Head,
         components,
     )
@@ -367,9 +368,9 @@ fn pin_focus_cycles_and_removal_returns_focus_to_active() {
 
     assert_eq!(ctrl.focus(), Focus::Tree);
     ctrl.handle(Intent::ToggleFocus);
-    assert_eq!(ctrl.focus(), Focus::Pinned);
-    ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Tree);
 
@@ -402,6 +403,8 @@ fn pinned_search_navigation_moves_only_the_pinned_search_and_viewport_with_wrap_
         active: (8, 4),
         pinned: Some((8, 4)),
     });
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     let active_before = ctrl.active_interaction().clone();
@@ -452,6 +455,8 @@ fn pinned_search_navigation_moves_only_the_pinned_search_and_viewport_with_wrap_
 fn pinned_search_cancel_restores_its_saved_scroll_and_clears_the_search() {
     let (_dir, mut ctrl) = pin_ready_controller();
     ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     for _ in 0..3 {
         ctrl.handle(Intent::NavDown);
@@ -501,6 +506,8 @@ fn close_from_pinned_focus_dismisses_the_visible_active_search_before_quitting()
         "precondition: a committed active search is highlighted"
     );
     ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
 
     let fx = ctrl.handle(Intent::Close);
@@ -531,9 +538,11 @@ fn close_from_pinned_focus_quits_past_a_hidden_active_search() {
     }
     ctrl.handle_prompt_key(key(KeyCode::Enter));
     ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
-    // The narrow fallback draws only the focused pinned region; the hidden active pane reports
-    // a zero viewport. Its highlights are off screen, so close must not burn a keypress on them.
+    // This fixture explicitly hides the active viewport, so close must not burn a keypress on its
+    // off-screen search even though the pin remains visible.
     ctrl.set_preview_viewports(PreviewViewports {
         active: (0, 0),
         pinned: Some((8, 4)),
@@ -551,12 +560,16 @@ fn close_from_pinned_focus_quits_past_a_hidden_active_search() {
 fn close_from_active_focus_dismisses_the_visible_pinned_search_before_quitting() {
     let (_dir, mut ctrl) = pin_ready_controller();
     ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::OpenSearch);
     for ch in "place".chars() {
         ctrl.handle_prompt_key(key(KeyCode::Char(ch)));
     }
     ctrl.handle_prompt_key(key(KeyCode::Enter));
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Tree);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Content);
 
@@ -581,6 +594,8 @@ fn close_from_active_focus_dismisses_the_visible_pinned_search_before_quitting()
 #[test]
 fn pinned_scroll_search_and_paging_do_not_touch_active_interaction() {
     let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
 
@@ -644,6 +659,9 @@ fn pinned_unavailable_actions_are_consumed_with_a_notice() {
     });
     ctrl.set_opener(Box::new(CountingOpener(Arc::clone(&opener_calls))));
     ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
     let unavailable = [
         Intent::Activate,
         Intent::OpenFullscreen,
@@ -684,6 +702,8 @@ fn pinned_unavailable_actions_are_consumed_with_a_notice() {
 #[test]
 fn pinned_incremental_search_borrows_its_document_and_preserves_matches() {
     let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::OpenSearch);
@@ -757,42 +777,27 @@ fn pinned_incremental_search_borrows_its_document_and_preserves_matches() {
 }
 
 #[test]
-fn hiding_a_pin_resets_its_viewport_before_pinned_paging() {
+fn hiding_a_pin_keeps_no_pin_geometry_and_skips_pinned_focus() {
     let (_dir, mut ctrl) = pin_ready_controller();
-    let wide = draw_viewports(&ctrl, 150, 12);
-    assert!(
-        wide.pinned.is_some(),
-        "wide layout draws the pinned preview"
-    );
-    ctrl.set_preview_viewports(wide);
-
-    ctrl.handle(Intent::ToggleFocus);
-    assert_eq!(ctrl.focus(), Focus::Pinned);
-    for _ in 0..100 {
-        ctrl.handle(Intent::NavDown);
-    }
-    let scroll_at_wide_bottom = ctrl.view_state().pinned.expect("pin stays present").scroll;
-    assert!(
-        scroll_at_wide_bottom > 0,
-        "wide viewport clamps before the end"
-    );
-
-    ctrl.handle(Intent::ToggleFocus);
-    ctrl.handle(Intent::ToggleFocus);
-    assert_eq!(ctrl.focus(), Focus::Tree);
+    let no_pin = {
+        ctrl.handle(Intent::PinPreview);
+        let viewports = draw_viewports(&ctrl, 60, 12);
+        ctrl.handle(Intent::PinPreview);
+        viewports
+    };
     let narrow = draw_viewports(&ctrl, 60, 12);
-    assert_eq!(narrow.pinned, None, "tree fallback hides the pin");
-    assert_eq!(narrow.active, (0, 0), "tree fallback also hides active");
-    ctrl.set_preview_viewports(narrow);
-
-    ctrl.handle(Intent::ToggleFocus);
-    assert_eq!(ctrl.focus(), Focus::Pinned);
-    ctrl.handle(Intent::PageDown);
+    assert_eq!(narrow.pinned, None, "the narrow layout hides the pin only");
     assert_eq!(
-        ctrl.view_state().pinned.expect("pin stays present").scroll,
-        scroll_at_wide_bottom + 1,
-        "the hidden pin has a zero-height viewport, so paging advances only the one-row floor"
+        narrow.active, no_pin.active,
+        "AC-16: pinning never changes active geometry"
     );
+
+    ctrl.set_preview_viewports(narrow);
+    assert_eq!(ctrl.focus(), Focus::Tree);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Tree, "the hidden pin is never focused");
 }
 
 #[test]
@@ -808,8 +813,14 @@ fn pinned_y_copies_the_captured_root_relative_path_after_re_root() {
     ctrl.handle(Intent::PinPreview);
     ctrl.re_root(new_root.path());
     await_content(&mut ctrl);
+    ctrl.set_preview_viewports(PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
     std::fs::remove_dir_all(original_root.path()).unwrap();
 
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::CopyRepoPath);
@@ -843,8 +854,14 @@ fn pinned_capital_y_copies_a_sanitized_captured_absolute_path_after_root_removal
     ctrl.handle(Intent::PinPreview);
     ctrl.re_root(new_root.path());
     await_content(&mut ctrl);
+    ctrl.set_preview_viewports(PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
     std::fs::remove_dir_all(original_root.path()).unwrap();
 
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::CopyAbsPath);
@@ -865,12 +882,16 @@ fn pinned_capital_y_copies_a_sanitized_captured_absolute_path_after_root_removal
 fn active_zoom_keeps_pin_while_pinned_fullscreen_is_rejected() {
     let (_dir, mut ctrl) = pin_ready_controller();
     ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::OpenFullscreen);
     assert!(!ctrl.zoomed());
     assert!(ctrl.view_state().pinned.is_some());
     assert!(ctrl.action_notice().is_some());
 
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Tree);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::OpenFullscreen);
@@ -881,6 +902,8 @@ fn active_zoom_keeps_pin_while_pinned_fullscreen_is_rejected() {
 #[test]
 fn tree_hidden_focus_cycles_between_pinned_and_active() {
     let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::ToggleZoom);
@@ -1177,6 +1200,12 @@ fn pin_lifecycle_clones_the_settled_preview_and_toggles_the_same_identity() {
         "the captured search keeps its non-zero current match"
     );
     assert_eq!(ctrl.view_state().preview_split_pct, 50);
+    ctrl.set_preview_viewports(PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     assert!(
@@ -1267,6 +1296,19 @@ fn preview_resize_intents_move_only_the_pinned_share_and_preserve_it_across_repi
 }
 
 #[test]
+fn preview_resize_intents_are_inert_when_the_pin_is_not_drawn() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.set_preview_viewports(PreviewViewports {
+        active: (8, 4),
+        pinned: None,
+    });
+    let ratio = ctrl.view_state().preview_split_pct;
+    assert!(!ctrl.handle(Intent::ShrinkPreview).redraw);
+    assert!(!ctrl.handle(Intent::GrowPreview).redraw);
+    assert_eq!(ctrl.view_state().preview_split_pct, ratio);
+}
+
+#[test]
 fn preview_resize_intents_are_inert_without_a_pin() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
@@ -1290,8 +1332,8 @@ fn mouse_routes_pinned_scroll_and_preview_divider_drag_without_touching_active()
         preview_area_x: 40,
         preview_area_width: 50,
         preview_divider_x: Some(65),
-        pinned_inner: Some(Rect::new(40, 1, 8, 4)),
-        content_inner: Some(Rect::new(65, 1, 8, 4)),
+        content_inner: Some(Rect::new(40, 1, 8, 4)),
+        pinned_inner: Some(Rect::new(65, 1, 8, 4)),
         ..PaneGeometry::default()
     });
 
@@ -1301,13 +1343,13 @@ fn mouse_routes_pinned_scroll_and_preview_divider_drag_without_touching_active()
 
     ctrl.handle_mouse(MouseEvent {
         kind: MouseEventKind::ScrollDown,
-        column: 42,
+        column: 67,
         row: 2,
         modifiers: KeyModifiers::NONE,
     });
     ctrl.handle_mouse(MouseEvent {
         kind: MouseEventKind::ScrollRight,
-        column: 42,
+        column: 67,
         row: 2,
         modifiers: KeyModifiers::NONE,
     });
@@ -1338,8 +1380,8 @@ fn mouse_routes_pinned_scroll_and_preview_divider_drag_without_touching_active()
 
     assert_eq!(
         ctrl.view_state().preview_split_pct,
-        20,
-        "dragging inside the measured preview area clamps its pinned share"
+        80,
+        "dragging toward the active edge grows the pinned share"
     );
     ctrl.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -1359,7 +1401,7 @@ fn mouse_routes_pinned_scroll_and_preview_divider_drag_without_touching_active()
         row: 2,
         modifiers: KeyModifiers::NONE,
     });
-    assert_eq!(ctrl.view_state().preview_split_pct, 80);
+    assert_eq!(ctrl.view_state().preview_split_pct, 20);
     assert_eq!(ctrl.split_pct(), tree_split_before);
     assert_eq!(ctrl.active_interaction(), &active_before);
 }
@@ -1367,20 +1409,19 @@ fn mouse_routes_pinned_scroll_and_preview_divider_drag_without_touching_active()
 #[test]
 fn preview_divider_drag_maps_the_cursor_column_to_a_proportional_pinned_share() {
     let (_dir, mut ctrl) = pin_ready_controller();
-    // Measured geometry: the preview area spans columns 40..90, divider at 65.
+    // Measured geometry: active spans columns 40..65, the pin spans 65..90, divider at 65.
     ctrl.set_pane_geometry(PaneGeometry {
         preview_area_x: 40,
         preview_area_width: 50,
         preview_divider_x: Some(65),
-        pinned_inner: Some(Rect::new(40, 1, 8, 4)),
-        content_inner: Some(Rect::new(65, 1, 8, 4)),
+        content_inner: Some(Rect::new(40, 1, 8, 4)),
+        pinned_inner: Some(Rect::new(65, 1, 8, 4)),
         ..PaneGeometry::default()
     });
 
-    // Interior columns must map proportionally — (column − area x) / area width — not merely
-    // clamp or snap toward the drag direction. 51 and 79 sit one step inside the 20/80 clamp,
-    // so a snap-to-extremes mapping cannot satisfy them.
-    for (column, expected_pct) in [(51, 22), (55, 30), (65, 50), (72, 64), (79, 78)] {
+    // The pin is on the right, so its proportional share is measured from the right edge.
+    // Interior columns must not merely snap toward the drag direction.
+    for (column, expected_pct) in [(51, 78), (55, 70), (65, 50), (72, 36), (79, 22)] {
         ctrl.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 65,
@@ -1668,6 +1709,8 @@ fn changed_file_jumps_from_pinned_focus_retarget_only_the_active_preview() {
         pinned: Some((8, 4)),
     });
     ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     let pinned_before = ctrl.view_state().pinned.expect("pin precondition");
     let pinned_search_status = ctrl
@@ -1713,8 +1756,108 @@ fn changed_file_jumps_from_pinned_focus_retarget_only_the_active_preview() {
 }
 
 #[test]
+fn branch_changed_pin_replacement_names_named_and_detached_states() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("preview.rs"), "placeholder\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .status()
+            .expect("run git init")
+            .success(),
+        "git fixture initializes"
+    );
+    assert!(
+        Command::new("git")
+            .args(["add", "preview.rs"])
+            .current_dir(dir.path())
+            .status()
+            .expect("stage fixture file")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .expect("commit fixture file")
+            .success()
+    );
+    let mut ctrl = controller(dir.path());
+    await_content(&mut ctrl);
+    ctrl.pin_active_preview();
+
+    assert!(
+        Command::new("git")
+            .args(["switch", "-c", "feature"])
+            .current_dir(dir.path())
+            .status()
+            .expect("switch fixture branch")
+            .success(),
+        "git fixture switches branch"
+    );
+    ctrl.handle(Intent::Refresh);
+    await_content(&mut ctrl);
+    ctrl.pin_active_preview();
+    assert_eq!(
+        ctrl.action_notice(),
+        Some("Replaced pin (branch changed: main → feature)"),
+        "AC-42 names both branch states when same-root/path replacement is caused by a branch change"
+    );
+}
+
+#[test]
+fn finder_confirm_from_pinned_focus_moves_to_active_while_changed_jumps_do_not() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Pinned);
+
+    ctrl.handle(Intent::OpenFinder);
+    assert!(ctrl.finder_open(), "finder opens from pinned focus");
+    ctrl.handle_finder_key(key(KeyCode::Char('p')));
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert_eq!(
+        ctrl.focus(),
+        Focus::Content,
+        "AC-41 finder confirmation takes focus to its file"
+    );
+}
+
+/// AC-41 moves focus from the PINNED pane only. A confirm from the tree keeps tree focus, which is
+/// the pre-feature behaviour: widening the rule to every confirm would silently take `j`/`k` away
+/// from the tree cursor, which no criterion asks for.
+#[test]
+fn finder_confirm_from_tree_focus_leaves_focus_on_the_tree() {
+    let (_dir, mut ctrl) = pin_ready_controller();
+    assert_eq!(ctrl.focus(), Focus::Tree, "precondition: tree focus");
+
+    ctrl.handle(Intent::OpenFinder);
+    assert!(ctrl.finder_open(), "finder opens from tree focus");
+    ctrl.handle_finder_key(key(KeyCode::Char('p')));
+    ctrl.handle_finder_key(key(KeyCode::Enter));
+    assert_eq!(
+        ctrl.focus(),
+        Focus::Tree,
+        "a confirm from the tree must not steal focus to the preview"
+    );
+}
+
+#[test]
 fn active_scroll_and_search_leave_the_pinned_interaction_unchanged() {
     let (_dir, mut ctrl) = pin_ready_controller();
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     ctrl.handle(Intent::NavDown);
@@ -1729,6 +1872,8 @@ fn active_scroll_and_search_leave_the_pinned_interaction_unchanged() {
         .pinned
         .expect("pinned interaction precondition");
 
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Tree);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::NavDown);
@@ -1753,7 +1898,6 @@ fn active_scroll_and_search_leave_the_pinned_interaction_unchanged() {
         }
         _ => panic!("active interaction changed pinned search presence"),
     }
-    ctrl.handle(Intent::ToggleFocus);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     assert!(

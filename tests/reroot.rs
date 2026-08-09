@@ -318,6 +318,12 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
     assert_eq!(ctrl.tree().cursor(), 0, "cursor back at the root row");
     assert!(!ctrl.zoomed(), "unzoomed after re_root");
     assert_eq!(ctrl.focus(), Focus::Tree, "focus back on the tree");
+    ctrl.set_preview_viewports(herdr_file_viewer::presenter::PreviewViewports {
+        active: (8, 4),
+        pinned: Some((8, 4)),
+    });
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Pinned);
     assert!(
@@ -327,7 +333,6 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
             .is_some_and(|status| status.contains("Search: fake (1/1)")),
         "captured pinned search query survives the re-root"
     );
-    ctrl.handle(Intent::ToggleFocus);
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(
         ctrl.focus(),

@@ -40,9 +40,9 @@ pub fn next_focus(current: Focus, has_pin: bool, tree_hidden: bool) -> Focus {
     }
 
     match current {
-        Focus::Tree => Focus::Pinned,
-        Focus::Pinned => Focus::Content,
-        Focus::Content => Focus::Tree,
+        Focus::Tree => Focus::Content,
+        Focus::Content => Focus::Pinned,
+        Focus::Pinned => Focus::Tree,
     }
 }
 
@@ -84,11 +84,11 @@ mod tests {
 
     #[test]
     fn focus_cycles_match_visible_regions() {
-        assert_eq!(next_focus(Focus::Tree, true, false), Focus::Pinned);
-        assert_eq!(next_focus(Focus::Pinned, true, false), Focus::Content);
-        assert_eq!(next_focus(Focus::Content, true, false), Focus::Tree);
-        assert_eq!(next_focus(Focus::Pinned, true, true), Focus::Content);
+        assert_eq!(next_focus(Focus::Tree, true, false), Focus::Content);
+        assert_eq!(next_focus(Focus::Content, true, false), Focus::Pinned);
+        assert_eq!(next_focus(Focus::Pinned, true, false), Focus::Tree);
         assert_eq!(next_focus(Focus::Content, true, true), Focus::Pinned);
+        assert_eq!(next_focus(Focus::Pinned, true, true), Focus::Content);
         assert_eq!(next_focus(Focus::Tree, false, false), Focus::Content);
         assert_eq!(next_focus(Focus::Content, false, false), Focus::Tree);
     }

@@ -84,6 +84,10 @@ pub struct PreviewLayout {
     pub active: Option<Rect>,
     pub tree_divider: Option<Rect>,
     pub preview_divider: Option<Rect>,
+    /// A pin exists but its candidate region misses the 40-column interior floor. The tree and
+    /// active regions deliberately match the no-pin layout; the Presenter uses this signal to
+    /// add the persistent widen notice to the active projection.
+    pub pinned_hidden_for_space: bool,
 }
 
 /// The existing fixed no-pin breakpoint. A pinned layout uses the structural preview floor below.
@@ -119,10 +123,6 @@ pub fn layout(input: LayoutInput) -> PreviewLayout {
         carve_unpinned(&mut result, input);
         return result;
     }
-    if body.width < PREVIEW_BORDER_COLUMNS {
-        return result;
-    }
-
     let (tree, preview_area, tree_divider) = if input.tree_hidden {
         (None, body, None)
     } else {
@@ -130,26 +130,24 @@ pub fn layout(input: LayoutInput) -> PreviewLayout {
         (Some(tree), preview, Some(divider))
     };
     let ratio = input.preview_split_pct.clamp(20, 80);
+    // The session ratio continues to name the pinned share, now measured from the right edge.
     let previews = Layout::horizontal([
-        Constraint::Percentage(ratio),
         Constraint::Percentage(100 - ratio),
+        Constraint::Percentage(ratio),
     ])
     .split(preview_area);
 
     if preview_is_wide_enough(previews[0]) && preview_is_wide_enough(previews[1]) {
         result.tree = tree;
-        result.pinned = Some(previews[0]);
-        result.active = Some(previews[1]);
+        result.active = Some(previews[0]);
+        result.pinned = Some(previews[1]);
         result.tree_divider = tree_divider.map(|x| divider_region(body, x));
         result.preview_divider = Some(divider_region(body, previews[1].x));
     } else {
-        // The tree participates in the narrow focus cycle only while it is visible. A stale Tree
-        // focus under tree-hidden mode follows the pre-existing zoom behaviour and shows active.
-        match input.focus {
-            PreviewFocus::Tree if !input.tree_hidden => result.tree = Some(body),
-            PreviewFocus::Pinned => result.pinned = Some(body),
-            PreviewFocus::Active | PreviewFocus::Tree => result.active = Some(body),
-        }
+        // A hidden pin must never reflow or collapse the existing tree/active geometry. Reuse the
+        // no-pin carve exactly, including its established 80-column fallback behaviour.
+        carve_unpinned(&mut result, input);
+        result.pinned_hidden_for_space = true;
     }
     result
 }
@@ -254,24 +252,26 @@ mod tests {
     }
 
     #[test]
-    fn pin_present_tiny_bodies_suppress_structural_regions() {
+    fn pin_present_tiny_bodies_match_the_no_pin_layout() {
         for area in [Rect::new(0, 0, 1, 1), Rect::new(0, 0, 1, 2)] {
             let result = layout(LayoutInput::new(area).with_pin(true));
-            assert_eq!(result.tree, None, "tree at {area:?}");
+            let without_pin = layout(LayoutInput::new(area));
+            assert_eq!(result.tree, without_pin.tree, "tree at {area:?}");
+            assert_eq!(result.active, without_pin.active, "active at {area:?}");
             assert_eq!(result.pinned, None, "pinned preview at {area:?}");
-            assert_eq!(result.active, None, "active preview at {area:?}");
+            assert!(result.pinned_hidden_for_space, "notice signal at {area:?}");
         }
     }
 
     #[test]
-    fn pin_split_floor_cannot_be_bypassed_by_ratio() {
+    fn pin_split_floor_hides_only_the_pin_and_keeps_no_pin_geometry() {
         for ratio in [20, 50, 80] {
             for focus in [
                 PreviewFocus::Tree,
                 PreviewFocus::Pinned,
                 PreviewFocus::Active,
             ] {
-                let result = layout(LayoutInput {
+                let input = LayoutInput {
                     area: Rect::new(0, 0, 138, 10),
                     has_pin: true,
                     focus,
@@ -279,24 +279,26 @@ mod tests {
                     tree_split_pct: 40,
                     tree_max_cols: u16::MAX,
                     ..LayoutInput::new(Rect::default())
+                };
+                let result = layout(input);
+                let without_pin = layout(LayoutInput {
+                    has_pin: false,
+                    ..input
                 });
-                assert!(
-                    !(result.pinned.is_some() && result.active.is_some()),
-                    "ratio {ratio} must not bypass the preview floor"
-                );
-                let visible_regions = [result.tree, result.pinned, result.active]
-                    .into_iter()
-                    .flatten()
-                    .count();
                 assert_eq!(
-                    visible_regions, 1,
-                    "narrow fallback at ratio {ratio} must retain exactly the focused region"
+                    result.tree, without_pin.tree,
+                    "ratio {ratio}, focus {focus:?}"
                 );
-                match focus {
-                    PreviewFocus::Tree => assert_eq!(result.tree, Some(result.body)),
-                    PreviewFocus::Pinned => assert_eq!(result.pinned, Some(result.body)),
-                    PreviewFocus::Active => assert_eq!(result.active, Some(result.body)),
-                }
+                assert_eq!(
+                    result.active, without_pin.active,
+                    "ratio {ratio}, focus {focus:?}"
+                );
+                assert_eq!(result.tree_divider, without_pin.tree_divider);
+                assert_eq!(result.pinned, None, "ratio {ratio} hides the pin only");
+                assert!(
+                    result.pinned_hidden_for_space,
+                    "ratio {ratio} signals the active notice"
+                );
             }
         }
     }
@@ -349,9 +351,12 @@ mod tests {
             let pinned = result.pinned.unwrap();
             let active = result.active.unwrap();
             assert_eq!(tree.x < pinned.x, tree_is_left);
-            assert!(pinned.x < active.x, "pinned stays left of active");
-            assert_eq!(result.tree_divider.unwrap().x, tree.x.max(pinned.x));
-            assert_eq!(result.preview_divider.unwrap().x, active.x);
+            assert!(
+                active.x < pinned.x,
+                "active stays left of the pinned preview"
+            );
+            assert_eq!(result.tree_divider.unwrap().x, tree.x.max(active.x));
+            assert_eq!(result.preview_divider.unwrap().x, pinned.x);
         }
     }
 }

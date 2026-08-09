@@ -2,10 +2,10 @@
 source: tests/presenter_pinned.rs
 expression: output
 ---
-"┌Pinned: pinned.rs [main @ /repo]────────────────┐┌active.rs───────────────────────────────────────┐"
-"│PINNED                                          ││active notice                                   │"
-"│                                                ││ACTIVE needle                                   │"
-"│                                                ││active second row                               │"
+"┌active.rs───────────────────────────────────────┐┌Pinned: [main @ /repo]──────────────────────────┐"
+"│active notice                                   ││PINNED                                          │"
+"│ACTIVE needle                                   ││                                                │"
+"│active second row                               ││                                                │"
 "│                                                ││                                                │"
 "│                                                ││                                                │"
 "│                                                ││                                                │"
@@ -13,4 +13,4 @@ expression: output
 "│                                                ││                                                │"
 "│                                                ││                                                │"
 "│                                                ││                                                │"
-"└────────────────────────────────────────────────┘└──────────────────────────────────────────? help┘"
+"└──────────────────────────────────────────? help┘└────────────────────────────────────────────────┘"

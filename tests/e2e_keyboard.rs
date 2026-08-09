@@ -165,56 +165,18 @@ fn every_keyboard_function_drives_the_viewer_and_it_exits_cleanly() {
     s.expect("ALPACAMARK")
         .expect("the file below the collapsed directory is active and rendered");
 
-    // Pin the stable `aaa.txt` preview, then move the active selection through two distinct
-    // changed-file markers. After each jump, a pinned-only search finds aaa's marker: this
-    // proves both `]` and `[` retarget only the active preview, never the frozen snapshot.
+    // The default PTY is too narrow for two 40-column preview interiors. Pinning preserves the
+    // tree/active layout and reports the held snapshot instead of focusing an undrawn pane.
     s.send("p").expect("pin the settled active preview");
-    s.send("\t")
-        .expect("focus the pinned preview after pinning");
-    s.expect("Pinned")
-        .expect("the pinned preview has the original identity before changed-file jumps");
-    s.send("\t")
-        .expect("focus the active preview before changed-file jumps");
+    s.expect("Pinned: aaa.txt — widen to view")
+        .expect("the hidden pin has a persistent widen notice");
     s.send("]").expect("jump forward to the next changed file");
     s.expect("BRAVOMARK")
         .expect("the forward changed-file jump updated the active preview");
-    s.send("\t")
-        .expect("cycle active focus to the tree after forward jump");
-    s.send("\t")
-        .expect("focus the pinned preview after forward jump");
-    s.send("/")
-        .expect("open a pinned-only search after the forward jump");
-    s.expect("Search:")
-        .expect("the pinned preview owns the forward-jump verification search");
-    for key in "ALPACAMARK".chars() {
-        s.send(key.to_string())
-            .expect("type the frozen-preview marker into pinned search");
-    }
-    s.expect("(1/1)")
-        .expect("the frozen pin still contains aaa's marker after `]`");
-    s.send("\r").expect("commit the pinned verification search");
-    s.send("q").expect("clear the pinned verification search");
-    s.send("\t").expect("return focus to the active preview");
     s.send("[")
         .expect("jump backward to the previous changed file");
     s.expect("CHARLIEMARK")
         .expect("the backward changed-file jump updated the active preview");
-    s.send("\t").expect("cycle active focus to the tree");
-    s.send("\t")
-        .expect("focus the pinned preview after backward jump");
-    s.send("/")
-        .expect("open a pinned-only search after the backward jump");
-    s.expect("Search:")
-        .expect("the pinned preview owns the backward-jump verification search");
-    for key in "ALPACAMARK".chars() {
-        s.send(key.to_string())
-            .expect("type the frozen-preview marker into pinned search");
-    }
-    s.expect("(1/1)")
-        .expect("the frozen pin still contains aaa's marker after `[`");
-    s.send("\r").expect("commit the pinned verification search");
-    s.send("q").expect("clear the pinned verification search");
-    s.send("\t").expect("return focus to the active preview");
 
     // Drive every remaining keyboard function; each must be wired and must not crash the loop.
     for key in [

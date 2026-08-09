@@ -287,6 +287,12 @@ impl Controller {
                 self.zoomed = true;
                 self.focus = Focus::Content;
             }
+            // A finder confirmation means "take me to this file", unlike changed-file jumps
+            // which intentionally keep pinned focus for comparison (AC-31). Only pinned focus
+            // moves: a confirm from the tree leaves focus on the tree exactly as before (AC-41).
+            if self.focus == Focus::Pinned {
+                self.focus = Focus::Content;
+            }
             self.dispatch_render();
             Effects::redraw()
         } else {

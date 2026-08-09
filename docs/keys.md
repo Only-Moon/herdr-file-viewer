@@ -29,7 +29,7 @@ is additive and on by default.
 | `e` | Open the selected file in `$EDITOR` (see [Opening in an editor](#opening-in-an-editor)) |
 | `O` (Shift+`o`) | **Open with default app**: hand the selected file or directory to the OS default application (e.g. an image opens in the system viewer). Read-only hand-off; non-blocking (the viewer keeps running) |
 | `R` (Shift+`r`) | **Reveal in file manager**: open the OS file manager (Finder / Explorer / a Linux file manager) with the selected entry highlighted where supported, so you can drag it out (e.g. into Slack). Read-only hand-off |
-| `f` | **Go to file**: open a fuzzy finder over every file in the tree; type to filter, `↑` / `↓` move, `Enter` opens the selected file, `Esc` cancels (`←` / `→` scroll long paths) |
+| `f` | **Go to file**: open a fuzzy finder over every file in the tree; type to filter, `↑` / `↓` move, `Enter` opens the selected file and focuses its active preview, `Esc` cancels (`←` / `→` scroll long paths) |
 | `:` | **Go to line**: open a prompt and jump the content pane to a source line by number (`Enter` jumps, `Esc` cancels; out-of-range clamps to the last line). Works in any view; in a rendered-markdown or diff view, confirming switches to the line-numbered content view and jumps there |
 | `/` | **Search in file**: open a prompt and highlight every match in the content pane as you type; `Enter` commits the search (highlights persist), `Esc` clears it and restores the scroll. Smartcase (a lowercase query is case-insensitive; a capital makes it case-sensitive). Works in any view |
 | `n` / `N` (Shift+`n`) | After a committed search, jump to the **next** / **previous** match and scroll it into view, wrapping at the ends with a notice |
@@ -38,11 +38,11 @@ is additive and on by default.
 | `Y` | Copy the selected file's **absolute** path to the clipboard |
 | `a` | **Add annotation**: open the annotation editor for the selected file (`←`/`→` or `Home`/`End` move the text cursor, `Enter` saves, `Esc` cancels). Annotations live only for this viewer session and never modify the file |
 | `A` (Shift+`a`) | **Show annotations**: open the session overview; fixed keys `j`/`k` or `↑`/`↓` move, `Enter`/`e` edits, `d` deletes one, `D` (Shift+`d`) clears all immediately, `y` copies all, and `Esc`/`q` closes |
-| `Tab` | Move focus between the tree and content columns |
+| `Tab` | Move focus between visible regions. With a pin: tree → active preview → pinned preview → tree; when the pin is hidden for space, tree → active preview |
 | `<` / `>` | Narrow / widen the outer tree column (move the tree/content divider) |
 | `w` | Toggle line wrapping for the content pane. For rendered markdown this switches between the fit-to-pane view (wide tables sized to fit, over-long cells shown as `…`) and a wide view that renders tables at full width and scrolls horizontally (`←`/`→`) so you can read every cell |
 | `z` | Zoom: hide the tree so the content pane fills the frame; press again (or `q`/`Esc`) to restore the two-column layout |
-| `p` | Pin the settled file preview as a frozen in-memory reference alongside the active preview; press again on that same file to remove it, or on another file to replace it. `Tab` then cycles tree → pinned preview → active preview → tree |
+| `p` | Pin the settled file preview as a frozen in-memory reference alongside the active preview; press again on that same file to remove it, or on another file to replace it. `Tab` then cycles tree → active preview → pinned preview → tree; if there is not room, the pin persists and the active preview explains how to widen it |
 | `{` / `}` | With a preview pinned, shrink / grow its horizontal share in 5-point steps (20–80%) by moving the **preview divider**; the outer tree/content divider stays put. Inert with no pin |
 | `Z` (Shift+`z`) | **Full-screen a file** (toggle): open the selected file like `Enter` _and_ zoom the viewer's herdr pane to fill the whole terminal, so the file takes over the entire screen instead of just the split. Press `Z` again (or `Esc`/`q`, or `z`) to return to the normal two-column split; switching worktree or quitting also restores the pane. On a directory it just expands/collapses like `Enter`; falls back to the in-pane zoom when the host isn't herdr |
 | `r` | Refresh git state: pick up changes made outside the viewer (a merge / pull / commit elsewhere) |

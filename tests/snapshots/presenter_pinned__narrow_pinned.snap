@@ -2,15 +2,15 @@
 source: tests/presenter_pinned.rs
 expression: output
 ---
-"┌Pinned: pinned.rs [review @ /worktrees/review]────────────┐"
-"│PINNED                                                    │"
+"┌active.rs─────────────────────────────────────────────────┐"
+"│active notice                                             │"
+"│Pinned: pinned.rs — widen to view                         │"
+"│ACTIVE needle                                             │"
+"│active second row                                         │"
 "│                                                          │"
 "│                                                          │"
 "│                                                          │"
 "│                                                          │"
 "│                                                          │"
 "│                                                          │"
-"│                                                          │"
-"│                                                          │"
-"│                                                          │"
-"└──────────────────────────────────────────────────────────┘"
+"└────────────────────────────────────────────────────? help┘"

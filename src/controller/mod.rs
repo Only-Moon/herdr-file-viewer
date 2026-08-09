@@ -2881,7 +2881,13 @@ impl Controller {
         if self.zoomed && self.pinned_snapshot.is_none() {
             return Effects::noop();
         }
-        self.focus = next_focus(self.focus, self.pinned_snapshot.is_some(), self.zoomed);
+        // A held pin may be omitted at the current width. Only a drawn pinned viewport belongs in
+        // the focus cycle, so Tab cannot strand input on an invisible region (AC-17).
+        let pinned_visible = self
+            .pinned_snapshot
+            .as_ref()
+            .is_some_and(|_| self.pinned_viewport_height() > 0);
+        self.focus = next_focus(self.focus, pinned_visible, self.zoomed);
         Effects::redraw()
     }
 
@@ -3079,11 +3085,11 @@ impl Controller {
         Effects::redraw()
     }
 
-    /// Move only the divider between the frozen and active previews. A missing pin leaves every
-    /// session field unchanged, including the retained ratio, so the actions are truly inert until
-    /// a reference preview exists.
+    /// Move only the divider between the frozen and active previews. A missing or currently
+    /// undrawn pin leaves every session field unchanged, including the retained ratio, so resizing
+    /// cannot change a divider the user cannot see (AC-22).
     fn resize_preview_split(&mut self, delta: i16) -> Effects {
-        if self.pinned_snapshot.is_none() {
+        if self.pinned_snapshot.is_none() || self.pinned_viewport_height() == 0 {
             return Effects::noop();
         }
         self.preview_split_pct = (self.preview_split_pct as i16 + delta)

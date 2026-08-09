@@ -156,8 +156,19 @@ fn structural_policy_keeps_no_pin_boundary_and_pin_floor_distinct() {
             "each 50/50 preview needs 40 interior columns at {width} columns"
         );
         if !adjacent {
-            assert_eq!(result.pinned, Some(Rect::new(0, 0, width, 10)));
-            assert_eq!(result.active, None);
+            let without_pin = layout(LayoutInput {
+                has_pin: false,
+                ..LayoutInput {
+                    area: Rect::new(0, 0, width, 10),
+                    has_pin: true,
+                    tree_hidden: true,
+                    focus: PreviewFocus::Pinned,
+                    ..LayoutInput::new(Rect::default())
+                }
+            });
+            assert_eq!(result.pinned, None);
+            assert_eq!(result.active, without_pin.active);
+            assert!(result.pinned_hidden_for_space);
         }
     }
 }

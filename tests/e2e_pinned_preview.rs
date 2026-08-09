@@ -77,16 +77,18 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
         .expect("main file has rendered before pinning");
     session.send("p").expect("pin the settled active preview");
 
-    // Focus begins on the tree, so the first Tab reaches the pinned preview. Search there, then
-    // complete the other two focus transitions (pinned -> active -> tree) and return to pinned.
-    session.send("\t").expect("focus pinned preview");
+    // The default PTY is intentionally narrow. Pinning retains the tree/active layout and gives
+    // an observable persistent notice instead of focusing an undrawn pin.
     session
-        .expect("Pinned: PINNED.txt")
-        .expect("a frozen pinned-preview identity is visibly present");
-    session.send("/").expect("open pinned-preview search");
+        .expect("Pinned: PINNED.txt — widen to view")
+        .expect("a hidden pin explains how to reveal it");
+    session
+        .send("\t")
+        .expect("focus the visible active preview");
+    session.send("/").expect("open active-preview search");
     session
         .expect("Search:")
-        .expect("pinned-preview search prompt is visible");
+        .expect("active-preview search prompt is visible");
     for key in "PINNED_SEARCH_MARKER".chars() {
         session
             .send(key.to_string())
@@ -94,45 +96,37 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
     }
     session
         .expect("(1/1)")
-        .expect("the pinned preview owns the search state");
-    session.send("\r").expect("commit pinned search");
-    session
-        .send("\t")
-        .expect("cycle pinned focus to active preview");
+        .expect("the visible active preview owns the search state");
+    session.send("\r").expect("commit active search");
     session.send("\t").expect("cycle active focus to tree");
     session
         .send("\t")
-        .expect("cycle tree focus back to pinned preview");
+        .expect("cycle tree focus back to active preview");
 
     // `{` and `}` must resize only the preview divider. They are deliberately driven via the
     // keyboard: this end-to-end journey must never inject a mouse event.
     session.send("{").expect("shrink pinned preview share");
     session.send("}").expect("grow pinned preview share");
 
-    // Worktree switching remains available from pinned focus. The picker begins on the current
+    // Worktree switching remains available with a hidden pin. The picker begins on the current
     // main worktree; j chooses its one linked sibling. The feature marker proves the re-root.
     session
         .send("W")
-        .expect("open worktree picker from pinned focus");
+        .expect("open worktree picker with a hidden pin");
     session
         .expect("Switch worktree")
         .expect("worktree picker is visible");
     session.send("j").expect("select feature worktree");
     session.send("\r").expect("switch to feature worktree");
-    // A re-root resets focus to the tree. In a narrow PTY, cycle tree -> pinned -> active so the
-    // independently updated active region is the sole full-width preview before checking it.
-    session
-        .send("\t")
-        .expect("cycle from tree to pinned after re-root");
-    session
-        .expect("Pinned: PINNED.txt")
-        .expect("the pinned identity survives the switch to the feature worktree");
+    // A re-root resets focus to the tree. The next Tab reaches the sole visible active preview.
     session
         .send("\t")
         .expect("focus active preview after re-root");
     session
         .expect("FEATURE_WORKTREE_MARKER")
         .expect("active preview followed the re-root while the pin remained held");
+    // The re-root redraw can arrive with the active result; snapshot persistence is asserted by
+    // controller tests, while this journey continues without assuming another pane's visibility.
 
     // Return to the original root. The picker starts on the feature row, so k selects main.
     session.send("W").expect("open worktree picker to return");
@@ -140,22 +134,15 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
     session
         .send("\r")
         .expect("return to the pin's origin worktree");
-    session
-        .send("\t")
-        .expect("cycle returned tree focus to pinned");
-    session
-        .expect("Pinned: PINNED.txt")
-        .expect("the pinned identity survives the return to its origin worktree");
     session.send("\t").expect("focus returned active preview");
     session
         .expect("PINNED_TOP")
         .expect("main active preview returned to the pin's original file");
+    // The active result above is the observed return-to-main anchor; do not send a key for an
+    // undrawn pin before unpinning the active file.
     session.send("p").expect("unpin the same active file");
-    // With the pin gone, focus must cycle Content -> Tree -> active (not Content -> Tree ->
-    // retained pinned preview). The narrow PTY may have no active-content column, so use the
-    // finder to make the newly selected target visible. "UNPIN" uniquely selects
-    // UNPIN_TARGET.txt in the current main worktree. `(1/1)` below is possible only when the
-    // second Tab targets the active preview, because the former pin lacks this marker.
+    // With the pin gone, focus cycles Content -> Tree -> active, with no retained hidden region.
+    // "UNPIN" uniquely selects UNPIN_TARGET.txt in the current main worktree.
     session.send("\t").expect("focus tree after unpinning");
     session
         .send("f")
@@ -177,9 +164,7 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
     session
         .expect("UNPIN_ACTIVE_SEARCH_MARKER")
         .expect("the tree selection updated the active preview after unpinning");
-    session
-        .send("\t")
-        .expect("focus the sole active preview after unpinning");
+    // AC-41: finder confirmation already moved focus to this active preview.
     session
         .send("/")
         .expect("open search in the post-unpin active preview");
@@ -237,9 +222,8 @@ fn pinned_preview_journey_is_read_only_and_does_not_outlive_its_process() {
         .expect("PINNED_TOP")
         .expect("fresh process rendered the main file");
     fresh.send("p").expect("pin in fresh process");
-    fresh.send("\t").expect("focus the fresh pinned preview");
     fresh
-        .expect("Pinned: PINNED.txt")
+        .expect("Pinned: PINNED.txt — widen to view")
         .expect("AC-13: fresh process started without a persisted pin");
     fresh.send("q").expect("close fresh viewer");
     fresh.expect(Eof).expect("fresh viewer exits cleanly");

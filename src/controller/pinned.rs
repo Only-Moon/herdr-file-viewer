@@ -2,6 +2,13 @@
 
 use super::*;
 
+fn branch_label(branch: &crate::preview::BranchState) -> &str {
+    match branch {
+        crate::preview::BranchState::Named(name) => name,
+        crate::preview::BranchState::Detached => "detached",
+    }
+}
+
 /// The one optional reference preview retained for this controller session.
 ///
 /// The document is an applied render only; the interaction state starts as a clone of the active
@@ -56,10 +63,26 @@ impl Controller {
                 self.focus = Focus::Content;
             }
         } else {
+            let branch_change = self.pinned_snapshot.as_ref().and_then(|pin| {
+                let old = pin.document.origin();
+                let new = document.origin();
+                (old.root() == new.root()
+                    && old.root_relative_path() == new.root_relative_path()
+                    && old.branch() != new.branch())
+                .then(|| {
+                    (
+                        branch_label(old.branch()).to_owned(),
+                        branch_label(new.branch()).to_owned(),
+                    )
+                })
+            });
             self.pinned_snapshot = Some(PinnedSnapshot {
                 document,
                 interaction: self.active_interaction.clone(),
             });
+            if let Some((old, new)) = branch_change {
+                self.action_notice = Some(format!("Replaced pin (branch changed: {old} → {new})"));
+            }
         }
         Effects::redraw()
     }
@@ -101,6 +124,10 @@ impl Controller {
     /// wide-layout dimensions.
     pub(super) fn set_pinned_viewport(&mut self, viewport: Option<(u16, u16)>) {
         let (width, height) = viewport.unwrap_or_default();
+        if viewport.is_none() && self.focus == Focus::Pinned {
+            // AC-17: a pin omitted for space cannot retain focus after the frame that hid it.
+            self.focus = Focus::Content;
+        }
         let Some(pin) = self.pinned_snapshot.as_mut() else {
             return;
         };

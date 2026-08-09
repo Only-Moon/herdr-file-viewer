@@ -1091,6 +1091,7 @@ fn draw_content(
     state: &ViewState,
     preview: &PreviewProjection,
     active: bool,
+    pinned_space_notice: Option<&str>,
 ) -> (u16, u16) {
     // the title is derived from the DISPLAYED content's file (`content_title`), not the
     // live tree cursor, so it switches in lockstep with the body — the pane never shows a newly-
@@ -1147,7 +1148,10 @@ fn draw_content(
     // it can never crowd out the file itself; the file + its scrollbars fill the area below it.
     // The self-expiring flash (if any) leads the strip, styled distinctly from a yellow warning
     // (cyan, dimming to gray as it fades) so a status hint never reads as an error.
-    let (notices_rect, content_area) = content_notice_split(inner, notice_strip_len(preview));
+    let (notices_rect, content_area) = content_notice_split(
+        inner,
+        notice_strip_len(preview) + usize::from(pinned_space_notice.is_some()),
+    );
     if notices_rect.height > 0 {
         let mut notice_lines: Vec<Line> = Vec::new();
         if let Some(flash) = &preview.flash {
@@ -1167,6 +1171,12 @@ fn draw_content(
                 .iter()
                 .map(|n| Line::styled(sanitize_control(n), Style::new().fg(Color::Yellow))),
         );
+        if let Some(notice) = pinned_space_notice {
+            notice_lines.push(Line::styled(
+                sanitize_control(notice),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
         frame.render_widget(Paragraph::new(notice_lines), notices_rect);
     }
 
@@ -1239,17 +1249,16 @@ fn draw_content(
     (text.width, text.height)
 }
 
-/// The frozen pin's complete origin identity, kept on its own title so a worktree switch cannot
-/// make the reference surface look like it belongs to the active tree. Each component is
-/// neutralized independently because all three are captured from paths/branch metadata.
+/// The frozen pin's origin identity, kept on its own title so a worktree switch cannot make the
+/// reference surface look like it belongs to the active tree. The path is deliberately omitted:
+/// the title prioritizes the branch/root distinction and path copying remains available separately.
 fn pinned_origin_title(origin: &PreviewOrigin) -> String {
     let branch = match origin.branch() {
         crate::preview::BranchState::Named(branch) => sanitize_control(branch),
         crate::preview::BranchState::Detached => "detached".to_string(),
     };
     format!(
-        "Pinned: {} [{} @ {}]",
-        sanitize_control(&origin.root_relative_path().to_string_lossy()),
+        "Pinned: [{} @ {}]",
         branch,
         sanitize_control(&origin.root().to_string_lossy()),
     )
@@ -1282,6 +1291,18 @@ fn draw_prompt_line(frame: &mut Frame, area: Rect, prompt: &str) {
 /// Translate the presenter's legacy no-pin view state into the structural policy. Later tasks pass
 /// the policy's pinned state directly; keeping the conversion here preserves every current drawing
 /// and hit-test caller while ensuring they already share one frame-carving path.
+fn pinned_space_notice(layout: &PreviewLayout, state: &ViewState) -> Option<String> {
+    layout.pinned_hidden_for_space.then(|| {
+        let path = state
+            .pinned
+            .as_ref()
+            .and_then(|preview| preview.origin.as_ref())
+            .map(|origin| origin.root_relative_path().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "preview".to_string());
+        format!("Pinned: {path} — widen to view")
+    })
+}
+
 fn structural_layout(area: Rect, state: &ViewState) -> PreviewLayout {
     layout(LayoutInput {
         area,
@@ -1407,6 +1428,7 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
     let body = layout.body;
     let tree = layout.tree;
     let content = layout.active;
+    let pinned_space_notice = pinned_space_notice(&layout, state);
     let divider_x = layout.tree_divider.map(|divider| divider.x);
     let inner = |r: Rect| Block::bordered().inner(r);
 
@@ -1449,7 +1471,10 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
     let (content_inner, content_vbar, content_hbar) =
         match content.map(|r| content_block(active).inner(r)) {
             Some(ci) => {
-                let (_notices, content_area) = content_notice_split(ci, notice_strip_len(active));
+                let (_notices, content_area) = content_notice_split(
+                    ci,
+                    notice_strip_len(active) + usize::from(pinned_space_notice.is_some()),
+                );
                 let (text, v, h) = content_bars(
                     content_area,
                     active.rows as usize,
@@ -1484,13 +1509,14 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         _ => (None, None, None),
     };
     let (preview_area_x, preview_area_width) = match (layout.pinned, layout.active) {
-        (Some(pinned), Some(active)) => (
-            pinned.x,
-            active
+        (Some(pinned), Some(active)) => {
+            let left = active.x.min(pinned.x);
+            let right = active
                 .x
                 .saturating_add(active.width)
-                .saturating_sub(pinned.x),
-        ),
+                .max(pinned.x.saturating_add(pinned.width));
+            (left, right.saturating_sub(left))
+        }
         _ => (0, 0),
     };
 
@@ -1587,12 +1613,20 @@ pub fn draw(frame: &mut Frame, state: &ViewState) -> PreviewViewports {
     if let Some(area) = layout.tree {
         draw_tree(frame, area, state);
     }
+    let pinned_space_notice = pinned_space_notice(&layout, state);
     let pinned = match (layout.pinned, state.pinned.as_ref()) {
-        (Some(area), Some(preview)) => Some(draw_content(frame, area, state, preview, false)),
+        (Some(area), Some(preview)) => Some(draw_content(frame, area, state, preview, false, None)),
         _ => None,
     };
     let active = match layout.active {
-        Some(area) => draw_content(frame, area, state, active, true),
+        Some(area) => draw_content(
+            frame,
+            area,
+            state,
+            active,
+            true,
+            pinned_space_notice.as_deref(),
+        ),
         None => (0, 0),
     };
     // The worktree picker is a modal overlay: drawn last, on TOP of whatever columns are

@@ -47,7 +47,8 @@ that one, and the chain stops the moment a directory holds a file or a second en
 
 Press `f` to open a **fuzzy finder** over every file in the tree (`.gitignore`-aware). Type to
 filter, `↑`/`↓` to move, `Enter` to open, `Esc` to cancel — far faster than scrolling the tree in a
-large repo.
+large repo. Confirming from a pinned preview moves focus to the active preview where the chosen
+file opens.
 
 ## Open at a known file
 
@@ -196,17 +197,18 @@ follow later renders. Press `p` again on the same file to unpin it; press it on 
 file to replace the reference. A directory, an empty tree, or a preview still rendering cannot be
 pinned.
 
-Every pin carries its **captured origin** — the worktree root, branch or detached state, and
-root-relative path — in its title. It therefore **survives a worktree switch** and remains useful
-even if its old worktree is no longer selected. While the pin is focused, `y` copies its **captured repo-relative path**
-and `Y` its **captured absolute path**; neither operation reads the current tree or the old file
-again.
+Every pin carries its **captured origin** — the worktree root and branch or detached state — in
+its title. It therefore **survives a worktree switch** and remains useful even if its old worktree
+is no longer selected. While the pin is focused, `y` copies its **captured repo-relative path** and
+`Y` its **captured absolute path**; neither operation reads the current tree or the old file again.
 
-With the tree visible, `Tab` cycles focus **tree → pinned preview → active preview → tree**. In
-tree-hidden zoom the cycle is just the two previews. The pinned and active previews have separate
-scroll positions and searches are independent: arrows, paging, `/`, and `n`/`N` operate only on the
-focused preview. On a narrow pane, the focused region takes the full width instead of squeezing the
-two previews below their **40-column floor**; use `Tab` to compare the other one.
+With the tree visible, `Tab` cycles focus **tree → active preview → pinned preview → tree**. In
+tree-hidden zoom the cycle is active preview then pinned preview. The pinned and active previews
+have separate scroll positions and searches are independent: arrows, paging, `/`, and `n`/`N`
+operate only on the focused preview. On a narrow pane, pinning never takes a pane away: the tree
+and active preview retain the no-pin layout, the hidden pin persists, and the active preview says
+`Pinned: <path> — widen to view` until there is room for both **40-column floor** previews. `Tab`
+then visits only the visible tree and active preview.
 
 The reference is display-only. Actions that need the live selection — including `Enter`, `:`, `e`,
 `L`, `O`, `R`, `a`, `A`, `v`, `D`, `w`, and `Z` — are **unavailable from the pinned preview** and

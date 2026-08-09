@@ -546,7 +546,8 @@ impl Controller {
         if self.pinned_snapshot.is_none() || self.geom.preview_area_width == 0 {
             return Effects::noop();
         }
-        let pinned_width = col.saturating_sub(self.geom.preview_area_x) as u32;
+        let right_edge = self.geom.preview_area_x as u32 + self.geom.preview_area_width as u32;
+        let pinned_width = right_edge.saturating_sub(col as u32);
         self.preview_split_pct = (pinned_width * 100 / self.geom.preview_area_width as u32)
             .clamp(PREVIEW_SPLIT_MIN as u32, PREVIEW_SPLIT_MAX as u32)
             as u16;
