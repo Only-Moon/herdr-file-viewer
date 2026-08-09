@@ -98,6 +98,7 @@ fn sample_state() -> ViewState {
         annotation_indicators: AnnotationIndicatorsView::default(),
         root_name: "r".to_string(), // the fixture tree is rooted at /r
         branch: None,
+        pinned_foreign_root: None,
         prompt: None,
         help: None,
     }

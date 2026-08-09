@@ -2,7 +2,7 @@
 source: tests/presenter_pinned.rs
 expression: output
 ---
-"┌r─────────────────┐┌active.rs──────────────────────────────────────────────────────┐┌Pinned: [topic @ /worktrees/other[31m]─────────────────────────┐"
+"┌r─────────────────┐┌active.rs──────────────────────────────────────────────────────┐┌Pinned: [topic @ other[31m]────────────────────────────────────┐"
 "│                  ││active notice                                                  ││PINNED                                                         │"
 "│                  ││ACTIVE needle                                                  ││                                                               │"
 "│                  ││active second row                                              ││                                                               │"

@@ -1988,6 +1988,19 @@ impl Controller {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             branch: self.current_branch.clone(),
+            // AC-12: name the pin's worktree only when it is not the one being viewed. Compare the
+            // full root paths, never the basenames — two checkouts of the same repo commonly share
+            // a basename, and a basename comparison would hide exactly the cross-worktree pin the
+            // label exists to mark.
+            pinned_foreign_root: self.pinned_snapshot.as_ref().and_then(|pin| {
+                let origin_root = pin.document.origin().root();
+                (origin_root != self.root).then(|| {
+                    origin_root
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| origin_root.to_string_lossy().into_owned())
+                })
+            }),
             prompt: self.bottom_line(),
             help: self.help_view(),
         }

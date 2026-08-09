@@ -2,7 +2,7 @@
 source: tests/presenter_pinned.rs
 expression: output
 ---
-"┌r─────────────────┐┌active.rs──────────────────────────────────────────────────────┐┌Pinned: [detached @ /worktrees/detached]───────────────────────┐"
+"┌r─────────────────┐┌active.rs──────────────────────────────────────────────────────┐┌Pinned: [detached]─────────────────────────────────────────────┐"
 "│                  ││active notice                                                  ││PINNED                                                         │"
 "│                  ││ACTIVE needle                                                  ││                                                               │"
 "│                  ││active second row                                              ││                                                               │"

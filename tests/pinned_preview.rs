@@ -1853,6 +1853,23 @@ fn finder_confirm_from_tree_focus_leaves_focus_on_the_tree() {
     );
 }
 
+/// AC-12: a pin captured in the CURRENT worktree names no worktree, so the title stays short. The
+/// comparison is over full root paths, not basenames, because two checkouts of one repo commonly
+/// share a basename and a basename comparison would silently call a foreign pin local.
+#[test]
+fn a_pin_from_the_viewed_worktree_names_no_worktree() {
+    let (_dir, ctrl) = pin_ready_controller();
+    assert!(
+        ctrl.view_state().pinned.is_some(),
+        "precondition: a pin exists"
+    );
+    assert_eq!(
+        ctrl.view_state().pinned_foreign_root,
+        None,
+        "a same-worktree pin must not repeat the viewed worktree's name"
+    );
+}
+
 #[test]
 fn active_scroll_and_search_leave_the_pinned_interaction_unchanged() {
     let (_dir, mut ctrl) = pin_ready_controller();

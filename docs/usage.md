@@ -197,9 +197,14 @@ follow later renders. Press `p` again on the same file to unpin it; press it on 
 file to replace the reference. A directory, an empty tree, or a preview still rendering cannot be
 pinned.
 
-Every pin carries its **captured origin** — the worktree root and branch or detached state — in
-its title. It therefore **survives a worktree switch** and remains useful even if its old worktree
-is no longer selected. While the pin is focused, `y` copies its **captured repo-relative path** and
+Every pin carries its **captured origin** — the branch, or detached state, it was taken on — in its
+title, as `Pinned: [main]`. The captured path is not in the title; it would clip the origin away on
+a narrow pane, and `y`/`Y` copy it anyway. When the pin comes from a **different worktree** than the
+one you are viewing, the title names that worktree too, as `Pinned: [main @ other-checkout]`, so a
+foreign reference can never be mistaken for a local one. A pin from the worktree you are already in
+names no worktree, since repeating it buys nothing. It therefore **survives a worktree switch** and
+remains useful even if its old worktree is no longer selected: after such a switch the same pin
+starts naming the worktree it came from. While the pin is focused, `y` copies its **captured repo-relative path** and
 `Y` its **captured absolute path**; neither operation reads the current tree or the old file again.
 
 With the tree visible, `Tab` cycles focus **tree → active preview → pinned preview → tree**. In

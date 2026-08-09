@@ -295,6 +295,22 @@ fn re_root_rebuilds_at_the_new_root_carrying_prefs_and_resetting_nav() {
         "content notices"
     );
     assert_eq!(pinned_after.origin, pinned_before.origin, "captured origin");
+    // AC-12: the frozen snapshot is untouched by the switch, but its TITLE now has a worktree to
+    // distinguish, so the label appears where it was absent before. It names the worktree the pin
+    // was captured in, not the one now being viewed.
+    let origin_root = pinned_before
+        .origin
+        .as_ref()
+        .expect("pinned origin precondition")
+        .root()
+        .to_path_buf();
+    assert_eq!(
+        ctrl.view_state().pinned_foreign_root,
+        origin_root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        "a pin from the previous worktree names that worktree after the switch"
+    );
     assert_eq!(pinned_after.scroll, pinned_before.scroll, "vertical scroll");
     assert_eq!(
         pinned_after.hscroll, pinned_before.hscroll,

@@ -57,8 +57,18 @@ fn state(pinned: PreviewProjection) -> ViewState {
         annotation_indicators: AnnotationIndicatorsView::default(),
         root_name: "r".into(),
         branch: None,
+        pinned_foreign_root: None,
         prompt: None,
         help: None,
+    }
+}
+
+/// The same fixture with the pin marked as captured in ANOTHER worktree, which is the only case
+/// that earns the worktree label in the title (AC-12).
+fn state_from_foreign_worktree(pinned: PreviewProjection, worktree: &str) -> ViewState {
+    ViewState {
+        pinned_foreign_root: Some(worktree.to_string()),
+        ..state(pinned)
     }
 }
 
@@ -193,6 +203,8 @@ fn narrow_pin_focus_snapshots() {
 
 #[test]
 fn pinned_origin_identity_is_visible_and_neutralized() {
+    // The third element is the foreign worktree label: `None` means the pin came from the viewed
+    // worktree, where the branch alone is the origin and no worktree is named.
     let cases = [
         (
             "origin_named_branch",
@@ -201,10 +213,12 @@ fn pinned_origin_identity_is_visible_and_neutralized() {
                 BranchState::Named("feat/one".into()),
                 "src/lib.rs",
             ),
+            None,
         ),
         (
             "origin_detached",
             origin("/worktrees/detached", BranchState::Detached, "README.md"),
+            None,
         ),
         (
             "origin_cross_worktree",
@@ -213,12 +227,17 @@ fn pinned_origin_identity_is_visible_and_neutralized() {
                 BranchState::Named("topic\u{7}".into()),
                 "src/other.rs",
             ),
+            Some("other\u{1b}[31m"),
         ),
     ];
-    for (name, origin) in cases {
+    for (name, origin, foreign) in cases {
         let mut pinned = projection("ignored", "PINNED\n");
         pinned.origin = Some(origin);
-        let (output, _) = render(&state(pinned), 150, 10);
+        let state = match foreign {
+            Some(worktree) => state_from_foreign_worktree(pinned, worktree),
+            None => state(pinned),
+        };
+        let (output, _) = render(&state, 150, 10);
         assert!(
             !output.contains('\u{1b}') && !output.contains('\u{7}'),
             "{output}"
@@ -228,6 +247,13 @@ fn pinned_origin_identity_is_visible_and_neutralized() {
                 && !output.contains("README.md")
                 && !output.contains("src/other.rs"),
             "AC-12: the pinned title contains origin only, not its path\n{output}"
+        );
+        // A same-worktree pin must not carry a worktree at all: repeating the viewed worktree's
+        // own name is the width that clipped the origin away before this amendment.
+        assert_eq!(
+            output.contains("Pinned: [feat/one]") || output.contains("Pinned: [detached]"),
+            foreign.is_none(),
+            "AC-12: only a cross-worktree pin names its worktree\n{output}"
         );
         insta::assert_snapshot!(name, output);
     }

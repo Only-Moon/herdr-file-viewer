@@ -175,6 +175,12 @@ pub struct ViewState {
     /// border. `None` outside a git repo or on a detached HEAD — in which case the bottom title is
     /// omitted entirely rather than showing a blank/placeholder branch (degrade gracefully).
     pub branch: Option<String>,
+    /// The worktree basename to disambiguate the pinned snapshot's origin, set only when the pin
+    /// was captured in a DIFFERENT worktree than the one currently viewed (AC-12). `None` in the
+    /// common same-worktree case, where the branch alone identifies the origin and a repeated
+    /// basename would be noise. Decided in the controller because only it holds both full root
+    /// paths: two worktrees can share a basename, so the comparison cannot be made from this label.
+    pub pinned_foreign_root: Option<String>,
     /// When `Some`, the in-app help overlay is drawn on top of everything else (AC-1, AC-5).
     /// `None` ⇒ no overlay. Drawn last in [`draw`] so it sits above the picker and finder.
     pub help: Option<HelpView>,
@@ -1102,7 +1108,7 @@ fn draw_content(
     // the still-loading selection's name and re-introduce the title-ahead-of-body bug.
     let applied_title = preview.title.is_some();
     let mut title = if let Some(origin) = &preview.origin {
-        pinned_origin_title(origin)
+        pinned_origin_title(origin, state.pinned_foreign_root.as_deref())
     } else if let Some(name) = &preview.title {
         sanitize_control(name)
     } else if active && !preview.rendering {
@@ -1250,18 +1256,23 @@ fn draw_content(
 }
 
 /// The frozen pin's origin identity, kept on its own title so a worktree switch cannot make the
-/// reference surface look like it belongs to the active tree. The path is deliberately omitted:
-/// the title prioritizes the branch/root distinction and path copying remains available separately.
-fn pinned_origin_title(origin: &PreviewOrigin) -> String {
+/// reference surface look like it belongs to the active tree. The captured path is deliberately
+/// omitted: it led the title and clipped the origin away on a narrow pane, defeating the very
+/// distinction AC-12 exists to draw. It remains available through the widen notice and the pinned
+/// copy actions.
+///
+/// The worktree is named only when `foreign_root` says the pin came from another one. A pin from
+/// the viewed worktree reads `[branch]`, because repeating the current worktree's own name each
+/// time buys no distinction and costs the width that clipped the title in the first place.
+fn pinned_origin_title(origin: &PreviewOrigin, foreign_root: Option<&str>) -> String {
     let branch = match origin.branch() {
         crate::preview::BranchState::Named(branch) => sanitize_control(branch),
         crate::preview::BranchState::Detached => "detached".to_string(),
     };
-    format!(
-        "Pinned: [{} @ {}]",
-        branch,
-        sanitize_control(&origin.root().to_string_lossy()),
-    )
+    match foreign_root {
+        Some(root) => format!("Pinned: [{} @ {}]", branch, sanitize_control(root)),
+        None => format!("Pinned: [{branch}]"),
+    }
 }
 
 /// Draw the supplied one-row remote-notice status. Reversed (theme-relative) so it reads as a
