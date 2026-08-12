@@ -283,8 +283,14 @@ impl Controller {
             // tree row with the file hidden off-screen. This mirrors the tree's Enter/activate on a
             // file (content full-screen). When the content is already visible (the wide two-column
             // layout, or already zoomed), the layout is left untouched and the file just renders.
-            if self.content_width == 0 {
+            if self.active_interaction.viewport_width == 0 {
                 self.zoomed = true;
+                self.focus = Focus::Content;
+            }
+            // A finder confirmation means "take me to this file", unlike changed-file jumps
+            // which intentionally keep pinned focus for comparison (AC-31). Only pinned focus
+            // moves: a confirm from the tree leaves focus on the tree exactly as before (AC-41).
+            if self.focus == Focus::Pinned {
                 self.focus = Focus::Content;
             }
             self.dispatch_render();

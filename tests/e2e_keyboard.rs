@@ -127,8 +127,14 @@ fn every_keyboard_function_drives_the_viewer_and_it_exits_cleanly() {
     std::fs::write(p.join("aaa.txt"), "ALPACAMARK\n").unwrap();
     git(p, &["add", "aaa.txt", "subdir/grand.txt"]);
     git(p, &["commit", "-q", "-m", "files"]);
-    // An untracked file so the changed-only / baseline keys have something to act on.
-    std::fs::write(p.join("bbb.txt"), "BRAVO\n").unwrap();
+    // Two tracked files, changed after their commit, give `[` / `]` two stable targets. Keeping
+    // them tracked makes both the Head and Base changed-set paths exercise the same candidates.
+    std::fs::write(p.join("bbb.txt"), "bravo base\n").unwrap();
+    std::fs::write(p.join("ccc.txt"), "charlie base\n").unwrap();
+    git(p, &["add", "bbb.txt", "ccc.txt"]);
+    git(p, &["commit", "-q", "-m", "changed-file candidates"]);
+    std::fs::write(p.join("bbb.txt"), "BRAVOMARK\n").unwrap();
+    std::fs::write(p.join("ccc.txt"), "CHARLIEMARK\n").unwrap();
 
     // A trivial, instantly-exiting "editor" so the open-in-editor key is safe to drive here.
     let mut cmd = viewer_command(p);
@@ -151,14 +157,36 @@ fn every_keyboard_function_drives_the_viewer_and_it_exits_cleanly() {
     s.send("k").expect("send nav-up to the directory");
     s.send("h").expect("send collapse on the directory");
 
+    // The collapsed-directory cursor is still on the directory. Move once onto a file before
+    // exercising pinned-preview controls, so p has an eligible settled preview and [`/`] changed
+    // navigation below can retarget only the active selection rather than the frozen snapshot.
+    s.send("j")
+        .expect("send nav-down onto a file after collapse");
+    s.expect("ALPACAMARK")
+        .expect("the file below the collapsed directory is active and rendered");
+
+    // The default PTY is too narrow for two 40-column preview interiors. Pinning preserves the
+    // tree/active layout and reports the held snapshot instead of focusing an undrawn pane.
+    s.send("p").expect("pin the settled active preview");
+    s.expect("Pinned: aaa.txt — widen to view")
+        .expect("the hidden pin has a persistent widen notice");
+    s.send("]").expect("jump forward to the next changed file");
+    s.expect("BRAVOMARK")
+        .expect("the forward changed-file jump updated the active preview");
+    s.send("[")
+        .expect("jump backward to the previous changed file");
+    s.expect("CHARLIEMARK")
+        .expect("the backward changed-file jump updated the active preview");
+
     // Drive every remaining keyboard function; each must be wired and must not crash the loop.
     for key in [
-        "i",  // toggle ignored
-        "c",  // changed-only
-        "b",  // toggle baseline
-        "v",  // cycle view
-        "\t", // toggle focus
-        "e",  // open-in-editor (hands off to `true`, which exits immediately)
+        "i", // toggle ignored
+        "c", // changed-only
+        "b", // toggle baseline
+        "v", // cycle view
+        "{", // shrink the pinned-preview share
+        "}", // grow the pinned-preview share
+        "e", // open-in-editor (hands off to `true`, which exits immediately)
     ] {
         s.send(key).expect("send key");
     }

@@ -8,6 +8,7 @@ customize it see [configuration](configuration.md).
 - [Finding a file fast](#finding-a-file-fast)
 - [Open at a known file](#open-at-a-known-file) (incl. [Teach your agent](#teach-your-agent))
 - [Viewing a file](#viewing-a-file)
+- [Pinned previews](#pinned-previews)
 - [Git awareness](#git-awareness)
 - [Navigating within a file](#navigating-within-a-file)
 - [Annotating files and ranges](#annotating-files-and-ranges)
@@ -46,7 +47,8 @@ that one, and the chain stops the moment a directory holds a file or a second en
 
 Press `f` to open a **fuzzy finder** over every file in the tree (`.gitignore`-aware). Type to
 filter, `↑`/`↓` to move, `Enter` to open, `Esc` to cancel — far faster than scrolling the tree in a
-large repo.
+large repo. Confirming from a pinned preview moves focus to the active preview where the chosen
+file opens.
 
 ## Open at a known file
 
@@ -186,6 +188,43 @@ numbers. No mode-switching, no commands.
 Rendering is **delegated** to `glow` (markdown), `delta` (diffs), and `bat` (syntax); when a
 renderer isn't installed the viewer falls back to plain text with a short notice. See
 [external renderers](renderers.md).
+
+## Pinned previews
+
+Press `p` on a settled file preview to keep a **frozen in-memory snapshot** beside the file you
+continue browsing. The snapshot is session-only: it does not reread the file, change after `r`, or
+follow later renders. Press `p` again on the same file to unpin it; press it on a different settled
+file to replace the reference. A directory, an empty tree, or a preview still rendering cannot be
+pinned.
+
+Every pin carries its **captured origin** — the branch, or detached state, it was taken on — in its
+title, as `Pinned: [main]`. The captured path is not in the title; it would clip the origin away on
+a narrow pane, and `y`/`Y` copy it anyway. When the pin comes from a **different worktree** than the
+one you are viewing, the title names that worktree too, as `Pinned: [main @ other-checkout]`, so a
+foreign reference can never be mistaken for a local one. A pin from the worktree you are already in
+names no worktree, since repeating it buys nothing. It therefore **survives a worktree switch** and
+remains useful even if its old worktree is no longer selected: after such a switch the same pin
+starts naming the worktree it came from. While the pin is focused, `y` copies its **captured repo-relative path** and
+`Y` its **captured absolute path**; neither operation reads the current tree or the old file again.
+
+With the tree visible, `Tab` cycles focus **tree → active preview → pinned preview → tree**. In
+tree-hidden zoom the cycle is active preview then pinned preview. The pinned and active previews
+have separate scroll positions and searches are independent: arrows, paging, `/`, and `n`/`N`
+operate only on the focused preview. On a narrow pane, pinning never takes a pane away: the tree
+and active preview retain the no-pin layout, the hidden pin persists, and the active preview says
+`Pinned: <path> — widen to view` until there is room for both **40-column floor** previews. `Tab`
+then visits only the visible tree and active preview.
+
+The reference is display-only. Actions that need the live selection — including `Enter`, `:`, `e`,
+`L`, `O`, `R`, `a`, `A`, `v`, `D`, `w`, and `Z` — are **unavailable from the pinned preview** and
+show a short notice; `Tab` to the active preview or tree to use them. This keeps a frozen reference
+from silently acting on a newer tree selection.
+
+Use `{` / `}` to shrink or grow the pin in 5-point steps (20–80%) without moving the tree/content
+split. They move the **preview divider** between the pinned and active previews and do nothing when
+there is no pin. You can also **drag the preview divider** with the mouse; it is separate from the
+outer tree/content divider (`<` / `>`). Each preview has its own scrollbars, which you can drag or
+press just as you would the active content scrollbar.
 
 ## Git awareness
 
