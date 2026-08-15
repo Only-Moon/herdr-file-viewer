@@ -906,6 +906,70 @@ fn configured_content_view_keeps_manual_diff_cycle_and_status_mode_semantics() {
 }
 
 #[test]
+fn config_changed_file_view_flows_through_resolve_to_the_startup_view_policy() {
+    // Integration: config text → parse → resolve → the controller's changed-file view policy is
+    // exactly the composition `app::run` performs at startup (config resolution reaching the
+    // controller). Exercise that whole chain end-to-end, closing the gap between resolution and
+    // application: the resolver tests stop at `EffectiveSettings`, and the other
+    // `configured_content_view_*` tests supply the enum directly, so neither would notice a startup
+    // that resolved the key and then ignored it. Mirrors
+    // `config_scroll_lines_flows_through_resolve_to_the_content_wheel_step` (the literal one-line
+    // `app::run` call mirrors the pre-existing `apply_hide_dotfiles` seam).
+    use herdr_file_viewer::config::{parse_config, resolve};
+    let (cfg, _outcome) = parse_config("changed_file_view = \"content\"\n");
+    let eff = resolve(&cfg, |_| None);
+    assert_eq!(
+        eff.changed_file_view,
+        ChangedFileView::Content,
+        "config value resolves to the effective changed-file view"
+    );
+
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("README.md"), "# Changed\n").unwrap();
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("README.md"), Status::Modified);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..StubGit::default()
+    };
+    // The resolved value — not a literal — is what startup hands the constructor.
+    let (ctrl, _, _) =
+        controller_with_changed_file_view(dir.path(), true, git, false, eff.changed_file_view);
+
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        Some(ViewMode::RenderedMarkdown),
+        "the resolved config changed_file_view reaches the startup view policy"
+    );
+
+    // And the default config still resolves to the original diff-first startup.
+    let (default_cfg, _) = parse_config("\n");
+    let default_eff = resolve(&default_cfg, |_| None);
+    let diff_dir = TempDir::new();
+    std::fs::write(diff_dir.path().join("README.md"), "# Changed\n").unwrap();
+    let mut diff_changed = BTreeMap::new();
+    diff_changed.insert(PathBuf::from("README.md"), Status::Modified);
+    let diff_git = StubGit {
+        status: diff_changed.clone(),
+        changed: diff_changed,
+        ..StubGit::default()
+    };
+    let (diff_ctrl, _, _) = controller_with_changed_file_view(
+        diff_dir.path(),
+        true,
+        diff_git,
+        false,
+        default_eff.changed_file_view,
+    );
+    assert_eq!(
+        diff_ctrl.selected_view_mode(),
+        Some(ViewMode::Diff),
+        "an absent key resolves to the unchanged diff-first startup"
+    );
+}
+
+#[test]
 fn toggle_baseline_recomputes_the_changed_set_and_updates_state() {
     // AC-16: switching the baseline re-queries git for the changed-set against it.
     let dir = TempDir::new();

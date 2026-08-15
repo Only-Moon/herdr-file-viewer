@@ -750,6 +750,20 @@ mod tests {
             resolve(&config, |_| None).changed_file_view,
             crate::view_policy::ChangedFileView::Content
         );
+
+        // The docs promise trimmed, case-insensitive values. The negative cases below all resolve
+        // to the default even without normalization, so only a POSITIVE spelling proves it.
+        for value in [" content ", "CONTENT", "CoNtEnT", "\tContent\n"] {
+            let config = Config {
+                changed_file_view: Some(value.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(
+                resolve(&config, |_| None).changed_file_view,
+                crate::view_policy::ChangedFileView::Content,
+                "{value:?} is trimmed and case-folded to the content preference"
+            );
+        }
     }
 
     #[test]
