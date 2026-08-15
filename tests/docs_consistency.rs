@@ -457,7 +457,7 @@ fn pinned_preview_docs_cover_the_frozen_reference_contract() {
     // AC-40: pinning is deliberately more than a `p` row. Its session lifetime, captured origin,
     // focus routing, independent interaction state, narrow-layout floor, and read-only boundary
     // must stay discoverable across the feature guide, key/config reference, architecture map, and
-    // Unreleased changelog entry.
+    // the released changelog entry.
     for phrase in [
         "## Pinned previews",
         "frozen in-memory snapshot",
@@ -507,9 +507,9 @@ fn pinned_preview_docs_cover_the_frozen_reference_contract() {
         );
     }
 
-    let unreleased = section(CHANGELOG, "## [Unreleased]", "\n## [");
+    let released = section(CHANGELOG, "## [1.16.0]", "\n## [");
     assert!(
-        unreleased.contains("Pinned preview"),
-        "CHANGELOG.md must include the pinned-preview feature in Unreleased"
+        released.contains("Pinned preview"),
+        "CHANGELOG.md must include the pinned-preview feature in the 1.16.0 section"
     );
 }

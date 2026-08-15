@@ -6,11 +6,10 @@
 ![herdr 0.7+](https://img.shields.io/badge/herdr-0.7%2B-8a2be2)
 ![platforms: linux • macOS • Windows (preview)](https://img.shields.io/badge/platforms-linux%20%E2%80%A2%20macOS%20%E2%80%A2%20Windows%20(preview)-informational)
 
-**Browse your repo without leaving your terminal session: a git-aware, read-only file viewer
-that lives in a herdr pane.** A keyboard-driven TUI with a directory tree
-on the left and, on the right, exactly the view each file deserves: a **diff** if it changed,
-**rendered markdown** if it's markdown, **syntax-highlighted code** otherwise. Git status is woven
-right into the tree. It opens beside whatever you're doing and never touches your files.
+**A git-aware, read-only file viewer in a herdr pane.** Tree on the left. On the right, the view
+that file deserves: a **diff** if it changed, **rendered markdown**, or **highlighted code**.
+Agents can drop you on a file or a line. You pin one file, mark a range, and paste those notes
+back into the chat. It never touches your files.
 
 ![herdr-file-viewer open in a herdr split beside your work: the directory tree on the left, syntax-highlighted content on the right](assets/File-viewer.png)
 
@@ -22,20 +21,28 @@ right into the tree. It opens beside whatever you're doing and never touches you
 
 ![herdr-file-viewer running full-screen](assets/File-Viewer-FS.png)
 
+*Pin a file with `p` and keep browsing: tree, the file you are on, and a frozen `Pinned: [main]` beside it:*
+
+![herdr-file-viewer with a pinned preview: tree on the left, the active file in the middle, a frozen pin of another file on the right](assets/Pinned-preview.png)
+
 ## Why you'd want it
 
-- **The right view, automatically.** Stop `cat`-ing files and squinting at raw diffs. A changed
-  file shows its diff; a README renders; code is highlighted: no mode-switching, no commands.
-- **Git at a glance.** `M`/`A`/`D`/`?` markers (colored, with the glyph as a non-color cue), a
-  changed-files-only filter, and a baseline you can flip between your branch's merge-base and
-  `HEAD` — all in the tree, not a separate mode.
-- **It sits beside your work.** Opens in a herdr split (or its own tab) with one keypress, and
-  toggles away just as fast. Great next to an agent, a build, or an editor.
-- **Safe on anything.** Read-only by construction and hardened to open *untrusted* repos (an
-  agent's worktree, a fresh clone) without running repo-controlled code or letting hostile file
-  content drive your terminal. See [SECURITY.md](SECURITY.md).
-- **Keyboard-first**, mouse-optional, and it never reinvents rendering: it delegates to
-  `glow` / `delta` / `bat` and degrades gracefully when they're absent.
+- **The right view, automatically.** A changed file opens as a diff. A README renders. Code is
+  highlighted. No `cat`, no mode switch, no commands. Press `v` only when you want something else.
+- **Git in the tree.** `M`/`A`/`D`/`?` on every row, a changed-only filter (`c`), jump next/prev
+  changed file (`]`/`[`), flip the baseline between your branch and `HEAD` (`b`). Not a separate
+  git client.
+- **Pin one file, keep browsing.** `p` freezes it on the right. Switch worktree (`W`) and compare
+  it with another checkout, or pin the old version and walk the new one.
+- **Agents show you the spot. You send notes back.** Teach them the [bundled skill](skills/herdr-file-viewer/SKILL.md)
+  and "open `src/app.rs:42` in Files" lands you there. Mark a file or a range (`a`), copy the
+  notes (`A` then `y`), paste them into the chat.
+- **Edit in *your* editor.** `e` suspends the viewer and opens the file in neovim, vim, micro, or
+  whatever you set as `editor` (else `$EDITOR`). You change the file there; the viewer never writes
+  it, and comes back when you quit the editor.
+- **Beside your work, safe on anything.** One keypress in a herdr split (or its own tab). Read-only,
+  hardened for an agent's worktree or a fresh clone. Delegates rendering to `glow` / `delta` / `bat`.
+  See [SECURITY.md](SECURITY.md).
 
 ## Highlights
 
@@ -45,13 +52,16 @@ A taste of what the keys do — the [full key & mouse reference](docs/keys.md) h
 | Key | Does |
 | --- | --- |
 | `f` | Fuzzy-find any file in the tree |
+| `p` | Pin the current file and keep browsing (compare across worktrees with `W`) |
+| `a` / `A` | Annotate a file or range; copy the notes out for an agent |
 | `v` | Cycle the view (diff ⇄ rendered ⇄ syntax) |
+| `]` / `[` | Jump to the next / previous changed file |
 | `b` | Flip the diff baseline: your branch's merge-base ⇄ `HEAD` |
 | `W` | Switch to another git worktree, in place |
-| `L` | Copy a `path:line` reference (or the selected lines) to your clipboard |
+| `L` | Copy a `path:line` reference (or the selected lines) |
 | `Z` | Full-screen the current file |
-| `e` / `O` / `R` | Hand off: open in your editor / the OS default app / the file manager |
-| `?` | Help overlay: What's New first, then keys, settings, and about |
+| `e` / `O` / `R` | Hand off: editor / OS default app / file manager |
+| `?` | Help overlay: What's New, keys, settings, about |
 
 ## Quick start
 
