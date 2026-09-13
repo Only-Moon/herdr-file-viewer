@@ -1112,6 +1112,10 @@ impl Controller {
             bindings: crate::input::default_bindings(),
             key_load_outcome: crate::input::KeyLoadOutcome::default(),
         };
+        // Bound the tree's ancestor `.gitignore` search at this repo's own boundary rather than
+        // letting it climb into an unrelated enclosing directory/repository (see
+        // `index::walk_builder`); a no-op (stays `false`) outside a repo.
+        ctrl.tree.set_is_git_repo(is_git_repo);
         ctrl.refresh_git_state();
         ctrl.dispatch_render();
         ctrl
@@ -1258,6 +1262,7 @@ impl Controller {
         self.root = resolved.root.clone();
         self.is_git_repo = resolved.is_git_repo;
         self.tree = TreeModel::new(resolved.root.clone());
+        self.tree.set_is_git_repo(self.is_git_repo);
         self.tree.set_compact_dirs(self.compact_dirs); // a carried session preference (AC-12)
         // Recompute the cached branch for the new root's bottom-border title. Cheap and
         // synchronous: a single `git rev-parse` against the already-resolved repo root, done once

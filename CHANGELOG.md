@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- The tree and Go-to-file index no longer inherit `.gitignore` rules from an unrelated directory or repository above the browsed root. The ancestor-`.gitignore` search climbed to the filesystem root with no repo-boundary check, so a repo nested under an unrelated enclosing `.gitignore` (a monorepo checkout, a dotfiles-managed home directory) could render a completely empty tree with no error.
+
 ## [1.16.0] - 2026-08-15
 
 ### Added
