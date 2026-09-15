@@ -13,7 +13,7 @@ All notable changes to this project are documented here. The format is based on
 ## [1.17.0] - 2026-09-15
 
 ### Added
-- `open_direction`: choose which way the summon key splits your pane — `"right"` (the default, viewer beside your work) or `"down"`, which keeps the terminal on top and puts the viewer underneath. `"bottom"` is accepted as a synonym. The tab action is unaffected, and the launcher reads it per summon, so the next `prefix+f` obeys it with no reload. → [configuration](docs/configuration.md) · [summoning](docs/summoning.md#split-beside-or-below)
+- `open_direction`: choose which way the summon key splits your pane — `"right"` (the default, viewer beside your work) or `"down"`, which keeps the terminal on top and puts the viewer underneath. `"bottom"` is accepted as a synonym. The tab action is unaffected, and the launcher reads it per summon, so the next `prefix+f` obeys it with no reload. Thanks @diegopzz and @pmaxvsbobo (#152, #167) → [configuration](docs/configuration.md) · [summoning](docs/summoning.md#split-beside-or-below)
 
 ### Fixed
 - Restore Git status, branch, and diffs on git 2.39 (Apple’s Xcode git), while disabling configured filter commands. Thanks @arykhoda (#160) → [usage](docs/usage.md#git-awareness) · [install](docs/install.md)
