@@ -580,6 +580,19 @@ impl TreeModel {
         self.visible_nodes().into_iter().nth(self.cursor)
     }
 
+    /// Move the cursor to `path`'s visible row, without changing expansion or filters.
+    pub(crate) fn select(&mut self, path: &Path) -> bool {
+        let Some(cursor) = self
+            .visible_nodes()
+            .iter()
+            .position(|node| node.path == path)
+        else {
+            return false;
+        };
+        self.cursor = cursor;
+        true
+    }
+
     /// Expand every ancestor directory of `path`, from its parent up to and including the root, so
     /// a target buried in collapsed directories can get a row.
     ///

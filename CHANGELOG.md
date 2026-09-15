@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+- `←`/`h` now walks up from a file or already-collapsed directory in the normal tree, collapsing the nearest visible parent and updating the content pane. Changed-only and status trees keep their existing behavior. → [usage](docs/usage.md#the-tree) · [keys](docs/keys.md)
+
 ## [1.17.0] - 2026-09-15
 
 ### Added

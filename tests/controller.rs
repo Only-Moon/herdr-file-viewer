@@ -2478,6 +2478,132 @@ fn left_click_selects_the_tree_row_it_lands_on() {
 }
 
 #[test]
+fn collapse_from_a_file_walks_up_the_normal_tree_and_clears_file_content() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+    std::fs::write(dir.path().join("a/b/file.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.handle(Intent::Expand); // expand a
+    ctrl.handle(Intent::NavDown); // select b
+    ctrl.handle(Intent::Expand); // expand b
+    ctrl.handle(Intent::NavDown); // select file.txt
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        dir.path().join("a/b/file.txt"),
+        "precondition: the file is selected"
+    );
+
+    let fx = ctrl.handle(Intent::Collapse);
+    assert!(fx.redraw, "walking to the parent redraws");
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        dir.path().join("a/b"),
+        "Left on a file selects its nearest visible parent"
+    );
+    assert!(
+        !ctrl.tree().selected().unwrap().expanded,
+        "the newly selected parent is collapsed"
+    );
+    assert_eq!(
+        flatten(ctrl.content()),
+        "Directory: select a file to view",
+        "changing from a file to a directory clears the old file content"
+    );
+
+    ctrl.handle(Intent::Collapse);
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        dir.path().join("a"),
+        "a second Left continues upward from the now-collapsed parent"
+    );
+}
+
+#[test]
+fn collapse_walk_up_skips_folded_compact_dir_segments() {
+    let dir = TempDir::new();
+    let deep = dir.path().join("mid/chain/main/java");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("App.java"), "x").unwrap();
+    // This keeps mid as its own row, while its child chain folds into one row.
+    std::fs::write(dir.path().join("mid/other.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.apply_compact_dirs(true);
+
+    ctrl.handle(Intent::Expand); // expand mid
+    ctrl.handle(Intent::NavDown); // select folded chain/main/java
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        deep,
+        "precondition: the compacted row is selected"
+    );
+
+    ctrl.handle(Intent::Collapse);
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        dir.path().join("mid"),
+        "walk past folded filesystem-only segments to the nearest visible row"
+    );
+}
+
+#[test]
+fn collapse_walk_up_stops_at_a_root_child() {
+    let dir = TempDir::new();
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    let fx = ctrl.handle(Intent::Collapse);
+    assert!(!fx.redraw, "there is no visible parent above a root child");
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        dir.path().join("a"),
+        "the root child remains selected"
+    );
+}
+
+#[test]
+fn collapse_walk_up_is_inert_in_changed_and_status_trees() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/file.txt"), "x").unwrap();
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("a/file.txt"), Status::Modified);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..Default::default()
+    };
+    let (mut ctrl, _, _) = controller(dir.path(), true, git, false);
+
+    ctrl.handle(Intent::ToggleChangedOnly);
+    ctrl.handle(Intent::NavDown); // synthetic tree: a then a/file.txt
+    let fx = ctrl.handle(Intent::Collapse);
+    assert!(
+        !fx.redraw,
+        "changed-only keeps the existing file-collapse no-op"
+    );
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        dir.path().join("a/file.txt"),
+        "changed-only keeps the file selected"
+    );
+
+    ctrl.handle(Intent::ToggleChangedOnly);
+    ctrl.handle(Intent::ToggleStatusMode);
+    ctrl.handle(Intent::NavDown); // synthetic tree: a then a/file.txt
+    let fx = ctrl.handle(Intent::Collapse);
+    assert!(
+        !fx.redraw,
+        "status mode keeps the existing file-collapse no-op"
+    );
+    assert_eq!(
+        ctrl.tree().selected().unwrap().path,
+        dir.path().join("a/file.txt"),
+        "status mode keeps the file selected"
+    );
+}
+
+#[test]
 fn left_click_in_the_content_column_focuses_it() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.txt"), "x").unwrap();
