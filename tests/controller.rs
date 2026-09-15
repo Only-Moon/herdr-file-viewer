@@ -5845,6 +5845,33 @@ fn open_finder_opens_finder_with_full_candidate_list_and_empty_query() {
     );
 }
 
+#[test]
+fn repository_launch_scopes_tree_and_finder_gitignores_to_the_repo_boundary() {
+    // A parent folder's .gitignore must not hide an inner repository's own vendor directory.
+    // This reaches both controller handoffs: construction configures the TreeModel, and OpenFinder
+    // calls the scoped index. Removing either production handoff makes its respective assertion fail.
+    let outer = TempDir::new();
+    std::fs::write(outer.path().join(".gitignore"), "vendor/\n").unwrap();
+    let inner = outer.path().join("inner");
+    std::fs::create_dir_all(inner.join("vendor")).unwrap();
+    init_repo_with_commit(&inner);
+    std::fs::write(inner.join("vendor/keep.txt"), "k").unwrap();
+
+    let (mut ctrl, _, _) = controller(&inner, true, StubGit::default(), false);
+    assert!(
+        visible_names(&ctrl).contains(&"vendor".to_string()),
+        "launch must show a repository directory hidden only by an unrelated parent .gitignore"
+    );
+
+    ctrl.handle(Intent::OpenFinder);
+    assert!(
+        ctrl.finder_candidates()
+            .iter()
+            .any(|path| path == "vendor/keep.txt"),
+        "Go-to-file must use the same repository-bound ignore policy as the tree"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Confirm (reveal + render) · cancel · no-match no-op
 // ---------------------------------------------------------------------------
