@@ -48,7 +48,7 @@ config key and above the built-in default — `editor` (`$EDITOR`) and `update_c
 (`$HERDR_FILE_VIEWER_NO_UPDATE_CHECK`) — giving those two a `config > env > default` chain. Every
 other key (`markdown`, `diff`, `syntax`, `open`, `reveal`, `hide_dotfiles`, `show_ignored`,
 `compact_dirs`, `changed_file_view`, `confirm_discard`, `scroll_lines`, `tree_width`,
-`tree_position`, `tree_max_cols`, `preview_max_lines`, `preview_max_kib`) has no
+`tree_position`, `tree_max_cols`, `open_direction`, `preview_max_lines`, `preview_max_kib`) has no
 applicable environment variable; for those it's `config > default` only.
 
 ## Keys
@@ -75,6 +75,7 @@ scroll_lines = 3            # mouse-wheel step (content/search/help), a 1 to 10 
 tree_width = 30             # tree column's share of the viewer pane, percent 20-80 (content takes the rest)
 tree_max_cols = 30          # HARD CAP in columns; the SMALLER of this and tree_width% wins (raise both to widen)
 tree_position = "left"      # which side the directory tree sits on: "left" (default) or "right"
+open_direction = "right"    # which way the summon key splits your pane: "right" (default) or "down"
 
 preview_max_lines = 10000   # show at most this many lines before a truncated preview (100–100000)
 preview_max_kib = 1024      # ...or this size before truncating, in KiB (1024 = 1 MB; 64–65536)
@@ -103,6 +104,15 @@ instead of a mostly-blank tree (it only bites past ~100 columns). `tree_position
 the `left` (default) or `right`. All three set the **startup** split inside the viewer's own pane
 (not the herdr pane, which the host decides); you can still resize live with the grow/shrink keys or
 by dragging the divider, and an explicit resize lifts the cap.
+
+`open_direction` is the one layout key that *does* reach the herdr pane. It chooses which way the
+summon action splits the pane you invoke it from: `"right"` (the default — viewer beside your work)
+or `"down"` (viewer underneath, terminal keeping the top half). `"bottom"` is accepted as a synonym
+for `"down"`; values are trimmed and case-insensitive, and anything unrecognized falls back to
+`"right"`. Two scoping notes: the **tab** action (`open-file-viewer-tab`) ignores it, because a tab
+has no direction; and the launcher reads it at summon time, so it applies to the **next** viewer you
+open, not to one already on screen. See [Summoning the viewer](summoning.md) for the actions
+themselves.
 
 `preview_max_lines` and `preview_max_kib` cap how much of a file the content pane shows: a file is
 displayed in full until it exceeds **either** cap, then the pane shows a truncated preview with a
@@ -188,7 +198,7 @@ customized).
 | | `page_up` | `PageUp` | Move up one screenful (content pane when focused, else the tree cursor) |
 | | `page_down` | `PageDown`, `Space` | Move down one screenful (content pane when focused, else the tree cursor) |
 | | `expand` | `Right`, `l` | Expand the selected directory |
-| | `collapse` | `Left`, `h` | Collapse the selected directory |
+| | `collapse` | `Left`, `h` | Collapse a directory, or walk up from a file/collapsed directory in the normal tree |
 | | `activate` | `Enter` | Activate the selection: expand/collapse a directory, or open a file |
 | **View & layout** | `open_fullscreen` | `Z` | Toggle full-screen reading of the selected file |
 | | `cycle_view` | `v` | Cycle the content pane's view mode |

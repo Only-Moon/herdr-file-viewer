@@ -2554,7 +2554,10 @@ impl Controller {
     }
 
     /// Left (←/h): collapse the selected directory when the tree is focused, or scroll the
-    /// content pane left when it is focused.
+    /// content pane left when it is focused. In the normal tree, a file or already-collapsed
+    /// directory instead walks to its nearest visible ancestor and collapses it. Changed-only and
+    /// status trees keep their existing behavior because their directory rows are synthetic and
+    /// always expanded.
     fn collapse(&mut self) -> Effects {
         if self.focus == Focus::Content {
             return self.scroll_content_h(-(HSCROLL_STEP as i32));
@@ -2562,11 +2565,35 @@ impl Controller {
         if self.focus == Focus::Pinned {
             return self.scroll_pinned_h(-(HSCROLL_STEP as i32));
         }
-        if let Some(node) = self.tree.selected()
-            && node.kind == NodeKind::Dir
-        {
+        let Some(node) = self.tree.selected() else {
+            return Effects::noop();
+        };
+        // During an asynchronous re-root refresh, the fresh tree has not received its
+        // changed-only filter yet. The controller's carried mode state is authoritative during
+        // that interval, so c/d cannot briefly fall through to normal-tree walk-up behavior.
+        if self.changed_only || self.status_mode {
+            if node.kind == NodeKind::Dir {
+                self.tree.collapse(&node.path);
+                return Effects::redraw();
+            }
+            return Effects::noop();
+        }
+        if node.kind == NodeKind::Dir && node.expanded {
             self.tree.collapse(&node.path);
             return Effects::redraw();
+        }
+
+        let mut current = node.path.as_path();
+        while let Some(parent) = current.parent() {
+            if parent == self.root || !parent.starts_with(&self.root) {
+                return Effects::noop();
+            }
+            if self.tree.select(parent) {
+                self.tree.collapse(parent);
+                self.dispatch_render();
+                return Effects::redraw();
+            }
+            current = parent;
         }
         Effects::noop()
     }

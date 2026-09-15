@@ -287,6 +287,7 @@ pub fn settings_text(
          tree_width        = {tree_width}\n\
          tree_position     = {tree_position}\n\
          tree_max_cols     = {tree_max_cols}\n\
+         open_direction    = {open_direction}\n\
          preview_max_lines = {preview_max_lines}\n\
          preview_max_kib   = {preview_max_kib}",
         open = open,
@@ -301,6 +302,7 @@ pub fn settings_text(
         tree_width = eff.tree_width,
         tree_position = eff.tree_position.label(),
         tree_max_cols = eff.tree_max_cols,
+        open_direction = eff.open_direction.label(),
         preview_max_lines = eff.preview_max_lines,
         preview_max_kib = eff.preview_max_kib,
     )
@@ -809,6 +811,7 @@ mod tests {
             tree_width: 25,
             tree_position: crate::config::TreePosition::Right,
             tree_max_cols: 50,
+            open_direction: crate::config::OpenDirection::Down,
             preview_max_lines: 8000,
             preview_max_kib: 2048,
         }
@@ -848,6 +851,7 @@ mod tests {
             "tree_width",
             "tree_position",
             "tree_max_cols",
+            "open_direction",
             "preview_max_lines",
             "preview_max_kib",
         ] {
@@ -877,6 +881,13 @@ mod tests {
             text.lines()
                 .any(|l| l.trim_start().starts_with("tree_max_cols") && l.contains("50")),
             "settings_text must show the effective tree_max_cols value (50):\n{text}"
+        );
+        // The launcher-facing split direction is shown too: the fixture sets `down`, so a row
+        // reading `right` would mean the config value never reached the overlay.
+        assert!(
+            text.lines()
+                .any(|l| l.trim_start().starts_with("open_direction") && l.contains("down")),
+            "settings_text must show the effective open_direction (down):\n{text}"
         );
         // The effective content-preview caps each appear as their own row with their value.
         assert!(
@@ -1002,6 +1013,7 @@ mod tests {
                 "tree_max_cols     = {}",
                 crate::config::DEFAULT_TREE_MAX_COLS
             ),
+            "open_direction    = right",
             &format!(
                 "preview_max_lines = {}",
                 crate::config::DEFAULT_PREVIEW_MAX_LINES
