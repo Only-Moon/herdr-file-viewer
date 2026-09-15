@@ -190,6 +190,43 @@ fn fake_factory() -> Box<dyn Fn(&Resolved) -> RootProviders> {
 }
 
 #[test]
+fn re_root_scopes_gitignores_to_the_new_repository_boundary() {
+    // The fresh TreeModel created by re_root must receive the newly resolved Git-root flag. An
+    // unrelated .gitignore above B must not hide B/vendor after the switch.
+    let a = TempDir::new();
+    common::init_repo_with_commit(a.path());
+    std::fs::write(a.path().join("a.txt"), "a\n").unwrap();
+
+    let outer = TempDir::new();
+    std::fs::write(outer.path().join(".gitignore"), "vendor/\n").unwrap();
+    let b = outer.path().join("inner");
+    std::fs::create_dir_all(b.join("vendor")).unwrap();
+    common::init_repo_with_commit(&b);
+    std::fs::write(b.join("vendor/keep.txt"), "k\n").unwrap();
+
+    let components = Components {
+        providers: fake_factory(),
+        editor: Box::new(FakeEditor),
+        clipboard: Box::new(FakeClipboard),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(a.path().to_path_buf(), true),
+        Baseline::Head,
+        components,
+    );
+    ctrl.re_root(&b);
+
+    assert!(
+        ctrl.tree()
+            .visible_nodes()
+            .iter()
+            .any(|node| node.path.file_name().is_some_and(|name| name == "vendor")),
+        "re-rooted tree must not inherit an unrelated parent .gitignore"
+    );
+}
+
+#[test]
 fn collapse_walk_up_is_inert_while_a_changed_only_reroot_refresh_is_pending() {
     let a = TempDir::new();
     let b = TempDir::new();

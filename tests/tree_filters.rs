@@ -268,17 +268,27 @@ fn is_git_repo_bounds_ancestor_gitignore_at_the_repo_boundary() {
         "an unrelated ancestor .gitignore outside the repo must not hide files inside it"
     );
 
-    // A .gitignore INSIDE the repo must still apply — the bound is at the repo's boundary, not a
-    // blanket disabling of gitignore matching.
-    fs::write(inner.join(".gitignore"), "secret.log\n").unwrap();
-    fs::write(inner.join("secret.log"), "s").unwrap();
+    // In-repo ignore inheritance must still apply below the root. Expanding `sub` makes this
+    // walk climb to the repository root for `root-hidden.log`, while its own .gitignore filters
+    // `secret.log`; the boundary must not blanket-disable either rule.
+    let sub = inner.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(inner.join(".gitignore"), "root-hidden.log\n").unwrap();
+    fs::write(sub.join(".gitignore"), "secret.log\n").unwrap();
+    fs::write(sub.join("root-hidden.log"), "r").unwrap();
+    fs::write(sub.join("secret.log"), "s").unwrap();
     let mut still_filters_own_gitignore = TreeModel::new(&inner);
     still_filters_own_gitignore.set_is_git_repo(true);
+    still_filters_own_gitignore.expand(&sub);
     let names = names(&still_filters_own_gitignore);
     assert!(names.contains(&"vendor".to_string()));
     assert!(
+        !names.contains(&"root-hidden.log".to_string()),
+        "the repository root's .gitignore applies while walking a child directory"
+    );
+    assert!(
         !names.contains(&"secret.log".to_string()),
-        "the repo's own .gitignore still applies"
+        "the repo's in-subdirectory .gitignore still applies"
     );
 }
 
