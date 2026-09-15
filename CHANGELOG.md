@@ -11,6 +11,7 @@ All notable changes to this project are documented here. The format is based on
 - The tree and Go-to-file index no longer inherit `.gitignore` rules from an unrelated directory or repository above a browsed Git repository. The ancestor-`.gitignore` search climbed to the filesystem root with no repo-boundary check, so a repo nested under an unrelated enclosing `.gitignore` (a monorepo checkout, a dotfiles-managed home directory) could render a completely empty tree with no error. Thanks @rubenvarela (#166).
 
 ### Changed
+- `baseline = "base"` or `"head"` selects the Git diff baseline used when the viewer starts. Omitting it keeps the existing context-smart default, and `b` still toggles during the session. Thanks @AntonyKor (#138) → [configuration](docs/configuration.md)
 - `←`/`h` now walks up from a file or already-collapsed directory in the normal tree, collapsing the nearest visible parent and updating the content pane. Changed-only and status trees keep their existing behavior. → [usage](docs/usage.md#the-tree) · [keys](docs/keys.md)
 
 ## [1.17.0] - 2026-09-15

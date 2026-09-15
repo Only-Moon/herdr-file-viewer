@@ -47,7 +47,7 @@ A config key always wins. Only two keys also have an environment-variable fallba
 config key and above the built-in default — `editor` (`$EDITOR`) and `update_check`
 (`$HERDR_FILE_VIEWER_NO_UPDATE_CHECK`) — giving those two a `config > env > default` chain. Every
 other key (`markdown`, `diff`, `syntax`, `open`, `reveal`, `hide_dotfiles`, `show_ignored`,
-`compact_dirs`, `changed_file_view`, `confirm_discard`, `scroll_lines`, `tree_width`,
+`compact_dirs`, `changed_file_view`, `baseline`, `confirm_discard`, `scroll_lines`, `tree_width`,
 `tree_position`, `tree_max_cols`, `open_direction`, `preview_max_lines`, `preview_max_kib`) has no
 applicable environment variable; for those it's `config > default` only.
 
@@ -69,6 +69,7 @@ hide_dotfiles = false       # true to hide dotfiles at startup (the `.` key stil
 show_ignored = false        # true to show gitignored files at startup (the `i` key still toggles)
 compact_dirs = false        # true to draw a chain of single-child dirs as ONE row (src/main/java)
 changed_file_view = "diff"  # changed files start in "diff", or use normal "content" by file type
+baseline = "base"           # force startup diff baseline: "base" or "head" (omit for context-smart default)
 update_check = true         # false disables all remote requests and their display
 confirm_discard = true      # false to discard annotations without confirming (on quit / worktree switch)
 scroll_lines = 3            # mouse-wheel step (content/search/help), a 1 to 10 scale: 1 slow · 3 medium · 6 fast · 10 max
@@ -94,6 +95,12 @@ This does not force raw source for Markdown. The `v` cycle still includes compac
 views, and the setting does not change Git status markers, changed-only filtering, the active
 baseline, git-status mode (`d`), or `D`'s unified/side-by-side/plain diff presentation. Values are
 trimmed and case-insensitive; an unrecognized value falls back defensively to `"diff"`.
+
+`baseline` selects only the initial Git **diff baseline**. Set it to `"base"` to compare the full
+body of work since the base branch's merge-base, or `"head"` to compare working-tree changes only.
+When omitted or unrecognized, the viewer keeps its context-smart default: base on a feature branch
+or worktree, `HEAD` on the default branch. The `b` key still toggles between the two baselines during
+the session. This does not enable git-status mode (`d`) or change any tree filter.
 
 `tree_width` and `tree_max_cols` **together** decide the tree's startup width, and the **smaller of
 the two wins**: the tree is drawn at `min(tree_width% of the pane, tree_max_cols)`. So if you set

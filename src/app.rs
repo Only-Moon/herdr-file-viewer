@@ -49,7 +49,6 @@ const RENDER_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn run(open_flag: Option<String>) -> io::Result<()> {
     let ctx = host::from_env();
     let resolved = root::resolve(&ctx);
-    let baseline = git::default_baseline(&resolved);
 
     // Load + resolve the plugin's optional TOML config once, up front (AC-3..AC-5, AC-14, AC-16,
     // AC-17): `eff` is the fully-resolved config > env > default settings the rest of `run` wires
@@ -58,6 +57,7 @@ pub fn run(open_flag: Option<String>) -> io::Result<()> {
     // `load_config_from_env` returns `Config::default()`, so default behavior is unchanged.
     let (cfg, load_outcome) = crate::config::load_config_from_env();
     let eff = crate::config::resolve(&cfg, |k| std::env::var(k).ok());
+    let baseline = initial_baseline(git::default_baseline(&resolved), eff.baseline);
 
     // The effective renderers (config overrides layered onto the built-in defaults, AC-7) — built
     // once and reused for both renderer sites below (the root-bound factory's `LiveContent` and
@@ -819,6 +819,12 @@ fn suspend_tui() -> io::Result<()> {
     execute!(io::stdout(), LeaveAlternateScreen)
 }
 
+/// Choose the baseline for a fresh controller. An absent or invalid config value arrives as
+/// `None`, so the existing root-aware default remains authoritative.
+fn initial_baseline(default: Baseline, configured: Option<Baseline>) -> Baseline {
+    configured.unwrap_or(default)
+}
+
 /// Re-enter raw mode + the alternate screen after the editor returns, and re-arm mouse capture
 /// for the viewer (best-effort, matching `run`'s setup).
 fn resume_tui() -> io::Result<()> {
@@ -913,6 +919,28 @@ fn default_renderers() -> Renderers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_baseline_uses_configured_value_or_preserves_the_context_default() {
+        assert_eq!(
+            initial_baseline(Baseline::Base, None),
+            Baseline::Base,
+            "an absent or invalid config value keeps the feature-branch default"
+        );
+        assert_eq!(
+            initial_baseline(Baseline::Head, None),
+            Baseline::Head,
+            "an absent or invalid config value keeps the default-branch default"
+        );
+        assert_eq!(
+            initial_baseline(Baseline::Base, Some(Baseline::Head)),
+            Baseline::Head
+        );
+        assert_eq!(
+            initial_baseline(Baseline::Head, Some(Baseline::Base)),
+            Baseline::Base
+        );
+    }
 
     // ---- resolve_editor: default-editor platform seam (AC-8, T-5) --------------
 

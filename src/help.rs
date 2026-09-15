@@ -267,6 +267,11 @@ pub fn settings_text(
     };
     let open = opener_row(&eff.open, &wired.open);
     let reveal = opener_row(&eff.reveal, &wired.reveal);
+    let baseline = match eff.baseline {
+        Some(crate::git::Baseline::Base) => "base",
+        Some(crate::git::Baseline::Head) => "head",
+        None => "auto",
+    };
     let update_check = if eff.update_check { "on" } else { "off" };
     let confirm_discard = if eff.confirm_discard { "on" } else { "off" };
 
@@ -281,6 +286,7 @@ pub fn settings_text(
          show_ignored      = {show_ignored}\n\
          compact_dirs      = {compact_dirs}\n\
          changed_file_view = {changed_file_view}\n\
+         baseline          = {baseline}\n\
          update_check      = {update_check}\n\
          confirm_discard   = {confirm_discard}\n\
          scroll_lines      = {scroll_lines}\n\
@@ -296,6 +302,7 @@ pub fn settings_text(
         show_ignored = eff.show_ignored,
         compact_dirs = eff.compact_dirs,
         changed_file_view = eff.changed_file_view.label(),
+        baseline = baseline,
         update_check = update_check,
         confirm_discard = confirm_discard,
         scroll_lines = eff.scroll_lines,
@@ -805,6 +812,7 @@ mod tests {
             show_ignored: true,
             compact_dirs: true,
             changed_file_view: crate::view_policy::ChangedFileView::Content,
+            baseline: Some(crate::git::Baseline::Base),
             update_check: false,
             confirm_discard: false,
             scroll_lines: 7,
@@ -846,6 +854,7 @@ mod tests {
             "show_ignored",
             "compact_dirs",
             "changed_file_view",
+            "baseline",
             "update_check",
             "scroll_lines",
             "tree_width",
@@ -860,6 +869,11 @@ mod tests {
                 "settings_text must contain a row for '{key}':\n{text}"
             );
         }
+        assert!(
+            text.lines()
+                .any(|l| l.trim_start().starts_with("baseline") && l.contains("base")),
+            "settings_text must show the explicit baseline (base):\n{text}"
+        );
         // AC-9: the effective scroll step is shown as its own row with its value (7 in the fixture).
         assert!(
             text.lines()
@@ -922,6 +936,7 @@ mod tests {
             "show_ignored      = true",
             "compact_dirs      = true",
             "changed_file_view = content",
+            "baseline          = base",
             "update_check      = off",
             "scroll_lines      = 7",
         ] {
@@ -1001,6 +1016,7 @@ mod tests {
             "show_ignored      = false",
             "compact_dirs      = false",
             "changed_file_view = diff",
+            "baseline          = auto",
             "update_check      = on",
             "confirm_discard   = on",
             &format!(
