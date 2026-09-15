@@ -219,6 +219,9 @@ pub struct SettingsWired {
     pub editor: Option<std::ffi::OsString>,
     pub open: String,
     pub reveal: String,
+    /// The baseline actually passed to the new controller after applying the optional config value
+    /// or the root-aware automatic default.
+    pub baseline: crate::git::Baseline,
 }
 
 /// Assemble the "Settings" pane text (AC-15, AC-18): a first line reflecting the config
@@ -267,10 +270,9 @@ pub fn settings_text(
     };
     let open = opener_row(&eff.open, &wired.open);
     let reveal = opener_row(&eff.reveal, &wired.reveal);
-    let baseline = match eff.baseline {
-        Some(crate::git::Baseline::Base) => "base",
-        Some(crate::git::Baseline::Head) => "head",
-        None => "auto",
+    let baseline = match wired.baseline {
+        crate::git::Baseline::Base => "base",
+        crate::git::Baseline::Head => "head",
     };
     let update_check = if eff.update_check { "on" } else { "off" };
     let confirm_discard = if eff.confirm_discard { "on" } else { "off" };
@@ -830,6 +832,7 @@ mod tests {
             editor: None,
             open: "xdg-open".to_string(),
             reveal: "xdg-open".to_string(),
+            baseline: crate::git::Baseline::Base,
         }
     }
 
@@ -1016,7 +1019,7 @@ mod tests {
             "show_ignored      = false",
             "compact_dirs      = false",
             "changed_file_view = diff",
-            "baseline          = auto",
+            "baseline          = base",
             "update_check      = on",
             "confirm_discard   = on",
             &format!(
@@ -1044,6 +1047,31 @@ mod tests {
                 "built-in default scalar row must be exactly '{row}':\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn settings_text_shows_the_actual_startup_baseline() {
+        let eff = crate::config::resolve(
+            &crate::config::Config {
+                baseline: Some(" HEAD ".to_owned()),
+                ..crate::config::Config::default()
+            },
+            |_| None,
+        );
+        let wired = SettingsWired {
+            baseline: crate::git::Baseline::Head,
+            ..sample_wired()
+        };
+        let text = settings_text(
+            &eff,
+            &LoadOutcome::Loaded,
+            std::path::Path::new("/cfg/config.toml"),
+            &wired,
+        );
+        assert!(
+            text.lines().any(|line| line == "baseline          = head"),
+            "Settings must report the baseline passed to Controller:\n{text}"
+        );
     }
 
     // AC-3: with no config editor, the row shows the WIRED editor (the `$EDITOR`/platform default

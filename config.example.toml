@@ -94,8 +94,8 @@
 # Choose the initial Git diff baseline. "base" compares the full body of work
 # since the base branch's merge-base; "head" shows working-tree changes only.
 # Omit it to retain the context-smart default (base on a feature branch/worktree,
-# HEAD on the default branch). The `b` key still toggles either way. Default:
-#baseline = "base"
+# HEAD on the default branch). The `b` key still toggles either way. Default: omit this setting.
+#baseline = "base" # optional override
 
 # `update_check` governs release details and project spotlights.
 # `false` disables all remote requests and their display. When unset,

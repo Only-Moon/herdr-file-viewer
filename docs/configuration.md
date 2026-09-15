@@ -99,8 +99,9 @@ trimmed and case-insensitive; an unrecognized value falls back defensively to `"
 `baseline` selects only the initial Git **diff baseline**. Set it to `"base"` to compare the full
 body of work since the base branch's merge-base, or `"head"` to compare working-tree changes only.
 When omitted or unrecognized, the viewer keeps its context-smart default: base on a feature branch
-or worktree, `HEAD` on the default branch. The `b` key still toggles between the two baselines during
-the session. This does not enable git-status mode (`d`) or change any tree filter.
+or worktree, `HEAD` on the default branch. The `?` Settings section shows the baseline actually
+selected at startup, including that context-smart result. The `b` key still toggles between the two
+baselines during the session. This does not enable git-status mode (`d`) or change any tree filter.
 
 `tree_width` and `tree_max_cols` **together** decide the tree's startup width, and the **smaller of
 the two wins**: the tree is drawn at `min(tree_width% of the pane, tree_max_cols)`. So if you set

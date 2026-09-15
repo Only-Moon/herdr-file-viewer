@@ -57,7 +57,6 @@ pub fn run(open_flag: Option<String>) -> io::Result<()> {
     // `load_config_from_env` returns `Config::default()`, so default behavior is unchanged.
     let (cfg, load_outcome) = crate::config::load_config_from_env();
     let eff = crate::config::resolve(&cfg, |k| std::env::var(k).ok());
-    let baseline = initial_baseline(git::default_baseline(&resolved), eff.baseline);
 
     // The effective renderers (config overrides layered onto the built-in defaults, AC-7) — built
     // once and reused for both renderer sites below (the root-bound factory's `LiveContent` and
@@ -98,23 +97,26 @@ pub fn run(open_flag: Option<String>) -> io::Result<()> {
     });
     let clipboard: Box<dyn Clipboard> = Box::new(Osc52Clipboard);
 
-    // Wired values for the Settings display (AC-1..AC-4): built from the same startup resolution
-    // as the live components below so the overlay shows what's actually in effect.
-    let settings_wired = settings_wired(&eff, current_os_kind(), platform_editor);
-
     // Seed the changed-file view policy during construction so the first render is dispatched in
-    // its final mode (the single worker cannot cancel a job it has already started). `baseline`
-    // was already built from `resolved` above, so moving the resolved root here is its last use.
-    let mut controller = Controller::new_with_changed_file_view(
+    // its final mode (the single worker cannot cancel a job it has already started). The helper
+    // resolves the configured-or-context-smart baseline and passes that exact value to Controller.
+    let mut controller = startup_controller(
         resolved,
-        baseline,
+        &eff,
         Components {
             providers,
             editor,
             clipboard,
             renderers: Some(renderers),
         },
-        eff.changed_file_view,
+    );
+    // Wired values for the Settings display (AC-1..AC-4): built from the same controller startup
+    // result as the live components, so `?` reports the baseline actually in effect.
+    let settings_wired = settings_wired(
+        &eff,
+        controller.baseline(),
+        current_os_kind(),
+        platform_editor,
     );
     // Apply the config-driven startup hide-dotfiles default (AC-9). The interactive `.` toggle
     // still flips it later.
@@ -825,6 +827,17 @@ fn initial_baseline(default: Baseline, configured: Option<Baseline>) -> Baseline
     configured.unwrap_or(default)
 }
 
+/// Build the initial controller from the resolved root and settings. Keeping this seam pure over
+/// its injected components makes the config-to-controller baseline handoff directly testable.
+fn startup_controller(
+    resolved: root::Resolved,
+    eff: &crate::config::EffectiveSettings,
+    components: Components,
+) -> Controller {
+    let baseline = initial_baseline(git::default_baseline(&resolved), eff.baseline);
+    Controller::new_with_changed_file_view(resolved, baseline, components, eff.changed_file_view)
+}
+
 /// Re-enter raw mode + the alternate screen after the editor returns, and re-arm mouse capture
 /// for the viewer (best-effort, matching `run`'s setup).
 fn resume_tui() -> io::Result<()> {
@@ -867,6 +880,7 @@ fn bundled_style_path(exe: Option<&Path>) -> Option<String> {
 /// config > `$EDITOR` > platform default.
 fn settings_wired(
     eff: &crate::config::EffectiveSettings,
+    baseline: Baseline,
     os: crate::opener::OsKind,
     platform_editor: Option<std::ffi::OsString>,
 ) -> crate::help::SettingsWired {
@@ -874,6 +888,7 @@ fn settings_wired(
         editor: crate::config::effective_editor(eff, platform_editor),
         open: crate::opener::default_opener_display(os, crate::opener::OpenAction::Open),
         reveal: crate::opener::default_opener_display(os, crate::opener::OpenAction::Reveal),
+        baseline,
     }
 }
 
@@ -940,6 +955,29 @@ mod tests {
             initial_baseline(Baseline::Head, Some(Baseline::Base)),
             Baseline::Base
         );
+    }
+
+    #[test]
+    fn configured_baseline_reaches_the_initial_controller() {
+        for (configured, expected) in [
+            (Some(" HEAD "), Baseline::Head),
+            (Some("base"), Baseline::Base),
+            (Some("unrecognized"), Baseline::Head),
+        ] {
+            let eff = crate::config::resolve(
+                &crate::config::Config {
+                    baseline: configured.map(str::to_owned),
+                    ..crate::config::Config::default()
+                },
+                |_| None,
+            );
+            let (controller, _root) = route_controller_with_settings("startup-baseline", &eff);
+            assert_eq!(
+                controller.baseline(),
+                expected,
+                "{configured:?} must flow from config through startup selection into Controller"
+            );
+        }
     }
 
     // ---- resolve_editor: default-editor platform seam (AC-8, T-5) --------------
@@ -1038,6 +1076,14 @@ mod tests {
     }
 
     fn route_controller(tag: &str) -> (Controller, PathBuf) {
+        let eff = crate::config::resolve(&crate::config::Config::default(), |_| None);
+        route_controller_with_settings(tag, &eff)
+    }
+
+    fn route_controller_with_settings(
+        tag: &str,
+        eff: &crate::config::EffectiveSettings,
+    ) -> (Controller, PathBuf) {
         let root = tmp(tag);
         std::fs::write(root.join("note.rs"), "fn main() {}\n").unwrap();
         let resolved = crate::root::Resolved {
@@ -1047,9 +1093,9 @@ mod tests {
             is_worktree: false,
             base_branch: None,
         };
-        let controller = Controller::new(
+        let controller = startup_controller(
             resolved,
-            Baseline::Head,
+            eff,
             Components {
                 providers: Box::new(|_| RootProviders {
                     git: Arc::new(RouteGit),
@@ -1333,7 +1379,12 @@ mod tests {
             editor: Some(std::ffi::OsString::from("nvim")),
             ..crate::config::resolve(&crate::config::Config::default(), |_| None)
         };
-        let w = settings_wired(&eff, OsKind::Mac, Some(std::ffi::OsString::from("vi")));
+        let w = settings_wired(
+            &eff,
+            Baseline::Base,
+            OsKind::Mac,
+            Some(std::ffi::OsString::from("vi")),
+        );
         assert_eq!(
             w.editor,
             Some(std::ffi::OsString::from("nvim")),
@@ -1354,7 +1405,13 @@ mod tests {
 
         // No config editor: the platform default is what the row must report.
         let bare = crate::config::resolve(&crate::config::Config::default(), |_| None);
-        let w = settings_wired(&bare, OsKind::Linux, Some(std::ffi::OsString::from("vi")));
+        let w = settings_wired(
+            &bare,
+            Baseline::Head,
+            OsKind::Linux,
+            Some(std::ffi::OsString::from("vi")),
+        );
+        assert_eq!(w.baseline, Baseline::Head);
         assert_eq!(w.editor, Some(std::ffi::OsString::from("vi")));
     }
 

@@ -855,15 +855,21 @@ mod tests {
             Some(crate::git::Baseline::Head)
         );
 
-        for value in ["base", " BASE ", "BaSe"] {
+        for (value, expected) in [
+            ("base", crate::git::Baseline::Base),
+            (" BASE ", crate::git::Baseline::Base),
+            ("BaSe", crate::git::Baseline::Base),
+            ("HEAD", crate::git::Baseline::Head),
+            ("HeAd", crate::git::Baseline::Head),
+        ] {
             let config = Config {
                 baseline: Some(value.to_owned()),
                 ..Config::default()
             };
             assert_eq!(
                 resolve(&config, |_| None).baseline,
-                Some(crate::git::Baseline::Base),
-                "{value:?} selects the base baseline"
+                Some(expected),
+                "{value:?} selects the {expected:?} baseline"
             );
         }
 
