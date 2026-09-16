@@ -219,6 +219,9 @@ pub struct SettingsWired {
     pub editor: Option<std::ffi::OsString>,
     pub open: String,
     pub reveal: String,
+    /// The baseline actually passed to the new controller after applying the optional config value
+    /// or the root-aware automatic default.
+    pub baseline: crate::git::Baseline,
 }
 
 /// Assemble the "Settings" pane text (AC-15, AC-18): a first line reflecting the config
@@ -267,6 +270,10 @@ pub fn settings_text(
     };
     let open = opener_row(&eff.open, &wired.open);
     let reveal = opener_row(&eff.reveal, &wired.reveal);
+    let baseline = match wired.baseline {
+        crate::git::Baseline::Base => "base",
+        crate::git::Baseline::Head => "head",
+    };
     let update_check = if eff.update_check { "on" } else { "off" };
     let confirm_discard = if eff.confirm_discard { "on" } else { "off" };
 
@@ -281,6 +288,7 @@ pub fn settings_text(
          show_ignored      = {show_ignored}\n\
          compact_dirs      = {compact_dirs}\n\
          changed_file_view = {changed_file_view}\n\
+         baseline          = {baseline}\n\
          update_check      = {update_check}\n\
          confirm_discard   = {confirm_discard}\n\
          scroll_lines      = {scroll_lines}\n\
@@ -296,6 +304,7 @@ pub fn settings_text(
         show_ignored = eff.show_ignored,
         compact_dirs = eff.compact_dirs,
         changed_file_view = eff.changed_file_view.label(),
+        baseline = baseline,
         update_check = update_check,
         confirm_discard = confirm_discard,
         scroll_lines = eff.scroll_lines,
@@ -805,6 +814,7 @@ mod tests {
             show_ignored: true,
             compact_dirs: true,
             changed_file_view: crate::view_policy::ChangedFileView::Content,
+            baseline: Some(crate::git::Baseline::Base),
             update_check: false,
             confirm_discard: false,
             scroll_lines: 7,
@@ -822,6 +832,7 @@ mod tests {
             editor: None,
             open: "xdg-open".to_string(),
             reveal: "xdg-open".to_string(),
+            baseline: crate::git::Baseline::Base,
         }
     }
 
@@ -846,6 +857,7 @@ mod tests {
             "show_ignored",
             "compact_dirs",
             "changed_file_view",
+            "baseline",
             "update_check",
             "scroll_lines",
             "tree_width",
@@ -860,6 +872,11 @@ mod tests {
                 "settings_text must contain a row for '{key}':\n{text}"
             );
         }
+        assert!(
+            text.lines()
+                .any(|l| l.trim_start().starts_with("baseline") && l.contains("base")),
+            "settings_text must show the explicit baseline (base):\n{text}"
+        );
         // AC-9: the effective scroll step is shown as its own row with its value (7 in the fixture).
         assert!(
             text.lines()
@@ -922,6 +939,7 @@ mod tests {
             "show_ignored      = true",
             "compact_dirs      = true",
             "changed_file_view = content",
+            "baseline          = base",
             "update_check      = off",
             "scroll_lines      = 7",
         ] {
@@ -1001,6 +1019,7 @@ mod tests {
             "show_ignored      = false",
             "compact_dirs      = false",
             "changed_file_view = diff",
+            "baseline          = base",
             "update_check      = on",
             "confirm_discard   = on",
             &format!(
@@ -1028,6 +1047,31 @@ mod tests {
                 "built-in default scalar row must be exactly '{row}':\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn settings_text_shows_the_actual_startup_baseline() {
+        let eff = crate::config::resolve(
+            &crate::config::Config {
+                baseline: Some(" HEAD ".to_owned()),
+                ..crate::config::Config::default()
+            },
+            |_| None,
+        );
+        let wired = SettingsWired {
+            baseline: crate::git::Baseline::Head,
+            ..sample_wired()
+        };
+        let text = settings_text(
+            &eff,
+            &LoadOutcome::Loaded,
+            std::path::Path::new("/cfg/config.toml"),
+            &wired,
+        );
+        assert!(
+            text.lines().any(|line| line == "baseline          = head"),
+            "Settings must report the baseline passed to Controller:\n{text}"
+        );
     }
 
     // AC-3: with no config editor, the row shows the WIRED editor (the `$EDITOR`/platform default

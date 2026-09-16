@@ -163,6 +163,11 @@ pub struct Config {
     /// [`resolve`]; an absent or unrecognized value preserves the default diff preference. Manual
     /// `v` cycling remains available in either mode.
     pub changed_file_view: Option<String>,
+    /// The initial Git **diff baseline**: `"base"` always compares against the base branch's
+    /// merge-base, `"head"` compares only against `HEAD`, and absent or unrecognized values keep
+    /// the existing context-smart choice. The interactive `b` key still toggles the baseline after
+    /// startup.
+    pub baseline: Option<String>,
     pub update_check: Option<bool>,
     /// Whether quitting with unexported session annotations confirms first. `None` falls back to
     /// `true`: annotations are session-only, so quitting destroys them, and the confirm is the only
@@ -337,6 +342,9 @@ pub struct EffectiveSettings {
     /// normal file-type view; absent, invalid, or `"diff"` preserves the original diff-first
     /// behavior. Config-or-default (no env var).
     pub changed_file_view: crate::view_policy::ChangedFileView,
+    /// An explicit startup **diff baseline** from `baseline`, or `None` when startup must retain
+    /// [`crate::git::default_baseline`]'s context-smart selection. Config-or-default (no env var).
+    pub baseline: Option<crate::git::Baseline>,
     pub update_check: bool,
     /// The effective **confirm-before-discarding-annotations** switch: the config
     /// `confirm_discard` when present, else `true`. Config-or-default (no env var).
@@ -437,6 +445,20 @@ pub fn resolve(config: &Config, get_env: impl Fn(&str) -> Option<String>) -> Eff
         _ => crate::view_policy::ChangedFileView::Diff,
     };
 
+    // Config > existing context-smart default; no env var. `None` deliberately carries the
+    // fallback decision to app wiring, where the resolved root is available. An unrecognized value
+    // must not force either side of the toggle, so a typo preserves today's startup behavior.
+    let baseline = match config
+        .baseline
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("base") => Some(crate::git::Baseline::Base),
+        Some("head") => Some(crate::git::Baseline::Head),
+        _ => None,
+    };
+
     // Config > default; no env var. Defaults ON: the confirm only fires when annotations are held,
     // so a session that never annotates never sees it, and the one that does has work to lose.
     let confirm_discard = config.confirm_discard.unwrap_or(true);
@@ -528,6 +550,7 @@ pub fn resolve(config: &Config, get_env: impl Fn(&str) -> Option<String>) -> Eff
         show_ignored,
         compact_dirs,
         changed_file_view,
+        baseline,
         update_check,
         confirm_discard,
         scroll_lines,
@@ -818,6 +841,47 @@ mod tests {
                 resolve(&config, |_| None).changed_file_view,
                 crate::view_policy::ChangedFileView::Content,
                 "{value:?} is trimmed and case-folded to the content preference"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_parses_and_resolves_explicit_values_or_auto() {
+        let (config, outcome) = parse_config("baseline = \" head \"\n");
+        assert_eq!(outcome, LoadOutcome::Loaded);
+        assert_eq!(config.baseline.as_deref(), Some(" head "));
+        assert_eq!(
+            resolve(&config, |_| None).baseline,
+            Some(crate::git::Baseline::Head)
+        );
+
+        for (value, expected) in [
+            ("base", crate::git::Baseline::Base),
+            (" BASE ", crate::git::Baseline::Base),
+            ("BaSe", crate::git::Baseline::Base),
+            ("HEAD", crate::git::Baseline::Head),
+            ("HeAd", crate::git::Baseline::Head),
+        ] {
+            let config = Config {
+                baseline: Some(value.to_owned()),
+                ..Config::default()
+            };
+            assert_eq!(
+                resolve(&config, |_| None).baseline,
+                Some(expected),
+                "{value:?} selects the {expected:?} baseline"
+            );
+        }
+
+        for value in [None, Some("auto"), Some("unknown"), Some("")] {
+            let config = Config {
+                baseline: value.map(str::to_owned),
+                ..Config::default()
+            };
+            assert_eq!(
+                resolve(&config, |_| None).baseline,
+                None,
+                "{value:?} preserves the context-smart startup baseline"
             );
         }
     }

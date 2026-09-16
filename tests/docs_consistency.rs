@@ -137,6 +137,7 @@ fn config_example_documents_every_config_key() {
         "show_ignored",
         "compact_dirs",
         "changed_file_view",
+        "baseline",
         "update_check",
         "confirm_discard",
         "scroll_lines",
